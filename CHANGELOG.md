@@ -17,9 +17,15 @@
   unambiguous UTF-8 tracked/non-ignored file plus magic-detected, globally
   budgeted archive members, with digest/count-bound synthetic/public-vector
   exceptions. The guard also closes low-entropy assignment/URL forms,
-  compatibility/control-character ambiguity, source-type shadowing, CommonMark/
-  MyST/OpenAPI coordinates, archive polyglots/metadata/trailing data, and
-  descriptor-relative ancestor races. Every CI build/test and Docker image
+  compatibility/control-character ambiguity, suffix-independent low-entropy and
+  ancestor-scoped config fields, digest-pinned source types and rebinding/record
+  forms, depth-bounded CommonMark/MyST/source fences, newly introduced OpenAPI/
+  SDK/package/Gold roots, all-offset V7 TAR polyglots, archive metadata/trailing
+  data, recursively normalized diagnostics, parser-operation budgets, and
+  descriptor-relative ancestor races. The self-test discovers and pins every
+  scanner test module. Both scanner commands use isolated `/usr/bin/python3 -I`;
+  every tracked workflow is enumerated and unknown workflows are rejected. Every
+  accepted CI build/test and Docker image
   publication job fetches and verifies one immutable `GITHUB_SHA` and depends on
   the exact-manifest self-test and current-tree scan. This is not runtime output-leak
   scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK

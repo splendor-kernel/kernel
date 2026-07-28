@@ -7,9 +7,11 @@ import math
 import re
 import unicodedata
 import urllib.parse
+from array import array
 from collections import Counter
+from collections.abc import Sequence
 
-from .model import ContentHit
+from .model import ContentHit, ScanDataError, WorkBudget, utf8_size
 
 
 def normalize_field_name(value: str) -> str:
@@ -21,20 +23,35 @@ def normalize_field_name(value: str) -> str:
 
 
 _BENIGN_EXACT_FIELDS = {
+    "allowed_credential_bindings",
     "auth_method",
     "auth_mode",
+    "auth_policy",
     "auth_scheme",
+    "auth_state",
     "authorization_endpoint",
     "authorization_url",
     "authentication_method",
     "authentication_mode",
+    "authentication_policy",
+    "authentication_state",
+    "authorization_policy",
+    "authorization_state",
+    "credential_backend",
+    "credential_binding",
+    "credential_bearing_send_sequence",
     "credential_count",
+    "credential_format",
     "credential_id",
     "credential_ids",
     "credential_kind",
     "credential_ref",
     "credential_refs",
     "credential_scope",
+    "credential_sink",
+    "credential_sinks",
+    "credential_slot",
+    "credential_slots",
     "credential_algorithm",
     "jwks_uri",
     "max_tokens",
@@ -43,10 +60,15 @@ _BENIGN_EXACT_FIELDS = {
     "public_metadata",
     "public_key",
     "public_keys",
+    "password_policy",
+    "secret_backend",
     "secret_count",
+    "secret_format",
+    "secret_policy",
     "secret_ref",
     "secret_ref_id",
     "secret_ref_ids",
+    "secret_state",
     "signature_algorithm",
     "token_algorithm",
     "token_count",
@@ -58,6 +80,7 @@ _BENIGN_EXACT_FIELDS = {
     "token_usage",
     "token_endpoint",
     "token_endpoint_auth_method",
+    "token_policy",
     "token_url",
     "tokenizer",
     "tokenizers",
@@ -155,6 +178,49 @@ _KEY_QUALIFIERS = {
     "tls",
 }
 _PAYLOAD_TERMS = {"bytes", "data", "material", "payload", "raw", "value"}
+_MEASUREMENT_TERMS = {
+    "attempt",
+    "attempts",
+    "budget",
+    "capacity",
+    "ceiling",
+    "count",
+    "counts",
+    "length",
+    "limit",
+    "limits",
+    "max",
+    "maximum",
+    "metric",
+    "min",
+    "minimum",
+    "quota",
+    "sequence",
+    "sequences",
+    "send",
+    "sends",
+    "usage",
+    "used",
+}
+_CONTEXT_METADATA_FIELDS = {
+    "algorithm",
+    "backend",
+    "format",
+    "id",
+    "kind",
+    "policy",
+    "provider",
+    "ref",
+    "state",
+    "type",
+}
+
+
+def is_credential_metadata_field(key: str) -> bool:
+    """Recognize only exact non-material coordinates in credential contexts."""
+
+    normalized = normalize_field_name(key)
+    return normalized in _BENIGN_EXACT_FIELDS or normalized in _CONTEXT_METADATA_FIELDS
 
 
 def is_secret_field_name(key: str) -> bool:
@@ -169,6 +235,15 @@ def is_secret_field_name(key: str) -> bool:
         return False
     tokens = {token for token in normalized.split("_") if token}
     if not tokens:
+        return False
+    # Counts, limits, and sequence coordinates describe enforcement metadata,
+    # not material. Keep this structural and token-exact so ``password=123``
+    # remains a credential assignment while names such as
+    # ``max_credential_sends_per_attempt`` remain ordinary policy metadata.
+    if (
+        normalized.split("_", 1)[0] in {"max", "maximum", "min", "minimum"}
+        and tokens & _MEASUREMENT_TERMS
+    ):
         return False
     if "oauth" in tokens and tokens & {"endpoint", "url", "uri"}:
         return False
@@ -296,7 +371,8 @@ BARE_QUERY_CREDENTIAL_PATTERN = re.compile(
 CONFIG_ASSIGNMENT_PATTERN = re.compile(
     r"(?im)^[ \t]*(?:(?:(?:export|readonly|local|typeset)(?:[ \t]+-[A-Za-z]+)?|"
     r"set|setenv|declare[ \t]+-[A-Za-z]+)[ \t]+|\$env:)?"
-    r"(?P<name>[^\s=:]{1,128})[ \t]*(?:=|:)[ \t]*(?P<value>[^\r\n]{1,2048})$"
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_.$%+-]{0,127})[ \t]*"
+    r"(?P<operator>=|:)[ \t]*(?P<value>[^\r\n]{1,2048})$"
 )
 SHELL_SETENV_PATTERN = re.compile(
     r"(?im)^[ \t]*setenv[ \t]+(?P<name>[^\s=:]{1,128})[ \t]+"
@@ -412,7 +488,7 @@ def decoded_private_key_signature(value: str) -> bool:
 
 def _percent_decode_bounded(value: str) -> str | None:
     current = value
-    for _ in range(2):
+    for _ in range(8):
         if not re.search(r"%[0-9A-Fa-f]{2}", current):
             return current
         try:
@@ -429,13 +505,15 @@ def _percent_decode_bounded(value: str) -> str | None:
     return current
 
 
-def _credential_value_present(value: str) -> bool:
-    candidate = value.strip()
+def _credential_value_present(value: str, coordinate: str | None = None) -> bool:
+    candidate = re.split(r"[ \t]+[#;]", value.strip(), maxsplit=1)[0].strip()
     if not candidate:
         return False
-    if candidate[0:1] == candidate[-1:] and candidate.startswith(("'", '"')):
+    quoted = candidate[0:1] == candidate[-1:] and candidate.startswith(("'", '"'))
+    if quoted:
         candidate = candidate[1:-1].strip()
-    candidate = re.split(r"[ \t]+[#;]", candidate, maxsplit=1)[0].strip()
+    elif "'" in candidate or '"' in candidate:
+        return False
     lowered = candidate.lower()
     if lowered in {
         "[]",
@@ -454,6 +532,11 @@ def _credential_value_present(value: str) -> bool:
         return False
     if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", candidate):
         return False
+    shell_default = re.fullmatch(
+        r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-|:=)([^}]*)\}", candidate
+    )
+    if shell_default is not None:
+        return _credential_value_present(shell_default.group(1), coordinate)
     if re.fullmatch(
         r"(?i)(?:bearer|basic)[ \t]+\$\{[A-Za-z_$][A-Za-z0-9_$.]*\}",
         candidate,
@@ -471,7 +554,20 @@ def _credential_value_present(value: str) -> bool:
         lowered,
     ):
         return False
-    return True
+    if coordinate is not None and normalize_field_name(
+        candidate
+    ) == normalize_field_name(coordinate):
+        return False
+    if candidate in {"self", "this"}:
+        return False
+    if quoted:
+        return True
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9_~+./:@%=-]{1,1024}", candidate)
+        or re.fullmatch(
+            r"(?i)(?:bearer|basic)[ \t]+[A-Za-z0-9._~+/=%-]{1,512}", candidate
+        )
+    )
 
 
 def _query_credential_spans(text: str) -> list[tuple[int, int]]:
@@ -517,16 +613,92 @@ def _query_credential_spans(text: str) -> list[tuple[int, int]]:
     return sorted(set(spans))
 
 
-def _nfkc_scan_view(text: str) -> tuple[str, list[int]]:
-    """Build a compatibility-normalized view with source-offset provenance."""
+def _nfkc_scan_view(
+    text: str, budget: WorkBudget | None = None
+) -> tuple[str, Sequence[int] | None]:
+    """Build a normalized view after charging expansion/provenance allocation."""
 
+    if budget is not None:
+        budget.charge_parser_operations(len(text))
+    changed = False
+    normalized_length = 0
+    normalized_bytes = 0
+    for char in text:
+        normalized = unicodedata.normalize("NFKC", char)
+        changed = changed or normalized != char
+        normalized_length += len(normalized)
+        size = utf8_size(normalized)
+        if size is None:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+        normalized_bytes += size
+    if not changed:
+        return text, None
+
+    # ``array('I')`` is the bounded four-byte source provenance representation.
+    # Charge both allocations before constructing either one.
+    allocation = normalized_bytes + normalized_length * 4
+    if budget is not None:
+        budget.ensure_work_capacity(allocation)
+        budget.charge_work(allocation)
+        budget.charge_parser_operations(len(text))
     chunks: list[str] = []
-    offsets: list[int] = []
+    offsets = array("I")
     for index, char in enumerate(text):
         normalized = unicodedata.normalize("NFKC", char)
         chunks.append(normalized)
         offsets.extend([index] * len(normalized))
     return "".join(chunks), offsets
+
+
+_SECTION_HEADER = re.compile(r"^\s*\[\[?([^\]\r\n]{1,512})\]\]?\s*(?:[#;].*)?$")
+
+
+def _credential_assignment_spans(
+    text: str, *, allow_colon_assignment: bool
+) -> list[tuple[int, int]]:
+    """Return low-entropy assignment values with INI/TOML section context."""
+
+    spans: list[tuple[int, int]] = []
+    credential_section = False
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        logical = line.rstrip("\r\n")
+        section = _SECTION_HEADER.fullmatch(logical)
+        if section is not None:
+            components = [
+                component.strip().strip("'\"")
+                for component in section.group(1).split(".")
+            ]
+            credential_section = any(
+                is_secret_field_name(component) for component in components
+            )
+            offset += len(line)
+            continue
+        for pattern in (CONFIG_ASSIGNMENT_PATTERN, SHELL_SETENV_PATTERN):
+            match = pattern.fullmatch(logical)
+            if match is None:
+                continue
+            if (
+                pattern is CONFIG_ASSIGNMENT_PATTERN
+                and match.group("operator") == ":"
+                and not allow_colon_assignment
+            ):
+                continue
+            name = _percent_decode_bounded(match.group("name"))
+            if name is None or not _credential_value_present(
+                match.group("value"), name
+            ):
+                continue
+            normalized_name = normalize_field_name(name)
+            sensitive = is_secret_field_name(name) or (
+                credential_section and not is_credential_metadata_field(normalized_name)
+            )
+            if sensitive:
+                spans.append(
+                    (offset + match.start("value"), offset + match.end("value"))
+                )
+        offset += len(line)
+    return sorted(set(spans))
 
 
 def scan_content(
@@ -535,22 +707,42 @@ def scan_content(
     *,
     authorization_context: bool = False,
     assignment_context: bool = False,
+    colon_assignment_context: bool = False,
+    budget: WorkBudget | None = None,
 ) -> list[ContentHit]:
     """Return every occurrence (including same-line duplicates) up to the cap."""
 
-    normalized_text, source_offsets = _nfkc_scan_view(text)
-    search_text = "".join(
-        " " if char.isspace() and char not in {"\n", "\r", "\t"} else char
+    normalized_text, source_offsets = _nfkc_scan_view(text, budget)
+    needs_whitespace_view = any(
+        char.isspace() and char not in {"\n", "\r", "\t", " "}
         for char in normalized_text
+    )
+    if needs_whitespace_view and budget is not None:
+        normalized_size = utf8_size(normalized_text)
+        if normalized_size is None:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+        budget.ensure_work_capacity(normalized_size)
+        budget.charge_work(normalized_size)
+    search_text = (
+        "".join(
+            " " if char.isspace() and char not in {"\n", "\r", "\t"} else char
+            for char in normalized_text
+        )
+        if needs_whitespace_view
+        else normalized_text
     )
     hits: list[ContentHit] = []
     occupied: list[tuple[int, int]] = []
 
     def add(code: str, start: int, end: int) -> bool:
-        if not source_offsets or start >= len(source_offsets) or end <= start:
+        if start >= len(search_text) or end <= start:
             return False
-        source_start = source_offsets[start]
-        source_end = source_offsets[min(end - 1, len(source_offsets) - 1)] + 1
+        source_start = source_offsets[start] if source_offsets is not None else start
+        source_end = (
+            source_offsets[min(end - 1, len(source_offsets) - 1)] + 1
+            if source_offsets is not None
+            else end
+        )
         hits.append(
             ContentHit(
                 line_for_offset(text, source_start),
@@ -597,22 +789,13 @@ def scan_content(
         ) and add("SCC003_AUTH_VALUE", match.start(), match.end()):
             return sorted(hits)
     if assignment_context:
-        for pattern in (CONFIG_ASSIGNMENT_PATTERN, SHELL_SETENV_PATTERN):
-            for match in pattern.finditer(search_text):
-                name = _percent_decode_bounded(match.group("name"))
-                if (
-                    name is None
-                    or not is_secret_field_name(name)
-                    or not _credential_value_present(match.group("value"))
-                    or overlaps(match.start("value"), match.end("value"))
-                ):
-                    continue
-                if add(
-                    "SCC003_AUTH_VALUE",
-                    match.start("value"),
-                    match.end("value"),
-                ):
-                    return sorted(hits)
+        for start, end in _credential_assignment_spans(
+            search_text, allow_colon_assignment=colon_assignment_context
+        ):
+            if overlaps(start, end):
+                continue
+            if add("SCC003_AUTH_VALUE", start, end):
+                return sorted(hits)
     for match in CREDENTIAL_HEX_ASSIGNMENT_PATTERN.finditer(search_text):
         if not is_secret_field_name(match.group("name")):
             continue

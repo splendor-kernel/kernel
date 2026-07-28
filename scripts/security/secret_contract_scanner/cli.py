@@ -88,6 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "C03 secret contract scan: PASS "
         f"(governed_files={stats.governed_files}, content_files={stats.content_files}, "
         f"archive_members={stats.archive_members}, bytes_worked={stats.bytes_worked}, "
+        f"parser_operations={stats.parser_operations}, "
         f"structural_exceptions={stats.structural_exceptions}, "
         f"content_allowlists={stats.content_allowlists})"
     )

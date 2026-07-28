@@ -7,8 +7,8 @@ import re
 from collections import Counter
 
 SCANNER_COMMANDS = (
-    "/usr/bin/python3 scripts/security/check-secret-contracts.py --self-test",
-    "/usr/bin/python3 scripts/security/check-secret-contracts.py",
+    "/usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test",
+    "/usr/bin/python3 -I scripts/security/check-secret-contracts.py",
 )
 CHECKOUT_COMMANDS = (
     "git init .",
@@ -25,10 +25,10 @@ REQUIRED_WORKFLOWS = (
 EXPECTED_WORKFLOW_SHA256 = {
     REQUIRED_WORKFLOWS[
         0
-    ]: "71fec9c94125b3bc1da077fa3c40501117f174de669ca69de4621b9a2cded728",
+    ]: "6b8b69bd670ff9290a485e39ab7cc8c508299b1db6bd15d69bbf956afd9a3ab8",
     REQUIRED_WORKFLOWS[
         1
-    ]: "c8884d0634eea70136d8c0c3173e8c0341fd26da3b0c472d863fb6d72cfc85c8",
+    ]: "728733b443f5bd0bf42d9a94e03d5b1f042cb3e16ee53cf2c9a96a59433ad652",
 }
 EXPECTED_JOBS = {
     REQUIRED_WORKFLOWS[0]: {
@@ -48,18 +48,18 @@ EXPECTED_JOBS = {
 EXPECTED_ACTIONS = {
     REQUIRED_WORKFLOWS[0]: Counter(
         {
-            "actions/setup-node@v4": 1,
-            "actions/setup-python@v5": 1,
+            "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020": 1,
+            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065": 1,
         }
     ),
     REQUIRED_WORKFLOWS[1]: Counter(
         {
-            "actions/download-artifact@v4": 1,
-            "actions/upload-artifact@v4": 1,
-            "docker/build-push-action@v6": 2,
-            "docker/login-action@v3": 2,
-            "docker/metadata-action@v5": 3,
-            "docker/setup-buildx-action@v3": 3,
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": 1,
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": 1,
+            "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8": 2,
+            "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9": 2,
+            "docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051": 3,
+            "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f": 3,
         }
     ),
 }
@@ -213,6 +213,8 @@ def validate_workflow_text(path: str, text: str) -> bool:
         for match in re.finditer(r"(?m)^\s+(?:-\s+)?uses:\s*([^\s#]+)\s*$", text)
     )
     if actions != EXPECTED_ACTIONS[path]:
+        return False
+    if any(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action) is None for action in actions):
         return False
     for job, block in blocks.items():
         dependencies = _needs(block)

@@ -105,8 +105,8 @@ MINIMAL_SCANNER_WORKFLOW = b"""jobs:
     timeout-minutes: 5
     steps:
       - run: |
-          /usr/bin/python3 scripts/security/check-secret-contracts.py --self-test
-          /usr/bin/python3 scripts/security/check-secret-contracts.py
+          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
+          /usr/bin/python3 -I scripts/security/check-secret-contracts.py
 """
 
 
@@ -150,11 +150,13 @@ def policy_template() -> dict[str, Any]:
             "max_array_items": 512,
             "max_string_bytes": 65_536,
             "max_markdown_fences": 32,
+            "max_parser_operations": 1_000_000,
             "max_archive_members": 64,
             "max_archive_unpacked_bytes": 1_048_576,
             "max_findings": 256,
         },
         "governed_roots": [],
+        "source_owner_exports": [],
         "owner_schema_documents": [],
         "structural_exceptions": [],
         "symbolic_fixtures": [],
@@ -180,6 +182,31 @@ def scan_explicit(
         findings, _stats = scan_repository(
             root,
             policy or policy_template(),
+            explicit_paths=[relative],
+        )
+        return findings
+
+
+def scan_with_production_types_owner(relative: str, data: bytes) -> list[Finding]:
+    policy, policy_findings = load_policy(
+        REPO_ROOT,
+        "scripts/security/secret-contract-policy.json",
+        today=dt.date(2026, 7, 26),
+    )
+    if policy is None or policy_findings:
+        raise AssertionError(policy_findings)
+    owner = policy["source_owner_exports"][0]
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        write_file(root, relative, data)
+        for key in ("path", "package_path"):
+            source_path = owner[key]
+            write_file(root, source_path, (REPO_ROOT / source_path).read_bytes())
+        local_policy = policy_template()
+        local_policy["source_owner_exports"] = [owner]
+        findings, _stats = scan_repository(
+            root,
+            local_policy,
             explicit_paths=[relative],
         )
         return findings
@@ -593,11 +620,9 @@ class SourceSurfaceTests(unittest.TestCase):
                     "SCF005_SOURCE_FIELD", codes(scan_explicit("fixture.ts", data))
                 )
 
-    def test_safe_typed_secret_reference_is_not_rejected(self) -> None:
-        data = b'import type { SecretRefV2 } from "@splendor/types";\nexport interface Request {\n  secretRef: SecretRefV2;\n}\n'
-        self.assertNotIn(
-            "SCF005_SOURCE_FIELD", codes(scan_explicit("fixture.ts", data))
-        )
+    def test_unpinned_lexical_secret_reference_is_rejected(self) -> None:
+        data = b'import type { SecretRefV2 } from "@splendor/types";\nexport interface Request {\n  secret: SecretRefV2;\n}\n'
+        self.assertIn("SCF005_SOURCE_FIELD", codes(scan_explicit("fixture.ts", data)))
 
     def test_safe_type_name_or_raw_union_cannot_smuggle_source_field(self) -> None:
         for annotation in ("SecretRefButRaw", "SecretRef | bytes"):
@@ -745,7 +770,7 @@ class SourceSurfaceTests(unittest.TestCase):
                     codes(scan_explicit("fixture.py", source.encode())),
                 )
 
-    def test_python_safe_reference_requires_canonical_import_provenance(self) -> None:
+    def test_python_lexical_safe_reference_has_no_pinned_owner_export(self) -> None:
         canonical = (
             "from splendor.types import SecretRefV2\n"
             "class Request:\n    secret: SecretRefV2 | None = None\n"
@@ -760,7 +785,7 @@ class SourceSurfaceTests(unittest.TestCase):
             "    class Request:\n"
             "        secret: Ref | None = None\n"
         )
-        self.assertNotIn(
+        self.assertIn(
             "SCF005_SOURCE_FIELD",
             codes(scan_explicit("fixture.py", canonical.encode())),
         )
@@ -830,18 +855,18 @@ class SourceSurfaceTests(unittest.TestCase):
 
     def test_typescript_safe_reference_requires_nonshadowed_import(self) -> None:
         canonical = (
-            'import type { SecretRefV2 } from "@splendor/types";\n'
-            "export interface Request { secret: SecretRefV2 | null; }\n"
+            'import type { CallerCredential } from "@splendor/types";\n'
+            "export interface Request { credential: CallerCredential | null; }\n"
         )
         shadowed = (
-            'import type { SecretRefV2 } from "@splendor/types";\n'
-            "type SecretRefV2 = string;\n"
-            "export interface Request { secret: SecretRefV2; }\n"
+            'import type { CallerCredential } from "@splendor/types";\n'
+            "type CallerCredential = string;\n"
+            "export interface Request { credential: CallerCredential; }\n"
         )
         alias_shadowed = (
-            'import type { SecretRefV2 as Ref } from "@splendor/types";\n'
+            'import type { CallerCredential as Ref } from "@splendor/types";\n'
             "function build(Ref: unknown) {\n"
-            "  class Request { secret: Ref; }\n"
+            "  class Request { credential: Ref; }\n"
             "}\n"
         )
         name_only_owner = (
@@ -850,14 +875,17 @@ class SourceSurfaceTests(unittest.TestCase):
         )
         self.assertNotIn(
             "SCF005_SOURCE_FIELD",
-            codes(scan_explicit("fixture.ts", canonical.encode())),
-        )
-        self.assertIn(
-            "SCF005_SOURCE_FIELD", codes(scan_explicit("fixture.ts", shadowed.encode()))
+            codes(scan_with_production_types_owner("fixture.ts", canonical.encode())),
         )
         self.assertIn(
             "SCF005_SOURCE_FIELD",
-            codes(scan_explicit("fixture.ts", alias_shadowed.encode())),
+            codes(scan_with_production_types_owner("fixture.ts", shadowed.encode())),
+        )
+        self.assertIn(
+            "SCF005_SOURCE_FIELD",
+            codes(
+                scan_with_production_types_owner("fixture.ts", alias_shadowed.encode())
+            ),
         )
         self.assertIn(
             "SCF005_SOURCE_FIELD",
@@ -1884,7 +1912,7 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
             validate_workflow_text(
                 ci_path,
                 ci.replace(
-                    "/usr/bin/python3 scripts/security/check-secret-contracts.py --self-test",
+                    "/usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test",
                     "true",
                     1,
                 ),
@@ -1920,8 +1948,8 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
             validate_workflow_text(
                 ci_path,
                 ci.replace(
-                    "          /usr/bin/python3 scripts/security/check-secret-contracts.py --self-test\n",
-                    "          set +e\n          /usr/bin/python3 scripts/security/check-secret-contracts.py --self-test\n",
+                    "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n",
+                    "          set +e\n          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n",
                     1,
                 ),
             )
@@ -1935,8 +1963,8 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
             validate_workflow_text(
                 ci_path,
                 ci.replace(
-                    "/usr/bin/python3 scripts/security/check-secret-contracts.py --self-test",
-                    "# /usr/bin/python3 scripts/security/check-secret-contracts.py --self-test",
+                    "/usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test",
+                    "# /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test",
                     1,
                 ),
             )
@@ -1967,8 +1995,8 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
                 1,
             ),
             ci.replace(
-                "          /usr/bin/python3 scripts/security/check-secret-contracts.py\n",
-                "          /usr/bin/python3 scripts/security/check-secret-contracts.py || true\n",
+                "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py\n",
+                "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py || true\n",
                 1,
             ),
         )
@@ -2054,6 +2082,10 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
                 "openapi/splendor-runtime-daemon.yaml",
                 {".yaml": "yaml"},
             ),
+            "openapi-external-surface": (
+                "openapi",
+                {".json": "json", ".yaml": "yaml", ".yml": "yaml"},
+            ),
             "repository-examples": (
                 "examples",
                 {
@@ -2076,6 +2108,23 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
                 "python/splendor",
                 {".py": "python_source"},
             ),
+            "python-package-manifest": (
+                "python/pyproject.toml",
+                {".toml": "config"},
+            ),
+            "typescript-packages-external-surface": (
+                "typescript/packages",
+                {
+                    ".cjs": "typescript_source",
+                    ".js": "typescript_source",
+                    ".json": "json",
+                    ".jsx": "typescript_source",
+                    ".mjs": "typescript_source",
+                    ".mts": "typescript_source",
+                    ".ts": "typescript_source",
+                    ".tsx": "typescript_source",
+                },
+            ),
             "typescript-types-external-surface": (
                 "typescript/packages/types/src",
                 {".ts": "typescript_source"},
@@ -2083,6 +2132,15 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
             "typescript-client-external-surface": (
                 "typescript/packages/client/src",
                 {".ts": "typescript_source"},
+            ),
+            "gold-example-catalog": (
+                "docs/rules/v2/gold/examples",
+                {
+                    ".json": "json",
+                    ".md": "markdown",
+                    ".yaml": "yaml",
+                    ".yml": "yaml",
+                },
             ),
         }
         self.assertEqual(

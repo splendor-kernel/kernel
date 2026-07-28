@@ -52,6 +52,12 @@ CONFIG_SUFFIXES = {
     ".toml",
     ".zsh",
 }
+WORKFLOW_PATH_PATTERN = re.compile(r"^\.github/workflows/[^/]+\.(?:yml|yaml)$")
+KNOWN_UNGOVERNED_PACKAGE_MANIFESTS = {
+    "package.json",
+    "python/bindings/pyproject.toml",
+}
+EXTERNAL_SOURCE_ROOT_NAMES = {"client", "clients", "sdk", "sdks"}
 
 
 @dataclass
@@ -84,6 +90,44 @@ def governed_formats(
                 findings.append(Finding(path, 0, "SCN001_POLICY_INVALID"))
             formats[path] = kind
     return formats, findings
+
+
+def _unregistered_surface_findings(
+    files: Sequence[str], formats: dict[str, str]
+) -> list[Finding]:
+    """Fail closed when repository discovery exposes a new authorizing root."""
+
+    findings: list[Finding] = []
+    allowed_python_roots = {"bindings", "splendor", "tests"}
+    for path in files:
+        python_match = re.fullmatch(r"python/([^/]+)(?:/.*)?\.py", path)
+        if python_match and python_match.group(1) not in allowed_python_roots:
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if path.startswith("conformance/0.2/") and path not in formats:
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        lowered_parts = tuple(part.lower() for part in path.split("/"))
+        manifest_name = lowered_parts[-1] if lowered_parts else ""
+        if (
+            manifest_name in {"package.json", "pyproject.toml"}
+            and path not in formats
+            and path not in KNOWN_UNGOVERNED_PACKAGE_MANIFESTS
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
+            suffix_for(path) in SOURCE_SUFFIXES
+            and path not in formats
+            and any(part in EXTERNAL_SOURCE_ROOT_NAMES for part in lowered_parts[:-1])
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
+            re.fullmatch(
+                r"(?i)(?:openapi|swagger)(?:[-_.][A-Za-z0-9_-]+)?\.(?:json|ya?ml)",
+                manifest_name,
+            )
+            and path not in formats
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+    return sorted(set(findings))
 
 
 def _decode_unambiguous(data: bytes) -> str | None:
@@ -133,11 +177,16 @@ def _selected_kind(
 ) -> str:
     if governed_kind:
         return governed_kind
+    suffix = suffix_for(path)
+    # INI/TOML table syntax may begin with ``[`` or ``[[``. Preserve the exact
+    # config grammar before suffix-independent JSON sniffing so credential
+    # section ancestry is evaluated rather than misclassified as malformed JSON.
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
     if _looks_like_json_text(text):
         return "json"
     if prefer_structured_sniff and looks_like_yaml_document(text):
         return "yaml"
-    suffix = suffix_for(path)
     first_line = text.splitlines()[0] if text.splitlines() else ""
     if first_line.startswith("#!"):
         lowered = first_line.lower()
@@ -157,8 +206,6 @@ def _selected_kind(
         return "yaml"
     if suffix == ".md" and rich_surface:
         return "markdown"
-    if suffix in CONFIG_SUFFIXES:
-        return "config"
     if not suffix and re.search(
         r"(?m)^\s*(?:async\s+)?(?:class|def|from|import)\s+", text
     ):
@@ -212,9 +259,16 @@ def _scan_raw_text(
     budget: WorkBudget,
     maximum_hits: int,
     assignment_context: bool = False,
+    colon_assignment_context: bool = False,
 ) -> list[ContentHit]:
     budget.charge_text(text)
-    return scan_content(text, maximum_hits, assignment_context=assignment_context)
+    return scan_content(
+        text,
+        maximum_hits,
+        assignment_context=assignment_context,
+        colon_assignment_context=colon_assignment_context,
+        budget=budget,
+    )
 
 
 def _exact_owner_status(
@@ -334,6 +388,7 @@ def _scan_text_blob(
     used_exceptions: dict[tuple[str, str, str], int],
     unit_digests: dict[str, str],
     structural_fields: bool,
+    safe_type_exports: dict[str, set[str]],
 ) -> BlobScan:
     unit_digests[path] = hashlib.sha256(data).hexdigest()
     maximum = policy["limits"]["max_findings"] + 1
@@ -357,10 +412,42 @@ def _scan_text_blob(
         fences = parse_markdown_fences(data, policy["limits"], budget)
         outside = markdown_outside_fences(text, fences)
         scans: list[BlobScan] = [
-            BlobScan(_scan_raw_text(outside, budget=budget, maximum_hits=maximum), [])
+            BlobScan(
+                _scan_raw_text(
+                    outside,
+                    budget=budget,
+                    maximum_hits=maximum,
+                    assignment_context=True,
+                ),
+                [],
+            )
         ]
         for fence in fences:
             fence_path = f"{path}#fence-{fence.start_line}"
+            if fence.kind in {"python_source", "typescript_source"}:
+                fence_text = _decode_unambiguous(fence.data)
+                if fence_text is None:
+                    raise ScanDataError("SCN008_MALFORMED_MARKDOWN", fence.start_line)
+                scans.append(
+                    _scan_text_blob(
+                        path=fence_path,
+                        data=fence.data,
+                        text=fence_text,
+                        kind=fence.kind,
+                        policy=policy,
+                        budget=budget,
+                        owner_documents=owner_documents,
+                        symbolic_fixtures=symbolic_fixtures,
+                        exceptions=exceptions,
+                        used_owner=used_owner,
+                        used_symbolic=used_symbolic,
+                        used_exceptions=used_exceptions,
+                        unit_digests=unit_digests,
+                        structural_fields=structural_fields,
+                        safe_type_exports=safe_type_exports,
+                    )
+                )
+                continue
             scans.append(
                 _scan_structured_document(
                     path=fence_path,
@@ -385,7 +472,11 @@ def _scan_text_blob(
         text,
         budget=budget,
         maximum_hits=maximum,
-        assignment_context=kind == "config",
+        # Low-entropy assignment grammar is suffix-independent for every
+        # unambiguous UTF-8 candidate. Source files use their stronger AST/token
+        # grammar to avoid mistaking annotations for material assignments.
+        assignment_context=kind not in {"python_source", "typescript_source"},
+        colon_assignment_context=kind == "config",
     )
     if kind == "python_source":
         if not structural_fields:
@@ -397,6 +488,7 @@ def _scan_text_blob(
             used_exceptions=used_exceptions,
             budget=budget,
             maximum_hits=maximum,
+            safe_type_names=safe_type_exports.get("python", set()),
         )
         return BlobScan(_deduplicate_hits(raw_hits + source.hits), source.findings)
     if kind == "typescript_source":
@@ -409,6 +501,7 @@ def _scan_text_blob(
             used_exceptions=used_exceptions,
             budget=budget,
             maximum_hits=maximum,
+            safe_type_names=safe_type_exports.get("typescript", set()),
         )
         return BlobScan(_deduplicate_hits(raw_hits + source.hits), source.findings)
     if kind == "empty" and data:
@@ -466,6 +559,7 @@ def _scan_repository_pinned(
             return findings, stats
         formats, format_findings = governed_formats(policy, files)
         findings.extend(format_findings)
+        findings.extend(_unregistered_surface_findings(files, formats))
 
     owner_documents = {
         entry["path"]: entry for entry in policy["owner_schema_documents"]
@@ -485,6 +579,33 @@ def _scan_repository_pinned(
     unit_digests: dict[str, str] = {}
     used_allowlists: set[str] = set()
     workflow_text: dict[str, str] = {}
+    safe_type_exports: dict[str, set[str]] = {}
+    source_owner_digests: dict[str, str] = {}
+    used_source_owner_files: set[str] = set()
+    for entry in policy["source_owner_exports"]:
+        entry_digests = {
+            entry["path"]: entry["sha256"],
+            entry["package_path"]: entry["package_sha256"],
+        }
+        source_owner_digests.update(entry_digests)
+        valid_entry = True
+        for owner_path, expected_digest in entry_digests.items():
+            try:
+                owner_data = repository.read_file(owner_path, limits["max_file_bytes"])
+                budget.charge_work(len(owner_data))
+                used_source_owner_files.add(owner_path)
+                if hashlib.sha256(owner_data).hexdigest() != expected_digest:
+                    valid_entry = False
+                    findings.append(
+                        Finding(owner_path, 0, "SCF003_INVALID_SAFE_RECORD")
+                    )
+            except ScanDataError:
+                valid_entry = False
+                findings.append(Finding(owner_path, 0, "SCF003_INVALID_SAFE_RECORD"))
+        if valid_entry:
+            safe_type_exports.setdefault(entry["language"], set()).update(
+                entry["exports"]
+            )
 
     def record_blob(path: str, data: bytes, scan: BlobScan) -> None:
         nonlocal findings
@@ -507,6 +628,11 @@ def _scan_repository_pinned(
             budget.charge_file()
             data = repository.read_file(path, limits["max_file_bytes"])
             budget.charge_work(len(data))
+            expected_source_digest = source_owner_digests.get(path)
+            if expected_source_digest is not None:
+                used_source_owner_files.add(path)
+                if hashlib.sha256(data).hexdigest() != expected_source_digest:
+                    findings.append(Finding(path, 0, "SCF003_INVALID_SAFE_RECORD"))
             archive_kind = detect_archive_kind(data)
             archive_named = suffix_for(path) in ARCHIVE_SUFFIXES
             if archive_kind is not None or archive_named:
@@ -543,6 +669,7 @@ def _scan_repository_pinned(
                         used_exceptions=used_exceptions,
                         unit_digests=unit_digests,
                         structural_fields=True,
+                        safe_type_exports=safe_type_exports,
                     )
                     record_blob(display, member.data, member_scan)
                     if len(findings) > limits["max_findings"]:
@@ -552,6 +679,8 @@ def _scan_repository_pinned(
             text = _decode_unambiguous(data)
             governed_kind = formats.get(path)
             if text is None:
+                if WORKFLOW_PATH_PATTERN.fullmatch(path):
+                    raise ScanDataError("SCN012_WORKFLOW_UNGATED")
                 if governed_kind:
                     raise ScanDataError("SCN003_PATH_AMBIGUOUS")
                 continue
@@ -586,9 +715,10 @@ def _scan_repository_pinned(
                 used_exceptions=used_exceptions,
                 unit_digests=unit_digests,
                 structural_fields=structural_fields,
+                safe_type_exports=safe_type_exports,
             )
             record_blob(path, data, blob_scan)
-            if path in REQUIRED_WORKFLOWS:
+            if WORKFLOW_PATH_PATTERN.fullmatch(path):
                 workflow_text[path] = text
         except ScanDataError as exc:
             findings.append(Finding(path, exc.line, exc.code))
@@ -599,11 +729,20 @@ def _scan_repository_pinned(
         if len(findings) > limits["max_findings"]:
             break
 
+    workflow_paths = {
+        path for path in files if WORKFLOW_PATH_PATTERN.fullmatch(path) is not None
+    }
     if explicit_paths is None:
-        for path in REQUIRED_WORKFLOWS:
-            text = workflow_text.get(path)
-            if text is None or not validate_workflow_text(path, text):
-                findings.append(Finding(path, 0, "SCN012_WORKFLOW_UNGATED"))
+        workflow_paths.update(REQUIRED_WORKFLOWS)
+    for path in sorted(workflow_paths):
+        text = workflow_text.get(path)
+        if (
+            path not in REQUIRED_WORKFLOWS
+            or text is None
+            or not validate_workflow_text(path, text)
+        ):
+            findings.append(Finding(path, 0, "SCN012_WORKFLOW_UNGATED"))
+    if explicit_paths is None:
         for path in sorted(set(owner_documents) - used_owner):
             findings.append(Finding(path, 0, "SCN009_STALE_ALLOWLIST"))
         for path in sorted(set(symbolic_fixtures) - used_symbolic):
@@ -611,6 +750,8 @@ def _scan_repository_pinned(
         for identity in sorted(set(exceptions) - set(used_exceptions)):
             findings.append(Finding(identity[0], 0, "SCN009_STALE_ALLOWLIST"))
         for path in sorted(set(allowlists) - used_allowlists):
+            findings.append(Finding(path, 0, "SCN009_STALE_ALLOWLIST"))
+        for path in sorted(set(source_owner_digests) - used_source_owner_files):
             findings.append(Finding(path, 0, "SCN009_STALE_ALLOWLIST"))
     for identity, count in sorted(used_exceptions.items()):
         entry = exceptions[identity]
@@ -620,6 +761,7 @@ def _scan_repository_pinned(
             findings.append(Finding(identity[0], 0, "SCF004_INVALID_EXCEPTION"))
     stats.structural_exceptions = sum(used_exceptions.values())
     stats.bytes_worked = budget.work_bytes
+    stats.parser_operations = budget.parser_operations
     return _bounded_findings(findings, limits["max_findings"]), stats
 
 

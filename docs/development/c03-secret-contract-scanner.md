@@ -23,11 +23,14 @@ make security-secret-contracts
 Or run them directly:
 
 ```bash
-python3 scripts/security/check-secret-contracts.py --self-test
-python3 scripts/security/check-secret-contracts.py
+/usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
+/usr/bin/python3 -I scripts/security/check-secret-contracts.py
 ```
 
-The self-test uses only temporary synthetic fragments. Normal mode enumerates
+The absolute interpreter and isolated-mode flag are part of the security
+contract: repository files such as `scripts/security/hashlib.py` cannot shadow
+the standard library during scanner startup. The self-test includes a subprocess
+regression for both commands and uses only temporary synthetic fragments. Normal mode enumerates
 tracked plus non-ignored files with local `git ls-files`; every regular file is
 read relative to one no-follow, descriptor-pinned repository root under the
 cumulative budget and every unambiguous UTF-8 file is
@@ -36,16 +39,19 @@ and the Docker image workflow run these commands in a dedicated prerequisite
 job; build, test, image, and publication jobs do not start unless both pass.
 Every job fetches, detaches, and verifies the same immutable `GITHUB_SHA`; there
 is no mutable-ref or `FETCH_HEAD` fallback.
-Recognized JSON, YAML, and Markdown files are additionally decoded so escaped,
-folded, keyed, and scalar content is scanned recursively. Registered governed
-Python, JavaScript, and TypeScript roots, sniffed archive members, and explicitly
-selected source files receive bounded declaration checks.
+Recognized JSON, YAML, INI/TOML-style configuration, and Markdown files are
+additionally decoded so escaped, folded, keyed, ancestor-scoped, and scalar
+content is scanned recursively. Registered governed Python, JavaScript, and
+TypeScript roots, sniffed archive members, and explicitly selected source files
+receive bounded declaration checks. Normal mode rejects unregistered OpenAPI,
+external SDK/client/package, conformance, and Gold authorizing surfaces instead
+of treating a new root as ordinary text.
 
 To check one new repository-relative fixture before placing it under a governed
 root:
 
 ```bash
-python3 scripts/security/check-secret-contracts.py --path path/to/fixture.json
+/usr/bin/python3 -I scripts/security/check-secret-contracts.py --path path/to/fixture.json
 ```
 
 Missing paths, symlinks, traversal, malformed or duplicate JSON/YAML keys,
@@ -75,10 +81,13 @@ literal/folded blocks (including sequence block scalars). Anchors, aliases, tags
 merge keys, multiple documents, tabs in indentation, and ambiguous indentation
 are rejected. Standard YAML quoted scalar escapes are decoded under the same
 Unicode and work budgets. Recognized JSON/YAML fences in Markdown must close and
-parse; JSONC/JSON5/JSON-lines-like fences fail closed instead of being skipped. Structural
+parse; governed Python/JavaScript/TypeScript fences use the bounded source
+grammar, and bounded MyST options such as captions are normalized before parsing.
+JSONC/JSON5/JSON-lines-like fences and residual container/fence syntax beyond the
+configured structural depth fail closed instead of being skipped. Structural
 forbidden-field enforcement remains limited to registered governed roots,
-explicit paths, and sniffed archive manifests; decoded content signatures cover
-all recognized repository text.
+explicit paths, and sniffed archive manifests; decoded content signatures and
+low-entropy assignment checks cover every unambiguous repository text file.
 
 Repository content scanning covers bounded UTF-8 source, fixtures, generated
 text, docs, manifests, and ZIP/TAR/GZIP containers recognized by magic rather
@@ -89,6 +98,8 @@ compression methods fail closed. Archive traversal, links, encryption,
 prefixes/polyglots, trailing data, ZIP comments, credential-capable
 member/metadata names, concatenated GZIP streams, malformed members, excessive
 expansion, or cumulative file/member/unpacked/work budget overflow fail closed.
+Supported V7 and USTAR TAR headers are detected by a bounded linear scan at every
+possible offset, including inside an otherwise opaque nested member.
 Global member capacity is checked before archive-library enumeration. Every
 archive member that decodes as unambiguous UTF-8 is content-scanned regardless
 of filename suffix. UTF-8 BOM/NUL/control/format ambiguity fails closed; opaque
@@ -147,6 +158,8 @@ rule message. Credential-capable path/archive-member segments are
 replaced by the single fixed `<redacted>` marker, including normalized plural,
 percent-encoded, and opaque mixed-token segments;
 candidate material and matched substrings are never printed.
+Percent-encoded diagnostic segments are decoded to a bounded fixed point before
+classification and collapse to the same fixed marker.
 Malformed Unicode, non-finite values, archives, and filesystem objects map to
 fixed rule codes.
 
@@ -158,7 +171,7 @@ removes it:
 ```bash
 tmp="$(mktemp .c03-secret-negative.XXXXXX.json)"
 trap 'rm -f "$tmp"' EXIT
-python3 - "$tmp" <<'PY'
+/usr/bin/python3 - "$tmp" <<'PY'
 import json
 import pathlib
 import sys
@@ -168,7 +181,7 @@ pathlib.Path(sys.argv[1]).write_text(
     encoding="utf-8",
 )
 PY
-if python3 scripts/security/check-secret-contracts.py --path "$tmp"; then
+if /usr/bin/python3 -I scripts/security/check-secret-contracts.py --path "$tmp"; then
   echo "unsafe fixture unexpectedly passed" >&2
   exit 1
 fi
@@ -176,14 +189,19 @@ fi
 
 ## Limits and nonclaims
 
-The policy caps cumulative files/work bytes/structure nodes/archive members and
-unpacked bytes, plus per-document depth/members/strings/fences. Raising a cap
-beyond the scanner's hard ceiling is invalid. Both CI workflows impose a
-five-minute scanner-job timeout as an outer resource bound.
+The policy caps cumulative files/work bytes/parser operations/structure
+nodes/archive members and unpacked bytes, plus per-document
+depth/members/strings/fences. YAML, source token/AST walks, normalization, and
+provenance construction are deterministically operation- or work-charged before
+unbounded allocation. Raising a cap beyond the scanner's hard ceiling is invalid.
+Both CI workflows impose a five-minute scanner-job timeout as an outer resource
+bound.
 
-The mandatory self-test pins exactly 141 unique test identities and their
-manifest digest. Zero discovery, a missing test, governed-root inventory drift,
-or owner/symbolic fixture digest drift fails closed.
+The mandatory self-test discovers and digest-pins every
+`scripts/security/tests/test_*.py` module, currently exactly 159 unique test
+identities. Zero discovery, an added/removed/renamed test module or case,
+governed-root inventory drift, or owner/symbolic fixture digest drift fails
+closed.
 
 The repository has no configured root Python typing policy or scanner-specific
 type-check CI job. Correction validation therefore runs the explicit default-tool
@@ -192,8 +210,9 @@ point, package, and independent tests; none is required at scanner runtime.
 
 The content scan is deterministic defense in depth, not proof that arbitrary
 binary, encrypted, compressed-inside-an-unknown-container, steganographic,
-custom-encoded, or split runtime material is absent. Python source checks use the
-standard AST; JavaScript/TypeScript checks intentionally recognize a bounded
-class/interface/type field grammar rather than a complete language grammar.
+custom-encoded, or split runtime material is absent. Python uses the standard AST
+and JavaScript/TypeScript uses a closed bounded authoring grammar rather than a
+complete language parser; unsupported credential-capable record, computed,
+mapped, rebinding, or nesting forms fail closed.
 Gitleaks or another approved general secret scanner remains complementary;
 neither replaces the structural C03 contract checks.

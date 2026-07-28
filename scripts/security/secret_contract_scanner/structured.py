@@ -13,6 +13,7 @@ from typing import Any
 
 from .content import (
     is_authorization_context,
+    is_credential_metadata_field,
     is_secret_field_name,
     normalize_field_name,
     object_is_fake_wrapper,
@@ -57,6 +58,8 @@ def parse_json_bytes(
         raise ScanDataError("SCN006_MALFORMED_JSON") from exc
     if "\ufeff" in text or "\x00" in text:
         raise ScanDataError("SCN006_MALFORMED_JSON")
+    if budget is not None:
+        budget.charge_parser_operations(len(text))
     try:
         value = json.loads(
             text,
@@ -119,6 +122,7 @@ def enforce_value_budget(
         local_nodes += 1
         if budget is not None:
             budget.charge_structure()
+            budget.charge_parser_operations()
         if local_nodes > max_nodes or depth > max_depth:
             raise ScanDataError("SCN005_BUDGET_EXCEEDED")
         if isinstance(current, dict):
@@ -428,6 +432,10 @@ class YamlSubsetParser:
             raise ScanDataError("SCN007_MALFORMED_YAML") from exc
         if "\ufeff" in text or "\x00" in text:
             raise ScanDataError("SCN007_MALFORMED_YAML")
+        if budget is not None:
+            # The closed parser makes a fixed bounded number of character
+            # passes for comments, mapping separators, and scalar decoding.
+            budget.charge_parser_operations(len(text) * 8)
         self.lines: list[YamlLine] = []
         self.comments: list[tuple[int, str]] = []
         block_parent_indent: int | None = None
@@ -675,7 +683,9 @@ def scan_yaml_comments(
             return
         text = "\n".join(chunks)
         budget.charge_text(text)
-        for hit in scan_content(text, remaining):
+        for hit in scan_content(
+            text, remaining, assignment_context=True, budget=budget
+        ):
             hits.append(
                 ContentHit(
                     start_line + hit.line - 1,
@@ -741,6 +751,21 @@ def _fence_kind(info: str) -> str | None:
             "text/yaml",
         }:
             return "yaml"
+        if token in {"py", "python", "python3"}:
+            return "python_source"
+        if token in {
+            "cjs",
+            "javascript",
+            "js",
+            "jsx",
+            "mjs",
+            "mts",
+            "node",
+            "ts",
+            "tsx",
+            "typescript",
+        }:
+            return "typescript_source"
         if token in {
             "jsonc",
             "json5",
@@ -753,30 +778,15 @@ def _fence_kind(info: str) -> str | None:
     return None
 
 
-def _commonmark_container_line(line: str) -> str:
-    """Remove valid list/blockquote container markers before fence parsing."""
-
-    current = line
-    for _ in range(16):
-        quote = re.match(r"^ {0,3}> ?", current)
-        if quote is not None:
-            current = current[quote.end() :]
-            continue
-        listing = re.match(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}", current)
-        if listing is not None:
-            current = current[listing.end() :]
-            continue
-        break
-    return current
-
-
-def _commonmark_container_prefixes(line: str) -> tuple[str, str, str]:
+def _commonmark_container_prefixes(
+    line: str, maximum_depth: int
+) -> tuple[str, str, str, bool]:
     """Return normalized text plus opener and continuation container prefixes."""
 
     current = line
     opener = ""
     continuation = ""
-    for _ in range(16):
+    for _ in range(maximum_depth):
         quote = re.match(r"^ {0,3}> ?", current)
         if quote is not None:
             marker = current[: quote.end()]
@@ -792,7 +802,11 @@ def _commonmark_container_prefixes(line: str) -> tuple[str, str, str]:
             current = current[listing.end() :]
             continue
         break
-    return current, opener, continuation
+    residual = bool(
+        re.match(r"^ {0,3}> ?", current)
+        or re.match(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}", current)
+    )
+    return current, opener, continuation, residual
 
 
 def parse_markdown_fences(
@@ -804,6 +818,8 @@ def parse_markdown_fences(
         raise ScanDataError("SCN008_MALFORMED_MARKDOWN") from exc
     if "\ufeff" in text or "\x00" in text:
         raise ScanDataError("SCN008_MALFORMED_MARKDOWN")
+    if budget is not None:
+        budget.charge_parser_operations(len(text) * 4)
     fences: list[StructuredFence] = []
     active_marker: str | None = None
     active_marker_length = 0
@@ -812,11 +828,21 @@ def parse_markdown_fences(
     continuation_prefix = ""
     start_line = 0
     chunks: list[str] = []
+    active_myst = False
+    myst_options_open = False
+    myst_option_count = 0
     for number, physical_line in enumerate(text.splitlines(), 1):
         if active_marker is None:
-            line, opening_prefix, opening_continuation = _commonmark_container_prefixes(
-                physical_line
+            (
+                line,
+                opening_prefix,
+                opening_continuation,
+                residual_container,
+            ) = _commonmark_container_prefixes(
+                physical_line, limits["max_structure_depth"]
             )
+            if residual_container:
+                raise ScanDataError("SCN008_MALFORMED_MARKDOWN", number)
         elif active_prefix and physical_line.startswith(active_prefix):
             line = physical_line[len(active_prefix) :]
             opening_prefix = ""
@@ -853,6 +879,11 @@ def parse_markdown_fences(
             active_marker = marker_text[0]
             active_marker_length = len(marker_text)
             active_kind = kind
+            active_myst = colon_opening is not None or bool(
+                re.match(r"\{(?:code-block|sourcecode)\}", info, flags=re.IGNORECASE)
+            )
+            myst_options_open = active_myst
+            myst_option_count = 0
             active_prefix = opening_prefix
             continuation_prefix = opening_continuation
             start_line = number
@@ -880,10 +911,48 @@ def parse_markdown_fences(
             active_marker = None
             active_marker_length = 0
             active_kind = None
+            active_myst = False
+            myst_options_open = False
+            myst_option_count = 0
             active_prefix = ""
             continuation_prefix = ""
             chunks = []
         else:
+            if active_myst and myst_options_open:
+                option = re.fullmatch(
+                    r" {0,3}:([A-Za-z][A-Za-z0-9_-]{0,63}):(?:[ \t]+(.*))?",
+                    line,
+                )
+                if option is not None:
+                    if option.group(1).lower() not in {
+                        "caption",
+                        "class",
+                        "dedent",
+                        "emphasize-lines",
+                        "lineno-start",
+                        "linenos",
+                        "name",
+                    }:
+                        raise ScanDataError("SCN008_MALFORMED_MARKDOWN", number)
+                    option_value = option.group(2) or ""
+                    if len(option_value) > 512:
+                        raise ScanDataError("SCN008_MALFORMED_MARKDOWN", number)
+                    myst_option_count += 1
+                    if myst_option_count > 16:
+                        raise ScanDataError("SCN008_MALFORMED_MARKDOWN", number)
+                    if budget is not None:
+                        budget.charge_text(option_value)
+                    if scan_content(
+                        option_value,
+                        1,
+                        assignment_context=True,
+                        budget=budget,
+                    ):
+                        raise ScanDataError("SCN008_MALFORMED_MARKDOWN", number)
+                    continue
+                if not line.strip():
+                    continue
+                myst_options_open = False
             chunks.append(line)
     if active_marker is not None:
         raise ScanDataError("SCN008_MALFORMED_MARKDOWN", start_line)
@@ -1043,10 +1112,28 @@ def validate_exception_node(name: str, value: Any) -> bool:
     if name == "python_acceptance_signing_material":
         return value in {
             SourceDeclaration("secret", "bytes", "class_field", "one", "absent"),
+            SourceDeclaration(
+                "request_secrets",
+                "set[bytes]",
+                "function_field",
+                "one",
+                "expression",
+            ),
+            SourceDeclaration(
+                "request_secrets", "", "function_field", "one", "expression"
+            ),
+            SourceDeclaration(
+                "evidence_secrets", "", "function_field", "one", "expression"
+            ),
+            SourceDeclaration("secret", "", "function_field", "one", "expression"),
             SourceDeclaration("private_key", "Path", "parameter", "one", "absent"),
             SourceDeclaration("signing_key", "Path", "parameter", "one", "absent"),
             SourceDeclaration("_private_key", "", "self_field", "one", "expression"),
         }
+    if name == "python_acceptance_auth_projection":
+        return value == SourceDeclaration(
+            "auth_value", "", "function_field", "one", "expression"
+        )
     if name == "python_caller_auth_transport":
         return value in {
             SourceDeclaration("token", "str", "class_field", "one", "absent"),
@@ -1078,6 +1165,15 @@ def validate_exception_node(name: str, value: Any) -> bool:
                 "one",
                 "none",
             ),
+            SourceDeclaration("credential", "", "object_field", "one", "expression"),
+            SourceDeclaration("Authorization", "", "object_field", "one", "expression"),
+            SourceDeclaration(
+                "X-Splendor-Caller-Credential",
+                "",
+                "object_field",
+                "one",
+                "expression",
+            ),
         }
     if name == "typescript_caller_auth_transport":
         return value in {
@@ -1095,7 +1191,7 @@ def validate_exception_node(name: str, value: Any) -> bool:
                 "defaultCredential", "", "source_field", "one", "expression"
             ),
             SourceDeclaration("credential", "", "object_field", "one", "expression"),
-            SourceDeclaration("Authorization", "", "object_field", "one", "literal"),
+            SourceDeclaration("Authorization", "", "object_field", "one", "expression"),
         }
     if name == "typescript_owner_safe_reference":
         return value in {
@@ -1123,6 +1219,24 @@ def validate_exception_node(name: str, value: Any) -> bool:
                 "one",
                 "absent",
             ),
+        }
+    if name == "typescript_json_value_index":
+        return value in {
+            SourceDeclaration("key", "key:string", "index_signature", "many", "absent"),
+            SourceDeclaration(
+                "adapter", "adapter:string", "index_signature", "many", "absent"
+            ),
+        }
+    if name == "typescript_record_key":
+        return value in {
+            SourceDeclaration(
+                "StablePrimitiveName",
+                "StablePrimitiveName",
+                "record_key",
+                "many",
+                "absent",
+            ),
+            SourceDeclaration("string", "string", "record_key", "many", "absent"),
         }
     return False
 
@@ -1172,6 +1286,43 @@ def _openapi_security_secret_coordinate(path: str, key: str) -> bool:
     )
 
 
+_IDENTIFIER_MAP_PATHS = {
+    "$.components.callbacks",
+    "$.components.examples",
+    "$.components.headers",
+    "$.components.links",
+    "$.components.parameters",
+    "$.components.requestBodies",
+    "$.components.responses",
+    "$.components.schemas",
+    "$.components.securitySchemes",
+    "$.configs",
+    "$.jobs",
+    "$.networks",
+    "$.permissions",
+    "$.services",
+    "$.volumes",
+    "$.webhooks",
+}
+
+
+def _mapping_keys_are_identifiers(path: str) -> bool:
+    """Return whether this mapping's keys are names, not record fields.
+
+    Workflow job IDs, Compose service/volume IDs, and OpenAPI registry/security
+    references may legitimately contain words such as ``secret`` or
+    ``credential``. Their child values still receive ordinary content scanning,
+    and real fields below those named entries remain structural coordinates.
+    """
+
+    return bool(
+        path in _IDENTIFIER_MAP_PATHS
+        or re.fullmatch(r"\$\.paths(?:\[.*?\]|\.[^.]+)?", path)
+        or re.search(r"\.security\[[0-9]+\]$", path)
+        or path.endswith((".$defs", ".definitions"))
+    )
+
+
 def scan_structured_value(
     value: Any,
     *,
@@ -1195,9 +1346,12 @@ def scan_structured_value(
         context: bool,
         line: int,
         assignment_key: str | None = None,
+        force_assignment: bool = False,
     ) -> None:
         prefix = (
-            f"{assignment_key}="
+            "credential="
+            if assignment_key is not None and force_assignment
+            else f"{assignment_key}="
             if assignment_key is not None and is_secret_field_name(assignment_key)
             else ""
         )
@@ -1210,7 +1364,8 @@ def scan_structured_value(
             scan_text,
             remaining,
             authorization_context=context,
-            assignment_context=bool(prefix),
+            assignment_context=True,
+            budget=budget,
         ):
             if hit.end <= len(prefix):
                 continue
@@ -1231,9 +1386,11 @@ def scan_structured_value(
         assignment_enabled: bool,
         openapi_payload: bool,
         parent_key: str | None,
+        credential_ancestor: bool,
     ) -> None:
         if isinstance(current, dict):
             openapi_payload = openapi_payload or _openapi_payload_root(path)
+            identifier_keys = _mapping_keys_are_identifiers(path)
             if (
                 openapi_mode
                 and structural_enabled
@@ -1271,6 +1428,9 @@ def scan_structured_value(
                 )
                 child_structural = structural_enabled
                 child_assignment = assignment_enabled
+                child_credential_ancestor = credential_ancestor or (
+                    not identifier_keys and is_secret_field_name(key)
+                )
                 if structural_enabled and not owner_exact and is_secret_coordinate:
                     identity = (file_path, doc_schema or "", child_path)
                     entry = exceptions.get(identity)
@@ -1296,6 +1456,7 @@ def scan_structured_value(
                     assignment_enabled=child_assignment,
                     openapi_payload=openapi_payload,
                     parent_key=key,
+                    credential_ancestor=child_credential_ancestor,
                 )
         elif isinstance(current, list):
             openapi_payload = openapi_payload or (
@@ -1309,11 +1470,13 @@ def scan_structured_value(
                     assignment_enabled=assignment_enabled,
                     openapi_payload=openapi_payload,
                     parent_key=parent_key,
+                    credential_ancestor=credential_ancestor,
                 )
         elif isinstance(current, str):
             add_text(
                 current,
                 context=is_authorization_context(parent_key)
+                or credential_ancestor
                 or openapi_payload
                 or (
                     openapi_mode
@@ -1322,6 +1485,12 @@ def scan_structured_value(
                 ),
                 line=base_line,
                 assignment_key=parent_key if assignment_enabled else None,
+                force_assignment=bool(
+                    assignment_enabled
+                    and credential_ancestor
+                    and parent_key
+                    and not is_credential_metadata_field(parent_key)
+                ),
             )
 
     walk(
@@ -1331,6 +1500,7 @@ def scan_structured_value(
         assignment_enabled=not owner_exact,
         openapi_payload=False,
         parent_key=None,
+        credential_ancestor=False,
     )
     return StructuredScan(hits, findings)
 
@@ -1344,29 +1514,6 @@ def _annotation_text(annotation: ast.expr | None) -> str:
         return ""
 
 
-_SAFE_SOURCE_TYPE_NAMES = {
-    "CallerCredential",
-    "CredentialAudience",
-    "CredentialBinding",
-    "CredentialId",
-    "CredentialRef",
-    "CredentialRefV1",
-    "CredentialRefV2",
-    "DigestRef",
-    "DigestValue",
-    "PublicKeyBytes",
-    "PublicKeyRef",
-    "RedactedBytes",
-    "RedactedString",
-    "RedactedValue",
-    "SecretCredentialAuthorization",
-    "SecretCredentialAuthorizationV2",
-    "SecretRef",
-    "SecretRefV1",
-    "SecretRefV2",
-    "SecretUseRequirement",
-    "WorkOrderAuthorization",
-}
 _PYTHON_SAFE_MODULES = {"splendor", "splendor.types", "splendor.secret_refs"}
 _TYPESCRIPT_SAFE_MODULE = "@splendor/types"
 
@@ -1411,7 +1558,9 @@ def _default_kind(value: ast.expr | None, *, absent: bool = False) -> str:
     return "expression"
 
 
-def _python_safe_imports(tree: ast.Module) -> tuple[dict[str, str], dict[str, str]]:
+def _python_safe_imports(
+    tree: ast.Module, allowed_types: set[str]
+) -> tuple[dict[str, str], dict[str, str]]:
     names: dict[str, str] = {}
     modules: dict[str, str] = {}
     canonical_bindings: dict[str, int] = {}
@@ -1422,7 +1571,7 @@ def _python_safe_imports(tree: ast.Module) -> tuple[dict[str, str], dict[str, st
             and statement.module in _PYTHON_SAFE_MODULES
         ):
             for alias in statement.names:
-                if alias.name in _SAFE_SOURCE_TYPE_NAMES:
+                if alias.name in allowed_types:
                     local = alias.asname or alias.name
                     names[local] = alias.name
                     canonical_bindings[local] = canonical_bindings.get(local, 0) + 1
@@ -1434,6 +1583,7 @@ def _python_safe_imports(tree: ast.Module) -> tuple[dict[str, str], dict[str, st
                     canonical_bindings[local] = canonical_bindings.get(local, 0) + 1
 
     bound_counts: dict[str, int] = {}
+    invalid_modules: set[str] = set()
 
     def bind(name: str | None) -> None:
         if name:
@@ -1452,11 +1602,37 @@ def _python_safe_imports(tree: ast.Module) -> tuple[dict[str, str], dict[str, st
             bind(getattr(node, "name", None))
         elif isinstance(node, ast.alias):
             bind(node.asname or node.name.split(".")[0])
+        elif (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.value, ast.Name)
+        ):
+            invalid_modules.add(node.value.id)
+        elif isinstance(node, ast.Subscript) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
+        ):
+            root: ast.expr = node.value
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if isinstance(root, ast.Name):
+                invalid_modules.add(root.id)
+        elif isinstance(node, ast.Call):
+            function = _annotation_text(node.func)
+            if function in {"eval", "exec", "globals", "locals"}:
+                names.clear()
+            if (
+                function in {"setattr", "delattr"}
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+            ):
+                invalid_modules.add(node.args[0].id)
 
     for name in set(names) | set(modules):
         if canonical_bindings.get(name) != 1 or bound_counts.get(name) != 1:
             names.pop(name, None)
             modules.pop(name, None)
+    for name in invalid_modules:
+        modules.pop(name, None)
     return names, modules
 
 
@@ -1481,6 +1657,7 @@ def _python_type_is_safe(
     *,
     safe_names: dict[str, str],
     safe_modules: dict[str, str],
+    allowed_types: set[str],
     default_kind: str,
 ) -> bool:
     if annotation is None or default_kind not in {"absent", "none", "required"}:
@@ -1494,10 +1671,7 @@ def _python_type_is_safe(
             continue
         if isinstance(member, ast.Attribute) and isinstance(member.value, ast.Name):
             module = safe_modules.get(member.value.id)
-            if (
-                module in _PYTHON_SAFE_MODULES
-                and member.attr in _SAFE_SOURCE_TYPE_NAMES
-            ):
+            if module in _PYTHON_SAFE_MODULES and member.attr in allowed_types:
                 safe_count += 1
                 continue
         return False
@@ -1513,6 +1687,137 @@ def _sensitive_parameter(name: str) -> bool:
     return is_secret_field_name(name)
 
 
+def _python_static_string(
+    node: ast.expr,
+    depth: int = 0,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
+    if depth > 16:
+        return None
+    if isinstance(node, ast.Name) and bindings is not None:
+        return bindings.get(node.id)
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _python_static_string(node.left, depth + 1, bindings)
+        right = _python_static_string(node.right, depth + 1, bindings)
+        if left is not None and right is not None and len(left) + len(right) <= 512:
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                return None
+            parts.append(value.value)
+        joined = "".join(parts)
+        return joined if len(joined) <= 512 else None
+    return None
+
+
+def _python_static_string_bindings(tree: ast.Module) -> dict[str, str]:
+    """Resolve simple constant keys conservatively across the source unit."""
+
+    candidates: dict[str, list[str]] = {}
+    assignment_values: dict[str, list[ast.expr]] = {}
+    stores: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            stores[node.id] = stores.get(node.id, 0) + 1
+        assignments: list[tuple[ast.expr, ast.expr]] = []
+        if isinstance(node, ast.Assign):
+            assignments.extend((target, node.value) for target in node.targets)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append((node.target, node.value))
+        elif isinstance(node, ast.NamedExpr):
+            assignments.append((node.target, node.value))
+        for target, value_node in assignments:
+            if not isinstance(target, ast.Name):
+                continue
+            assignment_values.setdefault(target.id, []).append(value_node)
+            value = _python_static_string(value_node)
+            if value is not None:
+                candidates.setdefault(target.id, []).append(value)
+
+    resolved: dict[str, str] = {}
+    for name, values in candidates.items():
+        sensitive = next(
+            (value for value in values if is_secret_field_name(value)), None
+        )
+        if sensitive is not None:
+            # Any credential-capable binding makes later dynamic key use unsafe,
+            # even if the name is rebound elsewhere.
+            resolved[name] = sensitive
+        elif stores.get(name) == 1 and len(values) == 1:
+            resolved[name] = values[0]
+
+    def resolve_alias(name: str, visiting: set[str]) -> str | None:
+        if name in resolved:
+            return resolved[name]
+        values = assignment_values.get(name, [])
+        if stores.get(name) != 1 or len(values) != 1 or name in visiting:
+            return None
+        value_node = values[0]
+        if not isinstance(value_node, ast.Name):
+            return None
+        value = resolve_alias(value_node.id, {*visiting, name})
+        if value is not None:
+            resolved[name] = value
+        return value
+
+    for name in assignment_values:
+        resolve_alias(name, set())
+
+    dependents: dict[str, set[str]] = {}
+    for binding_name, value_nodes in assignment_values.items():
+        for bound_value_node in value_nodes:
+            if isinstance(bound_value_node, ast.Name):
+                dependents.setdefault(bound_value_node.id, set()).add(binding_name)
+    queue = [name for name, value in resolved.items() if is_secret_field_name(value)]
+    cursor = 0
+    while cursor < len(queue):
+        source = queue[cursor]
+        cursor += 1
+        for dependent_name in dependents.get(source, set()):
+            if dependent_name in resolved and is_secret_field_name(
+                resolved[dependent_name]
+            ):
+                continue
+            resolved[dependent_name] = resolved[source]
+            queue.append(dependent_name)
+    return resolved
+
+
+def _python_dynamic_key_is_credential_capable(
+    node: ast.expr, bindings: dict[str, str] | None = None
+) -> bool:
+    resolved = _python_static_string(node, bindings=bindings)
+    if resolved is not None and is_secret_field_name(resolved):
+        return True
+    fragments = [
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+    ]
+    fragments.extend(
+        child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+    )
+    fragments.extend(
+        child.attr for child in ast.walk(node) if isinstance(child, ast.Attribute)
+    )
+    joined = "".join(fragments)
+    for value in [*fragments, joined]:
+        if not value:
+            continue
+        normalized = normalize_field_name(value)
+        if is_credential_metadata_field(normalized):
+            continue
+        if is_secret_field_name(value) or normalized.startswith(
+            ("auth", "cred", "pass", "private", "secret", "token")
+        ):
+            return True
+    return False
+
+
 def scan_python_source(
     text: str,
     *,
@@ -1521,6 +1826,7 @@ def scan_python_source(
     used_exceptions: dict[tuple[str, str, str], int],
     budget: WorkBudget,
     maximum_hits: int,
+    safe_type_names: set[str] | None = None,
 ) -> StructuredScan:
     try:
         tree = ast.parse(text, filename=file_path)
@@ -1530,7 +1836,17 @@ def scan_python_source(
     hits: list[ContentHit] = []
     findings: list[Finding] = []
     schema = "python:source.v1"
-    safe_names, safe_modules = _python_safe_imports(tree)
+    stack: list[tuple[ast.AST, int]] = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > budget.limits["max_structure_depth"]:
+            raise ScanDataError("SCN011_MALFORMED_SOURCE", getattr(node, "lineno", 0))
+        budget.charge_structure()
+        budget.charge_parser_operations()
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+    allowed_safe_types = safe_type_names or set()
+    safe_names, safe_modules = _python_safe_imports(tree, allowed_safe_types)
+    static_strings = _python_static_string_bindings(tree)
     line_offsets = [0]
     for match in re.finditer("\n", text):
         line_offsets.append(match.end())
@@ -1541,6 +1857,32 @@ def scan_python_source(
             self.functions: list[str] = []
             self.scopes: list[str] = []
             self.context_literals: set[int] = set()
+
+        def object_field_path(self, name: str) -> str:
+            if self.functions and self.classes:
+                return (
+                    f"$.classes.{self.classes[-1]}.methods.{self.functions[-1]}."
+                    f"object_fields.{name}"
+                )
+            if self.functions:
+                return f"$.functions.{self.functions[-1]}.object_fields.{name}"
+            if self.classes:
+                return f"$.classes.{self.classes[-1]}.object_fields.{name}"
+            return f"$.module.object_fields.{name}"
+
+        def inspect_object_field(
+            self, name: str, value: ast.expr | None, line: int
+        ) -> None:
+            self.inspect(
+                name=name,
+                annotation=None,
+                default=value,
+                default_absent=value is None,
+                kind="object_field",
+                path=self.object_field_path(name),
+                line=line,
+            )
+            self.scan_literal(value, name)
 
         def inspect(
             self,
@@ -1561,13 +1903,6 @@ def scan_python_source(
             ):
                 return
             default_state = _default_kind(default, absent=default_absent)
-            if cardinality == "one" and _python_type_is_safe(
-                annotation,
-                safe_names=safe_names,
-                safe_modules=safe_modules,
-                default_kind=default_state,
-            ):
-                return
             declaration = SourceDeclaration(
                 name,
                 _annotation_text(annotation),
@@ -1575,6 +1910,31 @@ def scan_python_source(
                 cardinality,
                 default_state,
             )
+            if cardinality == "one" and _python_type_is_safe(
+                annotation,
+                safe_names=safe_names,
+                safe_modules=safe_modules,
+                allowed_types=allowed_safe_types,
+                default_kind=default_state,
+            ):
+                # Existing exact exceptions remain stale-failing even when the
+                # independently digest-pinned owner export is sufficient.
+                # This consumes only an exact path/schema/field/shape entry;
+                # new files may use the pinned type without an allowlist.
+                try:
+                    _source_exception(
+                        file_path=file_path,
+                        schema=schema,
+                        field_path=path,
+                        node=declaration,
+                        exceptions=exceptions,
+                        used_exceptions=used_exceptions,
+                    )
+                except ScanDataError:
+                    findings.append(
+                        Finding(file_path, line, "SCF004_INVALID_EXCEPTION")
+                    )
+                return
             try:
                 allowed = _source_exception(
                     file_path=file_path,
@@ -1613,7 +1973,8 @@ def scan_python_source(
                 prefix + value.value,
                 remaining,
                 authorization_context=is_authorization_context(coordinate),
-                assignment_context=assignment,
+                assignment_context=True,
+                budget=budget,
             )
             base = _python_source_offset(line_offsets, value)
             for hit in literal_hits:
@@ -1701,9 +2062,13 @@ def scan_python_source(
                     path = f"$.module.fields.{name}"
                     kind = "module_field"
                 else:
-                    self.scan_literal(node.value, name)
-                    self.generic_visit(node)
-                    return
+                    path = (
+                        f"$.classes.{self.classes[-1]}.methods."
+                        f"{self.functions[-1]}.fields.{name}"
+                        if self.classes and self.functions
+                        else f"$.functions.{self.functions[-1]}.fields.{name}"
+                    )
+                    kind = "function_field"
             elif (
                 isinstance(node.target, ast.Attribute)
                 and isinstance(node.target.value, ast.Name)
@@ -1741,7 +2106,13 @@ def scan_python_source(
                         path = f"$.module.fields.{name}"
                         kind = "module_field"
                     else:
-                        inspect_declaration = False
+                        path = (
+                            f"$.classes.{self.classes[-1]}.methods."
+                            f"{self.functions[-1]}.fields.{name}"
+                            if self.classes and self.functions
+                            else f"$.functions.{self.functions[-1]}.fields.{name}"
+                        )
+                        kind = "function_field"
                 elif (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
@@ -1751,6 +2122,16 @@ def scan_python_source(
                     owner = self.classes[-1] if self.classes else "<module>"
                     path = f"$.classes.{owner}.self_fields.{name}"
                     kind = "self_field"
+                elif isinstance(target, ast.Subscript):
+                    key = _python_static_string(target.slice, bindings=static_strings)
+                    if key is not None:
+                        self.inspect_object_field(key, node.value, node.lineno)
+                    elif _python_dynamic_key_is_credential_capable(
+                        target.slice, static_strings
+                    ):
+                        raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                elif isinstance(target, ast.Attribute):
+                    self.inspect_object_field(target.attr, node.value, node.lineno)
                 if name is None:
                     continue
                 if inspect_declaration and path is not None and kind is not None:
@@ -1766,10 +2147,33 @@ def scan_python_source(
                 self.scan_literal(node.value, name)
             self.generic_visit(node)
 
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            target = node.target
+            if isinstance(target, ast.Name):
+                self.inspect_object_field(target.id, node.value, node.lineno)
+            elif isinstance(target, ast.Attribute):
+                self.inspect_object_field(target.attr, node.value, node.lineno)
+            elif isinstance(target, ast.Subscript):
+                key = _python_static_string(target.slice, bindings=static_strings)
+                if key is not None:
+                    self.inspect_object_field(key, node.value, node.lineno)
+                elif _python_dynamic_key_is_credential_capable(
+                    target.slice, static_strings
+                ):
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+            self.generic_visit(node)
+
         def visit_Dict(self, node: ast.Dict) -> None:
             for key, value in zip(node.keys, node.values):
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    self.scan_literal(value, key.value)
+                if key is None:
+                    continue
+                static_key = _python_static_string(key, bindings=static_strings)
+                if static_key is not None:
+                    self.inspect_object_field(
+                        static_key, value, getattr(key, "lineno", node.lineno)
+                    )
+                elif _python_dynamic_key_is_credential_capable(key, static_strings):
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
@@ -1781,13 +2185,40 @@ def scan_python_source(
                 and isinstance(node.args[0].value, str)
             ):
                 factory_name = node.args[0].value
-            if function == "TypedDict":
+            if function == "dict":
+                for keyword in node.keywords:
+                    if keyword.arg is None:
+                        continue
+                    self.inspect_object_field(keyword.arg, keyword.value, node.lineno)
+            elif function == "setattr":
+                if len(node.args) < 3:
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                attribute = _python_static_string(node.args[1], bindings=static_strings)
+                if attribute is not None:
+                    self.inspect_object_field(attribute, node.args[2], node.lineno)
+                elif _python_dynamic_key_is_credential_capable(
+                    node.args[1], static_strings
+                ):
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+            elif function in {"TypedDict", "NamedTuple"}:
                 if len(node.args) >= 2:
-                    if not isinstance(node.args[1], ast.Dict):
+                    fields = node.args[1]
+                    if isinstance(fields, ast.Dict):
+                        pairs = list(zip(fields.keys, fields.values))
+                    elif isinstance(fields, (ast.List, ast.Tuple)):
+                        pairs = []
+                        for field in fields.elts:
+                            if not (
+                                isinstance(field, (ast.List, ast.Tuple))
+                                and len(field.elts) == 2
+                            ):
+                                raise ScanDataError(
+                                    "SCN011_MALFORMED_SOURCE", node.lineno
+                                )
+                            pairs.append((field.elts[0], field.elts[1]))
+                    else:
                         raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
-                    for key, field_annotation in zip(
-                        node.args[1].keys, node.args[1].values
-                    ):
+                    for key, field_annotation in pairs:
                         if not (
                             isinstance(key, ast.Constant) and isinstance(key.value, str)
                         ):
@@ -1814,6 +2245,39 @@ def scan_python_source(
                         kind="typed_dict_field",
                         path=f"$.factories.{factory_name}.fields.{keyword.arg}",
                         line=keyword.value.lineno,
+                    )
+            elif function == "namedtuple":
+                if len(node.args) < 2:
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                fields_node = node.args[1]
+                field_names: list[tuple[str, int]] = []
+                if isinstance(fields_node, ast.Constant) and isinstance(
+                    fields_node.value, str
+                ):
+                    field_names = [
+                        (name, fields_node.lineno)
+                        for name in re.split(r"[\s,]+", fields_node.value.strip())
+                        if name
+                    ]
+                elif isinstance(fields_node, (ast.List, ast.Tuple)):
+                    for field in fields_node.elts:
+                        name = _python_static_string(field)
+                        if name is None:
+                            raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                        field_names.append(
+                            (name, getattr(field, "lineno", node.lineno))
+                        )
+                else:
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                for name, line in field_names:
+                    self.inspect(
+                        name=name,
+                        annotation=None,
+                        default=None,
+                        default_absent=True,
+                        kind="namedtuple_factory_field",
+                        path=f"$.factories.{factory_name}.fields.{name}",
+                        line=line,
                     )
             elif function == "make_dataclass":
                 if len(node.args) < 2 or not isinstance(
@@ -1894,8 +2358,6 @@ def scan_python_source(
                         self.scan_literal(model_default, model_name_node.value)
             self.generic_visit(node)
 
-    for node in ast.walk(tree):
-        budget.charge_structure()
     Visitor().visit(tree)
     return StructuredScan(hits, findings)
 
@@ -1959,10 +2421,13 @@ def _decode_js_string(raw: str, quote: str) -> str:
     return value
 
 
-def _tokenize_typescript(text: str, budget: WorkBudget) -> list[JsToken]:
+def _tokenize_typescript(
+    text: str, budget: WorkBudget
+) -> tuple[list[JsToken], dict[int, int]]:
     tokens: list[JsToken] = []
     index = 0
     line = 1
+    budget.charge_parser_operations(len(text))
     while index < len(text):
         char = text[index]
         if char.isspace():
@@ -2001,7 +2466,18 @@ def _tokenize_typescript(text: str, budget: WorkBudget) -> list[JsToken]:
             raw = text[start + 1 : index]
             index += 1
             value = _decode_js_string(raw, quote)
-            tokens.append(JsToken("string", value, start, index, token_line))
+            dynamic_template = quote == "`" and bool(
+                re.search(r"(?<!\\)(?:\\\\)*\$\{", raw)
+            )
+            tokens.append(
+                JsToken(
+                    "template" if dynamic_template else "string",
+                    value,
+                    start,
+                    index,
+                    token_line,
+                )
+            )
         elif char.isalpha() or char in "_$":
             index += 1
             while index < len(text) and (text[index].isalnum() or text[index] in "_$-"):
@@ -2039,48 +2515,57 @@ def _tokenize_typescript(text: str, budget: WorkBudget) -> list[JsToken]:
             index += len(matched)
             tokens.append(JsToken("punct", matched, start, index, token_line))
         budget.charge_structure()
-    stack: list[str] = []
+    stack: list[tuple[str, int]] = []
+    matching: dict[int, int] = {}
     pairs = {")": "(", "]": "[", "}": "{"}
-    for token in tokens:
+    for token_index, token in enumerate(tokens):
         if token.value in {"(", "[", "{"}:
-            stack.append(token.value)
-        elif token.value in pairs:
-            if not stack or stack.pop() != pairs[token.value]:
+            stack.append((token.value, token_index))
+            if len(stack) > budget.limits["max_structure_depth"]:
                 raise ScanDataError("SCN011_MALFORMED_SOURCE", token.line)
+        elif token.value in pairs:
+            if not stack or stack[-1][0] != pairs[token.value]:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE", token.line)
+            _opening, opening_index = stack.pop()
+            matching[opening_index] = token_index
     if stack:
         raise ScanDataError("SCN011_MALFORMED_SOURCE")
-    return tokens
+    return tokens, matching
 
 
 def _matching_token(
-    tokens: list[JsToken], start: int, opening: str, closing: str
+    tokens: list[JsToken],
+    matching: dict[int, int],
+    start: int,
+    opening: str,
+    closing: str,
 ) -> int:
-    depth = 0
-    for index in range(start, len(tokens)):
-        if tokens[index].value == opening:
-            depth += 1
-        elif tokens[index].value == closing:
-            depth -= 1
-            if depth == 0:
-                return index
-    raise ScanDataError("SCN011_MALFORMED_SOURCE", tokens[start].line)
+    end = matching.get(start)
+    if end is None or tokens[start].value != opening or tokens[end].value != closing:
+        raise ScanDataError("SCN011_MALFORMED_SOURCE", tokens[start].line)
+    return end
 
 
 def _typescript_import_provenance(
     tokens: list[JsToken],
+    matching: dict[int, int],
     file_path: str,
     parameter_ranges: list[tuple[int, int]],
+    allowed_types: set[str],
+    budget: WorkBudget,
 ) -> set[str]:
     del file_path
     safe: set[str] = set()
     index = 0
     while index < len(tokens):
+        budget.charge_parser_operations()
         if tokens[index].value != "import":
             index += 1
             continue
         source_index: int | None = None
         depth = 0
         for position in range(index + 1, len(tokens)):
+            budget.charge_parser_operations()
             value = tokens[position].value
             if value in {"{", "["}:
                 depth += 1
@@ -2125,7 +2610,7 @@ def _typescript_import_provenance(
                 None,
             )
             if opening is not None:
-                closing = _matching_token(tokens, opening, "{", "}")
+                closing = _matching_token(tokens, matching, opening, "{", "}")
                 if closing < source_index:
                     specifier: list[JsToken] = []
 
@@ -2136,19 +2621,20 @@ def _typescript_import_provenance(
                         if (
                             len(values) == 1
                             and values[0].kind == "identifier"
-                            and values[0].value in _SAFE_SOURCE_TYPE_NAMES
+                            and values[0].value in allowed_types
                         ):
                             safe.add(values[0].value)
                         elif (
                             len(values) == 3
                             and values[0].kind == "identifier"
-                            and values[0].value in _SAFE_SOURCE_TYPE_NAMES
+                            and values[0].value in allowed_types
                             and values[1].value == "as"
                             and values[2].kind == "identifier"
                         ):
                             safe.add(values[2].value)
 
                     for position in range(opening + 1, closing):
+                        budget.charge_parser_operations()
                         if tokens[position].value == ",":
                             record_specifier(specifier)
                             specifier = []
@@ -2157,6 +2643,7 @@ def _typescript_import_provenance(
                     record_specifier(specifier)
         index = source_index + 1 if source_index is not None else index + 1
     for index, token in enumerate(tokens[:-1]):
+        budget.charge_parser_operations()
         if token.value in {
             "interface",
             "type",
@@ -2179,7 +2666,11 @@ def _typescript_import_provenance(
                 safe.discard(local)
             if token.value in {"const", "let", "var"} and local in {"{", "["}:
                 closing = _matching_token(
-                    tokens, index + 1, local, "}" if local == "{" else "]"
+                    tokens,
+                    matching,
+                    index + 1,
+                    local,
+                    "}" if local == "{" else "]",
                 )
                 if any(
                     candidate.value in safe for candidate in tokens[index + 2 : closing]
@@ -2190,6 +2681,7 @@ def _typescript_import_provenance(
                         if candidate.value in safe
                     )
     for index, token in enumerate(tokens):
+        budget.charge_parser_operations()
         if token.value not in safe:
             continue
         matching_range = next(
@@ -2242,31 +2734,37 @@ def scan_typescript_source(
     used_exceptions: dict[tuple[str, str, str], int],
     budget: WorkBudget,
     maximum_hits: int,
+    safe_type_names: set[str] | None = None,
 ) -> StructuredScan:
     findings: list[Finding] = []
     hits: list[ContentHit] = []
     schema = "typescript:source.v1"
-    tokens = _tokenize_typescript(text, budget)
+    tokens, matching = _tokenize_typescript(text, budget)
     blocks: list[tuple[int, int, str, str]] = []
     for index, token in enumerate(tokens[:-1]):
+        budget.charge_parser_operations()
         if token.value not in {"interface", "class", "type"}:
             continue
         name = tokens[index + 1].value
-        opening = next(
-            (
-                position
-                for position in range(index + 2, len(tokens))
-                if tokens[position].value in {"{", ";"}
-            ),
-            None,
-        )
+        opening = None
+        for position in range(index + 2, len(tokens)):
+            budget.charge_parser_operations()
+            if tokens[position].value in {"{", ";"}:
+                opening = position
+                break
         if opening is None or tokens[opening].value != "{":
             continue
         blocks.append(
-            (opening, _matching_token(tokens, opening, "{", "}"), token.value, name)
+            (
+                opening,
+                _matching_token(tokens, matching, opening, "{", "}"),
+                token.value,
+                name,
+            )
         )
 
     def enclosing(index: int) -> tuple[str, str] | None:
+        budget.charge_parser_operations(len(blocks))
         candidates = [
             (end - start, kind, name)
             for start, end, kind, name in blocks
@@ -2278,11 +2776,16 @@ def scan_typescript_source(
         return kind, name
 
     method_blocks: list[tuple[int, int, str, str]] = []
+    method_parameter_ranges: list[tuple[int, int, str, str]] = []
 
     def enclosing_method(index: int) -> tuple[str, str] | None:
+        budget.charge_parser_operations(len(method_blocks))
         candidates = [
             (end - start, class_name, method_name)
-            for start, end, class_name, method_name in method_blocks
+            for start, end, class_name, method_name in [
+                *method_blocks,
+                *method_parameter_ranges,
+            ]
             if start < index < end
         ]
         if not candidates:
@@ -2297,6 +2800,9 @@ def scan_typescript_source(
         number: int,
         index: int,
         declaration_kind: str,
+        *,
+        force: bool = False,
+        cardinality: str = "one",
     ) -> None:
         budget.charge_text(name)
         block = enclosing(index)
@@ -2312,18 +2818,33 @@ def scan_typescript_source(
             field_path = (
                 f"$.classes.{method[0]}.methods.{method[1]}.object_fields.{name}"
             )
+        elif declaration_kind == "record_key" and method is not None:
+            field_path = f"$.classes.{method[0]}.methods.{method[1]}.record_keys.{name}"
         else:
             field_path = f"$.{collection}.{block_name}.fields.{name}"
         if declaration_kind == "source_field" and block is not None and method is None:
             declaration_kind = f"{block[0]}_field"
         declared_type = "".join(token.value for token in declared_tokens)
-        if not is_secret_field_name(name) or _typescript_type_is_safe(
-            declared_tokens, safe_names, default_kind
-        ):
+        if not force and not is_secret_field_name(name):
             return
         declaration = SourceDeclaration(
-            name, declared_type, declaration_kind, "one", default_kind
+            name, declared_type, declaration_kind, cardinality, default_kind
         )
+        if not force and _typescript_type_is_safe(
+            declared_tokens, safe_names, default_kind
+        ):
+            try:
+                _source_exception(
+                    file_path=file_path,
+                    schema=schema,
+                    field_path=field_path,
+                    node=declaration,
+                    exceptions=exceptions,
+                    used_exceptions=used_exceptions,
+                )
+            except ScanDataError:
+                findings.append(Finding(file_path, number, "SCF004_INVALID_EXCEPTION"))
+            return
         try:
             allowed = _source_exception(
                 file_path=file_path,
@@ -2383,6 +2904,7 @@ def scan_typescript_source(
     brace_depths: list[int] = []
     brace_depth = 0
     for candidate in tokens:
+        budget.charge_parser_operations()
         brace_depths.append(brace_depth)
         if candidate.value == "{":
             brace_depth += 1
@@ -2405,9 +2927,10 @@ def scan_typescript_source(
         return tokens[cursor].value if cursor >= 0 else "<anonymous>"
 
     for opening, candidate in enumerate(tokens):
+        budget.charge_parser_operations()
         if candidate.value != "(":
             continue
-        closing = _matching_token(tokens, opening, "(", ")")
+        closing = _matching_token(tokens, matching, opening, "(", ")")
         previous = tokens[opening - 1].value if opening else ""
         before_previous = tokens[opening - 2].value if opening >= 2 else ""
         block = enclosing(opening)
@@ -2432,25 +2955,26 @@ def scan_typescript_source(
         if class_method or function_declaration or arrow:
             parameter_ranges.append((opening, closing))
         if class_method and block is not None:
-            body_opening = next(
-                (
-                    position
-                    for position in range(closing + 1, len(tokens))
-                    if tokens[position].value in {"{", ";"}
-                ),
-                None,
-            )
+            method_name = callable_name(opening)
+            method_parameter_ranges.append((opening, closing, block[1], method_name))
+            body_opening = None
+            for position in range(closing + 1, len(tokens)):
+                budget.charge_parser_operations()
+                if tokens[position].value in {"{", ";"}:
+                    body_opening = position
+                    break
             if body_opening is not None and tokens[body_opening].value == "{":
                 method_blocks.append(
                     (
                         body_opening,
-                        _matching_token(tokens, body_opening, "{", "}"),
+                        _matching_token(tokens, matching, body_opening, "{", "}"),
                         block[1],
-                        callable_name(opening),
+                        method_name,
                     )
                 )
 
     def in_parameter_list(index: int) -> bool:
+        budget.charge_parser_operations(len(parameter_ranges))
         return any(start < index < end for start, end in parameter_ranges)
 
     shadow_ranges = list(parameter_ranges)
@@ -2460,12 +2984,290 @@ def scan_typescript_source(
             and opening > 0
             and tokens[opening - 1].value == "catch"
         ):
-            shadow_ranges.append((opening, _matching_token(tokens, opening, "(", ")")))
+            shadow_ranges.append(
+                (opening, _matching_token(tokens, matching, opening, "(", ")"))
+            )
 
-    safe_names = _typescript_import_provenance(tokens, file_path, shadow_ranges)
+    safe_names = _typescript_import_provenance(
+        tokens,
+        matching,
+        file_path,
+        shadow_ranges,
+        safe_type_names or set(),
+        budget,
+    )
+    assignment_values = {"=", "??=", "||=", "&&="}
+    for index, token in enumerate(tokens[:-1]):
+        if token.value in safe_names and tokens[index + 1].value in assignment_values:
+            safe_names.discard(token.value)
+
+    static_string_bindings: dict[str, set[str]] = {}
+    type_string_aliases: dict[str, set[str]] = {}
+    type_alias_tokens: dict[str, list[JsToken]] = {}
+    for index, token in enumerate(tokens[:-3]):
+        budget.charge_parser_operations()
+        if (
+            token.value == "const"
+            and tokens[index + 1].kind == "identifier"
+            and tokens[index + 2].value == "="
+            and tokens[index + 3].kind == "string"
+        ):
+            static_string_bindings.setdefault(tokens[index + 1].value, set()).add(
+                tokens[index + 3].value
+            )
+        if (
+            token.value != "type"
+            or tokens[index + 1].kind != "identifier"
+            or tokens[index + 2].value != "="
+        ):
+            continue
+        values: set[str] = set()
+        alias_tokens: list[JsToken] = []
+        expect_string = True
+        literal_alias = True
+        closed = False
+        for candidate in tokens[index + 3 :]:
+            budget.charge_parser_operations()
+            if candidate.value == ";":
+                type_alias_tokens[tokens[index + 1].value] = alias_tokens
+                closed = literal_alias and bool(values) and not expect_string
+                break
+            alias_tokens.append(candidate)
+            if expect_string and candidate.kind == "string":
+                values.add(candidate.value)
+                expect_string = False
+                continue
+            if not expect_string and candidate.value == "|":
+                expect_string = True
+                continue
+            literal_alias = False
+        if closed:
+            type_string_aliases[tokens[index + 1].value] = values
+
+    def closed_key_values(
+        key_tokens: list[JsToken], visiting: frozenset[str] = frozenset()
+    ) -> set[str] | None:
+        while key_tokens and key_tokens[0].value == "|":
+            key_tokens = key_tokens[1:]
+        if len(key_tokens) == 1:
+            key = key_tokens[0]
+            if key.kind == "string":
+                return {key.value}
+            if key.kind == "identifier":
+                direct = static_string_bindings.get(
+                    key.value, type_string_aliases.get(key.value)
+                )
+                if direct is not None:
+                    return direct
+                if key.value in visiting:
+                    return None
+                alias = type_alias_tokens.get(key.value)
+                if alias is not None:
+                    return closed_key_values(alias, visiting | {key.value})
+        if not any(key.value == "|" for key in key_tokens):
+            return None
+        values: set[str] = set()
+        member: list[JsToken] = []
+        for key in [*key_tokens, JsToken("punct", "|", 0, 0, 0)]:
+            budget.charge_parser_operations()
+            if key.value != "|":
+                member.append(key)
+                continue
+            if not member:
+                return None
+            resolved_member = closed_key_values(member, visiting)
+            if resolved_member is None:
+                return None
+            values.update(resolved_member)
+            member = []
+        return values or None
+
+    def alias_has_dynamic_template(
+        name: str, visiting: frozenset[str] = frozenset()
+    ) -> bool:
+        if name in visiting:
+            return False
+        alias = type_alias_tokens.get(name, [])
+        if any(token.kind == "template" for token in alias):
+            return True
+        return any(
+            token.kind == "identifier"
+            and token.value in type_alias_tokens
+            and alias_has_dynamic_template(token.value, visiting | {name})
+            for token in alias
+        )
+
+    # Closed handling for generic Record keys. Concrete credential-capable keys
+    # are declarations even though they occur in a type-argument position.
+    for index, token in enumerate(tokens[:-1]):
+        if token.value != "Record" or tokens[index + 1].value != "<":
+            continue
+        depth = 0
+        first_argument: list[tuple[int, JsToken]] = []
+        closed = False
+        first_complete = False
+        for position in range(index + 1, len(tokens)):
+            budget.charge_parser_operations()
+            value = tokens[position].value
+            if value == "<":
+                depth += 1
+                continue
+            if value == ">":
+                depth -= 1
+                if depth == 0:
+                    closed = True
+                    break
+            if depth == 1 and value == ",":
+                first_complete = True
+                continue
+            if depth >= 1 and not first_complete:
+                first_argument.append((position, tokens[position]))
+        if not closed or not first_complete:
+            raise ScanDataError("SCN011_MALFORMED_SOURCE", token.line)
+        resolved_keys = closed_key_values(
+            [key_token for _position, key_token in first_argument]
+        )
+        for key_value in sorted(resolved_keys or set()):
+            if is_secret_field_name(key_value):
+                position = first_argument[0][0]
+                key_token = first_argument[0][1]
+                inspect_field(
+                    key_value,
+                    [],
+                    "absent",
+                    key_token.line,
+                    position,
+                    "record_key",
+                )
+        dynamic_template_alias = bool(
+            len(first_argument) == 1
+            and first_argument[0][1].kind == "identifier"
+            and alias_has_dynamic_template(first_argument[0][1].value)
+        )
+        if (
+            resolved_keys is None
+            or dynamic_template_alias
+            or any(
+                key_token.kind == "template" for _position, key_token in first_argument
+            )
+        ):
+            position, key_token = first_argument[0]
+            inspect_field(
+                key_token.value,
+                [candidate for _position, candidate in first_argument],
+                "absent",
+                key_token.line,
+                position,
+                "record_key",
+                force=True,
+                cardinality="many",
+            )
+
+    # Mapped/index signatures and dynamic computed properties are rejected when
+    # their key set cannot be statically closed. Static computed names are
+    # inspected through the same field grammar.
+    for opening, closing in sorted(matching.items()):
+        budget.charge_parser_operations()
+        if tokens[opening].value != "[":
+            continue
+        cursor = closing + 1
+        if cursor < len(tokens) and tokens[cursor].value == "?":
+            cursor += 1
+        if cursor >= len(tokens) or tokens[cursor].value != ":":
+            continue
+        key_tokens = tokens[opening + 1 : closing]
+        mapped = any(key_token.value == "in" for key_token in key_tokens)
+        resolved_tokens = key_tokens
+        if mapped:
+            in_index = next(
+                index
+                for index, key_token in enumerate(key_tokens)
+                if key_token.value == "in"
+            )
+            resolved_tokens = key_tokens[in_index + 1 :]
+        resolved_values = closed_key_values(resolved_tokens)
+        sensitive_values = sorted(
+            value for value in resolved_values or set() if is_secret_field_name(value)
+        )
+        sensitive = [
+            (opening + 1 + offset, key_token)
+            for offset, key_token in enumerate(key_tokens)
+            if key_token.kind in {"identifier", "string"}
+            and is_secret_field_name(key_token.value)
+        ]
+        direct_sensitive_values = {
+            key_token.value for _position, key_token in sensitive
+        }
+        for position, key_token in sensitive:
+            inspect_field(
+                key_token.value,
+                [],
+                "absent",
+                key_token.line,
+                position,
+                "computed_field",
+            )
+        for key_value in sensitive_values:
+            if key_value in direct_sensitive_values:
+                continue
+            inspect_field(
+                key_value,
+                [],
+                "absent",
+                tokens[opening].line,
+                opening,
+                "computed_field",
+            )
+        static_computed = resolved_values is not None
+        if not sensitive and not sensitive_values and (mapped or not static_computed):
+            key_token = next(
+                (
+                    candidate
+                    for candidate in key_tokens
+                    if candidate.kind in {"identifier", "string"}
+                ),
+                tokens[opening],
+            )
+            inspect_field(
+                key_token.value,
+                key_tokens,
+                "absent",
+                key_token.line,
+                opening + 1,
+                "index_signature" if not mapped else "mapped_field",
+                force=True,
+                cardinality="many",
+            )
+
+    # A client package cannot create an unpinned credential contract by
+    # re-exporting an owner symbol under a new surface.
+    for index, token in enumerate(tokens):
+        budget.charge_parser_operations()
+        if token.value != "export":
+            continue
+        opening = index + 1
+        if opening < len(tokens) and tokens[opening].value == "type":
+            opening += 1
+        if opening >= len(tokens) or tokens[opening].value != "{":
+            continue
+        closing = _matching_token(tokens, matching, opening, "{", "}")
+        if closing + 2 >= len(tokens) or tokens[closing + 1].value != "from":
+            continue
+        for exported in tokens[opening + 1 : closing]:
+            budget.charge_parser_operations()
+            if exported.kind == "identifier" and is_secret_field_name(exported.value):
+                inspect_field(
+                    exported.value,
+                    [],
+                    "absent",
+                    exported.line,
+                    index,
+                    "reexport_field",
+                )
 
     destructuring_ranges: list[tuple[int, int]] = []
     for index, token in enumerate(tokens[:-1]):
+        budget.charge_parser_operations()
         if token.value not in declaration_keywords or tokens[index + 1].value not in {
             "{",
             "[",
@@ -2477,6 +3279,7 @@ def scan_typescript_source(
                 index + 1,
                 _matching_token(
                     tokens,
+                    matching,
                     index + 1,
                     destructuring_opening,
                     "}" if destructuring_opening == "{" else "]",
@@ -2485,6 +3288,7 @@ def scan_typescript_source(
         )
     for start, end in parameter_ranges:
         for position in range(start + 1, end):
+            budget.charge_parser_operations()
             if tokens[position].value not in {"{", "["}:
                 continue
             previous = tokens[position - 1].value
@@ -2493,6 +3297,7 @@ def scan_typescript_source(
             destructuring_opening = tokens[position].value
             closing = _matching_token(
                 tokens,
+                matching,
                 position,
                 destructuring_opening,
                 "}" if destructuring_opening == "{" else "]",
@@ -2501,13 +3306,16 @@ def scan_typescript_source(
                 destructuring_ranges.append((position, closing))
 
     def in_destructuring_binding(index: int) -> bool:
+        budget.charge_parser_operations(len(destructuring_ranges))
         return any(start < index < end for start, end in destructuring_ranges)
 
     class_fields: set[tuple[str, str]] = set()
     for index, token in enumerate(tokens):
+        budget.charge_parser_operations()
         block = enclosing(index)
         if block is None or block[0] != "class":
             continue
+        budget.charge_parser_operations(len(blocks))
         class_opening = next(
             start
             for start, _end, kind, name in blocks
@@ -2529,6 +3337,7 @@ def scan_typescript_source(
             class_fields.add((block[1], token.value.removeprefix("#")))
 
     for index, token in enumerate(tokens):
+        budget.charge_parser_operations()
         if token.kind not in {"identifier", "string"}:
             continue
         name = token.value.removeprefix("#")
@@ -2663,6 +3472,7 @@ def scan_typescript_source(
                 remaining,
                 authorization_context=is_authorization_context(name),
                 assignment_context=True,
+                budget=budget,
             ):
                 hits.append(
                     ContentHit(
@@ -2674,13 +3484,15 @@ def scan_typescript_source(
                 )
 
     for token in tokens:
-        if token.kind != "string":
+        if token.kind not in {"string", "template"}:
             continue
         budget.charge_text(token.value)
         remaining = maximum_hits - len(hits)
         if remaining <= 0:
             break
-        for hit in scan_content(token.value, remaining):
+        for hit in scan_content(
+            token.value, remaining, assignment_context=True, budget=budget
+        ):
             hits.append(
                 ContentHit(
                     token.line + hit.line - 1,

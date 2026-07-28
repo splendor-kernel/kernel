@@ -17,6 +17,7 @@ from .model import (
     HARD_MAX_FILES,
     HARD_MAX_FINDINGS,
     HARD_MAX_TOTAL_BYTES,
+    HARD_MAX_PARSER_OPERATIONS,
     HARD_POLICY_BYTES,
     POLICY_SCHEMA,
     RULE_MESSAGES,
@@ -51,6 +52,10 @@ GOVERNED_ROOT_INVENTORY: dict[str, tuple[str, dict[str, str]]] = {
         "openapi/splendor-runtime-daemon.yaml",
         {".yaml": "yaml"},
     ),
+    "openapi-external-surface": (
+        "openapi",
+        {".json": "json", ".yaml": "yaml", ".yml": "yaml"},
+    ),
     "repository-examples": (
         "examples",
         {
@@ -73,6 +78,23 @@ GOVERNED_ROOT_INVENTORY: dict[str, tuple[str, dict[str, str]]] = {
         "python/splendor",
         {".py": "python_source"},
     ),
+    "python-package-manifest": (
+        "python/pyproject.toml",
+        {".toml": "config"},
+    ),
+    "typescript-packages-external-surface": (
+        "typescript/packages",
+        {
+            ".cjs": "typescript_source",
+            ".js": "typescript_source",
+            ".json": "json",
+            ".jsx": "typescript_source",
+            ".mjs": "typescript_source",
+            ".mts": "typescript_source",
+            ".ts": "typescript_source",
+            ".tsx": "typescript_source",
+        },
+    ),
     "typescript-types-external-surface": (
         "typescript/packages/types/src",
         {".ts": "typescript_source"},
@@ -81,7 +103,30 @@ GOVERNED_ROOT_INVENTORY: dict[str, tuple[str, dict[str, str]]] = {
         "typescript/packages/client/src",
         {".ts": "typescript_source"},
     ),
+    "gold-example-catalog": (
+        "docs/rules/v2/gold/examples",
+        {".json": "json", ".md": "markdown", ".yaml": "yaml", ".yml": "yaml"},
+    ),
 }
+
+SOURCE_OWNER_EXPORT_INVENTORY: tuple[
+    tuple[str, str, str, str, str, str, tuple[str, ...]], ...
+] = (
+    (
+        "typescript",
+        "@splendor/types",
+        "typescript/packages/types/src/index.ts",
+        "adb32535e7708bd8109870b32496ad4bd364d55fffdc93c0b368f5fbd75d1241",
+        "typescript/packages/types/package.json",
+        "c67bd9b0f8983dfe041ada5528c3f85204726dbdd8e87ebfe89f2f48d47f3c92",
+        (
+            "CallerCredential",
+            "CredentialAudience",
+            "CredentialBinding",
+            "WorkOrderAuthorization",
+        ),
+    ),
+)
 
 
 def parse_date(value: Any) -> dt.date | None:
@@ -112,6 +157,7 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         "reviewed_on",
         "scanner_version",
         "schema_version",
+        "source_owner_exports",
         "structural_exceptions",
         "symbolic_fixtures",
     }
@@ -134,6 +180,7 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         "max_files",
         "max_findings",
         "max_markdown_fences",
+        "max_parser_operations",
         "max_object_members",
         "max_string_bytes",
         "max_structure_depth",
@@ -153,6 +200,7 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         or limits["max_findings"] > HARD_MAX_FINDINGS
         or limits["max_archive_members"] > HARD_MAX_ARCHIVE_MEMBERS
         or limits["max_archive_unpacked_bytes"] > HARD_MAX_ARCHIVE_BYTES
+        or limits["max_parser_operations"] > HARD_MAX_PARSER_OPERATIONS
         or limits["max_structure_depth"] > 128
         or limits["max_structure_nodes"] > 1_000_000
         or limits["max_total_bytes"] < limits["max_file_bytes"]
@@ -191,6 +239,56 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         if isinstance(entry, dict)
     }
     if actual_roots != GOVERNED_ROOT_INVENTORY:
+        return invalid()
+
+    source_owner_keys = {
+        "exports",
+        "language",
+        "module",
+        "package_path",
+        "package_sha256",
+        "path",
+        "sha256",
+    }
+    source_owners = policy["source_owner_exports"]
+    if not isinstance(source_owners, list):
+        return invalid()
+    actual_source_owners: list[
+        tuple[str, str, str, str, str, str, tuple[str, ...]]
+    ] = []
+    for entry in source_owners:
+        if not exact_keys(entry, source_owner_keys):
+            return invalid()
+        exports = entry["exports"]
+        if (
+            entry["language"] not in {"python", "typescript"}
+            or not _policy_text(entry["module"])
+            or not safe_policy_path(entry["path"])
+            or not safe_policy_path(entry["package_path"])
+            or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            or not re.fullmatch(r"[0-9a-f]{64}", entry["package_sha256"])
+            or not isinstance(exports, list)
+            or not exports
+            or exports != sorted(set(exports))
+            or not all(
+                isinstance(name, str)
+                and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", name)
+                for name in exports
+            )
+        ):
+            return invalid()
+        actual_source_owners.append(
+            (
+                entry["language"],
+                entry["module"],
+                entry["path"],
+                entry["sha256"],
+                entry["package_path"],
+                entry["package_sha256"],
+                tuple(exports),
+            )
+        )
+    if tuple(actual_source_owners) != SOURCE_OWNER_EXPORT_INVENTORY:
         return invalid()
 
     digest_entry_keys = {"owner", "path", "reason", "schema_version", "sha256"}
@@ -237,10 +335,13 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         "credential_correlation_value",
         "local_verification_secret_placeholder",
         "non_secret_scope_statement",
+        "python_acceptance_auth_projection",
         "python_acceptance_signing_material",
         "python_caller_auth_transport",
         "typescript_caller_auth_transport",
+        "typescript_json_value_index",
         "typescript_owner_safe_reference",
+        "typescript_record_key",
     }
     exceptions = policy["structural_exceptions"]
     if not isinstance(exceptions, list):

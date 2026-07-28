@@ -125,21 +125,18 @@ def detect_archive_kind(data: bytes) -> str | None:
         return "gzip"
     if _tar_header_checksum(data):
         return "tar"
-    # Reject common prefixed/self-extracting TAR polyglots. The bounded prefix
-    # scan covers generic/V7 headers; the USTAR marker scan covers longer
-    # prefixes without quadratic work.
-    generic_prefix_limit = min(max(0, len(data) - 512), 4096)
-    prefix_sums = [0]
-    for byte in data[: generic_prefix_limit + 512]:
-        prefix_sums.append(prefix_sums[-1] + byte)
-    for offset in range(1, generic_prefix_limit + 1):
+    # Reject prefixed/self-extracting TAR polyglots. V7 has no USTAR marker, so
+    # inspect every possible header start with a constant-memory rolling sum.
+    # Repository file-size limits bound this O(n) pass.
+    last_header = len(data) - 512
+    window_sum = sum(data[:512])
+    for offset in range(1, last_header + 1):
+        window_sum += data[offset + 511] - data[offset - 1]
         if not _plausible_tar_checksum_field(data, offset):
             continue
         checksum = data[offset + 148 : offset + 156]
         expected = int(checksum.strip(b"\x00 "), 8)
-        actual = (
-            prefix_sums[offset + 512] - prefix_sums[offset] - sum(checksum) + (8 * 0x20)
-        )
+        actual = window_sum - sum(checksum) + (8 * 0x20)
         if expected == actual:
             return "tar"
     plausible_markers = 0

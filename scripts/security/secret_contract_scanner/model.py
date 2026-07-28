@@ -20,6 +20,7 @@ HARD_MAX_FILES = 50_000
 HARD_MAX_FINDINGS = 1_000
 HARD_MAX_ARCHIVE_MEMBERS = 2_048
 HARD_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+HARD_MAX_PARSER_OPERATIONS = 100_000_000
 HARD_GIT_TIMEOUT_SECONDS = 15
 
 ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar", ".zip", ".gz", ".gzip")
@@ -108,16 +109,29 @@ _PROVIDER_FRAGMENT = re.compile(
 _OPAQUE_MIXED_FRAGMENT = re.compile(r"[A-Za-z0-9_~+.-]{24,512}")
 
 
-def _segment_variants(segment: str) -> tuple[str, ...]:
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+_MAX_PERCENT_DECODE_ROUNDS = 8
+
+
+def _segment_variants(segment: str) -> tuple[tuple[str, ...], bool]:
     raw_variants = [segment]
-    if re.search(r"%[0-9A-Fa-f]{2}", segment):
+    current = segment
+    ambiguous = False
+    for _ in range(_MAX_PERCENT_DECODE_ROUNDS):
+        if not _PERCENT_ESCAPE.search(current):
+            break
         try:
-            decoded = urllib.parse.unquote(segment, errors="strict")
+            decoded = urllib.parse.unquote(current, errors="strict")
         except (UnicodeDecodeError, ValueError):
-            pass
-        else:
-            if decoded != segment:
-                raw_variants.append(decoded)
+            ambiguous = True
+            break
+        if decoded == current:
+            ambiguous = True
+            break
+        raw_variants.append(decoded)
+        current = decoded
+    if _PERCENT_ESCAPE.search(current):
+        ambiguous = True
     variants: list[str] = []
     for value in raw_variants:
         variants.append(value)
@@ -127,7 +141,7 @@ def _segment_variants(segment: str) -> tuple[str, ...]:
         normalized = "".join(" " if char.isspace() else char for char in value)
         if normalized != value:
             variants.append(normalized)
-    return tuple(dict.fromkeys(variants))
+    return tuple(dict.fromkeys(variants)), ambiguous
 
 
 def _looks_like_opaque_mixed_fragment(value: str) -> bool:
@@ -150,9 +164,10 @@ def _redact_segment(segment: str) -> str:
     # scanner modules have loaded.
     from .content import is_secret_field_name
 
-    variants = _segment_variants(segment)
+    variants, ambiguous_percent_encoding = _segment_variants(segment)
     unsafe = (
         utf8_size(segment) is None
+        or ambiguous_percent_encoding
         or any(unicodedata.category(char) in {"Cc", "Cf"} for char in segment)
         or any(
             bool(_CREDENTIAL_ASSIGNMENT.search(value))
@@ -207,6 +222,7 @@ class ScanStats:
     content_files: int = 0
     archive_members: int = 0
     bytes_worked: int = 0
+    parser_operations: int = 0
     structural_exceptions: int = 0
     content_allowlists: int = 0
 
@@ -221,6 +237,7 @@ class WorkBudget:
     structure_nodes: int = 0
     archive_members: int = 0
     archive_unpacked_bytes: int = 0
+    parser_operations: int = 0
 
     def charge_file(self) -> None:
         self.files += 1
@@ -262,6 +279,15 @@ class WorkBudget:
     def charge_structure(self, amount: int = 1) -> None:
         self.structure_nodes += amount
         if self.structure_nodes > self.limits["max_structure_nodes"]:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+
+    def charge_parser_operations(self, amount: int = 1) -> None:
+        """Charge deterministic parser/normalization work before doing it."""
+
+        if amount < 0:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+        self.parser_operations += amount
+        if self.parser_operations > self.limits["max_parser_operations"]:
             raise ScanDataError("SCN005_BUDGET_EXCEEDED")
 
     def remaining_archive_bytes(self) -> int:
