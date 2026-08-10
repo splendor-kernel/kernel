@@ -34,7 +34,7 @@ ARG RUST_TOOLCHAIN=1.88.0
 RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release \
     -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation \
     -p splendor-daemon --example resident_auth_key_tool \
-    -p splendor-acceptance-action-host
+    -p splendor-acceptance-action-host --bin splendor-acceptance-action-host
 
 FROM python:${PYTHON_VERSION}-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba AS python-builder
 

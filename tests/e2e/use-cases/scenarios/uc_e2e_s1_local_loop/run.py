@@ -220,6 +220,38 @@ def sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def canonical_audit_state_for_commit(
+    state_committed: dict, audit_export: dict, state_head: dict
+) -> dict:
+    commit_trace_id = trace_event_id(state_committed)
+    commit_sequence = state_committed.get("sequence")
+    matches = [
+        item
+        for item in audit_export.get("state_nodes", [])
+        if item.get("trace_event_id") == commit_trace_id
+        and item.get("sequence") == commit_sequence
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "state commit must correlate to exactly one trusted audit state node "
+            f"by trace event and sequence (trace_event_id={commit_trace_id!r}, "
+            f"sequence={commit_sequence!r}, matches={len(matches)})"
+        )
+
+    audit_state = matches[0]
+    state_node_id = audit_state.get("state_node_id")
+    identity = audit_state.get("identity", {})
+    if not state_node_id or identity.get("state_node_id") != state_node_id:
+        raise RuntimeError("trusted audit state node identity is missing or inconsistent")
+    if state_head.get("trace_sequence") != commit_sequence:
+        raise RuntimeError("state head trace sequence does not match the committed audit node")
+    if state_head.get("state_hash") != audit_state.get("state_hash"):
+        raise RuntimeError("state head hash does not match the committed audit node")
+    if state_head.get("snapshot_id") != audit_state.get("snapshot_id"):
+        raise RuntimeError("state head snapshot does not match the committed audit node")
+    return audit_state
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -367,13 +399,13 @@ def main() -> int:
         api_traffic = artifact_dir / "api-traffic.ndjson"
         api_traffic.write_text(json.dumps({"surface": "splendorctl", "commands_log": str(commands)}) + "\n", encoding="utf-8")
         state_committed = next(r for r in reversed(primary_records) if event_type(r) == "state.committed")
-        committed_kind = state_committed["payload"]["kind"]["StateCommitted"]
-        state_node_id = state_committed["payload"]["identity"].get("state_node_id")
-        state_hash = f"{committed_kind['state_hash']['algorithm'].lower()}:{committed_kind['state_hash']['value']}"
         audit_proc = run_cmd(ctl + ["audit", "export", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
         audit_export = json.loads(audit_proc.stdout)
-        audit_state = next(item for item in audit_export["state_nodes"] if item.get("state_node_id") == state_node_id)
-        snapshot_value = audit_state.get("snapshot_id") or committed_kind.get("snapshot_id")
+        audit_state = canonical_audit_state_for_commit(state_committed, audit_export, state_head)
+        state_node_id = audit_state["state_node_id"]
+        state_hash_value = audit_state["state_hash"]
+        state_hash = f"{state_hash_value['algorithm'].lower()}:{state_hash_value['value']}"
+        snapshot_value = audit_state.get("snapshot_id")
         snapshot_ref = f"{snapshot_value['algorithm'].lower()}:{snapshot_value['value']}" if isinstance(snapshot_value, dict) else str(snapshot_value)
         state_export = {
             "schema_version": "splendor.state_node.evidence.v1",

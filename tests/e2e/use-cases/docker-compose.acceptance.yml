@@ -72,7 +72,13 @@ services:
       - bash
       - -lc
       - |
+        set -euo pipefail
         chown -R root:root \
+          /run/splendor-manager-auth \
+          /run/splendor-runner-auth \
+          /run/splendor-vpc-auth \
+          /run/splendor-cloud-auth \
+          /run/splendor-edge-auth \
           /run/splendor-provider-auth \
           /run/splendor-provider-runner-auth \
           /run/splendor-provider-local-auth \
@@ -80,6 +86,11 @@ services:
           /run/splendor-provider-vpc-auth \
           /run/splendor-provider-edge-auth
         chmod 700 \
+          /run/splendor-manager-auth \
+          /run/splendor-runner-auth \
+          /run/splendor-vpc-auth \
+          /run/splendor-cloud-auth \
+          /run/splendor-edge-auth \
           /run/splendor-provider-auth \
           /run/splendor-provider-runner-auth \
           /run/splendor-provider-local-auth \
@@ -101,7 +112,6 @@ services:
           --edge-out /run/splendor-provider-edge-auth
         chown -R splendor:splendor \
           /run/splendor-manager-auth \
-          /run/splendor-runner-auth \
           /run/splendor-vpc-auth \
           /run/splendor-cloud-auth \
           /run/splendor-edge-auth \
@@ -110,7 +120,12 @@ services:
           /run/splendor-provider-cloud-auth \
           /run/splendor-provider-vpc-auth \
           /run/splendor-provider-edge-auth
-        chown -R root:root /run/splendor-provider-runner-auth
+        chown -R root:root \
+          /run/splendor-runner-auth \
+          /run/splendor-provider-runner-auth
+        chmod 700 \
+          /run/splendor-runner-auth \
+          /run/splendor-provider-runner-auth
     volumes:
       - ../../..:/workspace:ro
       - e2e-manager-auth:/run/splendor-manager-auth
