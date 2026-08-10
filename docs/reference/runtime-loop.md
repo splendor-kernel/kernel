@@ -99,13 +99,17 @@ documented in [`identity.md`](identity.md).
   escalation does not execute adapters, contact ticket systems, or install
   circuit breakers.
 - Adapter failure records a failed/denied outcome.
-- Any adapter entry latches the live engine until the tick reaches its durable
-  `LoopTickCompleted`. A successful completed tick clears that transient latch.
-  Generic adapter failure, postcondition failure, or credential-bearing or
-  ambiguous adapter output remains not retryable and reconciliation-required;
-  later same-tick candidates are not submitted, and the local scheduler parks
-  the engine after the outcome is recorded. A trace, outcome, or state failure
-  after adapter entry also leaves the engine parked rather than runnable.
+- Every durable `ActionVerificationStarted` latches the live engine until the
+  complete action/tick suffix reaches durable `LoopTickCompleted`. A Gateway
+  denial or `NeedsApproval` result cannot clear that persistence latch merely
+  because no adapter entered. Adapter entry strengthens the block to an in-flight
+  effect boundary. A successful completed tick clears the transient block only
+  when no recorded outcome independently requires reconciliation. Generic adapter
+  failure, postcondition failure, or credential-bearing or ambiguous adapter
+  output remains not retryable and reconciliation-required; later same-tick
+  candidates are not submitted, and the local scheduler parks the engine after
+  the outcome is recorded. Any later trace, outcome, or state persistence failure
+  leaves the engine parked rather than runnable.
   Fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
   Persisted resume rejects a recorded reconciliation-required result or an
   action-capable tick attempt without its matching `LoopTickCompleted`, including
@@ -125,14 +129,24 @@ documented in [`identity.md`](identity.md).
   persisted history. Fresh and resumed persisted engines hold one exact
   `run_id + tenant_id + agent_id` live-owner claim, so an independent constructor
   or duplicate scheduler admission fails closed and appends no competing event.
-  Recovery retains the highest validated attempted tick even when that tick did
-  not complete; direct ticks and resumed schedulers advance beyond it rather than
-  resetting or reusing the ID. Duplicate policy-supplied explicit action IDs in
-  one decision are rejected with `duplicate_action_id` before Gateway submission;
+  Recovery retains the highest validated attempted tick. A strictly later tick
+  may supersede an earlier incomplete attempt only when the earlier attempt has
+  no `ActionVerificationStarted`/action order, outcome, state commit, pending
+  episode, or effect evidence. An unsuperseded open attempt and every attempt that
+  crossed one of those boundaries remain reconciliation-required. Every completed
+  tick, including a no-action tick, must contain exactly one ordered
+  `OutcomeRecorded`, exactly one later `StateCommitted`, and exactly one later
+  `LoopTickCompleted`. Duplicate, missing, orphaned, or misordered lifecycle
+  events fail closed. Duplicate
+  policy-supplied explicit action IDs in one decision are rejected with
+  `duplicate_action_id` before Gateway submission;
   re-evaluation of one stable `ActionId` on a later distinct tick remains valid.
-  Ordinary pre-effect loop failures retain their existing requeue behavior.
-- State commit failure prevents `StateCommitted` and `LoopTickCompleted` from
-  being emitted for that tick.
+  Ordinary failures before durable `ActionVerificationStarted` retain their
+  existing requeue behavior.
+- Every state graph commit failure latches persistence denial before returning,
+  including state-only ticks with no action or adapter entry. It prevents
+  `StateCommitted` and `LoopTickCompleted`, rejects a later direct tick, and makes
+  the scheduler park the engine.
 - Trace store failure fails the tick before side-effectful work can proceed when
   the event is required before execution.
 

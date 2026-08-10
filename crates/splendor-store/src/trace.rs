@@ -283,14 +283,21 @@ struct SqliteTraceInner {
     connection: Mutex<Connection>,
     store_identity: RuntimeTraceStoreIdentity,
     store_id: String,
-    writable_database: Option<WritableDatabase>,
+    database: Option<VerifiedDatabase>,
     lock_root: Option<SecureLockRoot>,
 }
 
-struct WritableDatabase {
+struct VerifiedDatabase {
     path: PathBuf,
     descriptor: File,
     identity: FileIdentity,
+    access: DatabaseAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatabaseAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Clone)]
@@ -317,6 +324,38 @@ struct ProcessRuntimeLock {
 
 static PROCESS_RUNTIME_LOCKS: OnceLock<Mutex<HashSet<ProcessRuntimeLockKey>>> = OnceLock::new();
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SqliteOpenStage {
+    BeforeSqliteOpen,
+    AfterSqliteOpen,
+}
+
+#[cfg(test)]
+type SqliteOpenStageHook = Box<dyn FnMut(SqliteOpenStage) -> std::io::Result<()> + Send + 'static>;
+
+#[cfg(test)]
+static SQLITE_OPEN_STAGE_HOOKS: OnceLock<Mutex<HashMap<PathBuf, SqliteOpenStageHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+struct SqliteOpenStageHookGuard {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+type SqliteConfirmSnapshotHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static SQLITE_CONFIRM_SNAPSHOT_HOOKS: OnceLock<
+    Mutex<HashMap<(String, String), SqliteConfirmSnapshotHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+struct SqliteConfirmSnapshotHookGuard {
+    key: (String, String),
+}
+
 impl SqliteTraceStore {
     /// Opens or creates a SQLite-backed trace store at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TraceStoreError> {
@@ -341,35 +380,40 @@ impl SqliteTraceStore {
                     connection: Mutex::new(connection),
                     store_identity: sqlite_runtime_store_identity(&store_id, None),
                     store_id,
-                    writable_database: None,
+                    database: None,
                     lock_root: None,
                 }),
             });
         }
 
-        let database_descriptor = open_secure_database(path)?;
+        let database_path = canonical_database_path(path)?;
+        let database_descriptor = open_secure_database(&database_path, DatabaseAccess::ReadWrite)?;
         let database_identity = verify_secure_regular_file(&database_descriptor, 0o600)?;
-        let connection = Connection::open(path)?;
+        let database = VerifiedDatabase {
+            path: database_path.clone(),
+            descriptor: database_descriptor,
+            identity: database_identity,
+            access: DatabaseAccess::ReadWrite,
+        };
+        let connection =
+            open_file_backed_sqlite_connection(&database_path, DatabaseAccess::ReadWrite)?;
+        verify_database_binding_legacy(&connection, &database)?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        let post_open_descriptor = open_secure_database(path)?;
-        let post_open_identity = verify_secure_regular_file(&post_open_descriptor, 0o600)?;
-        if post_open_identity != database_identity {
-            return Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
         let proposed_store_id = Uuid::new_v4().to_string();
-        Self::init_schema(&connection, &proposed_store_id)?;
-        let store_id = Self::load_store_id(&connection)?;
+        with_verified_database_legacy(&connection, &database, |connection| {
+            Self::init_schema(connection, &proposed_store_id)
+        })?;
+        let store_id = with_verified_database_legacy(&connection, &database, |connection| {
+            Self::load_store_id(connection)
+        })?;
         let lock_root = SecureLockRoot::open(lock_root.as_ref())?;
+        verify_database_binding_legacy(&connection, &database)?;
         Ok(Self {
             inner: Arc::new(SqliteTraceInner {
                 connection: Mutex::new(connection),
                 store_identity: sqlite_runtime_store_identity(&store_id, Some(database_identity)),
                 store_id,
-                writable_database: Some(WritableDatabase {
-                    path: path.to_path_buf(),
-                    descriptor: database_descriptor,
-                    identity: database_identity,
-                }),
+                database: Some(database),
                 lock_root: Some(lock_root),
             }),
         })
@@ -381,39 +425,63 @@ impl SqliteTraceStore {
     /// audit export cannot mutate the trace database while reading evidence.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, TraceStoreError> {
         let path = path.as_ref();
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if path == Path::new(":memory:") {
+            let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+            let store_id = Self::try_load_store_id(&connection)?.unwrap_or_else(|| {
+                std::fs::metadata(path)
+                    .map(|metadata| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            format!("legacy:{}:{}", metadata.dev(), metadata.ino())
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            format!("legacy:{}", metadata.len())
+                        }
+                    })
+                    .unwrap_or_else(|_| "legacy:unavailable".to_string())
+            });
+            return Ok(Self {
+                inner: Arc::new(SqliteTraceInner {
+                    connection: Mutex::new(connection),
+                    store_identity: sqlite_runtime_store_identity(&store_id, None),
+                    store_id,
+                    database: None,
+                    lock_root: None,
+                }),
+            });
+        }
+
+        let database_path = canonical_database_path(path)?;
+        let database_descriptor = open_secure_database(&database_path, DatabaseAccess::ReadOnly)?;
+        let database_identity = verify_secure_regular_file(&database_descriptor, 0o600)?;
+        let database = VerifiedDatabase {
+            path: database_path.clone(),
+            descriptor: database_descriptor,
+            identity: database_identity,
+            access: DatabaseAccess::ReadOnly,
+        };
+        let connection =
+            open_file_backed_sqlite_connection(&database_path, DatabaseAccess::ReadOnly)?;
+        verify_database_binding_legacy(&connection, &database)?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        let store_id = Self::try_load_store_id(&connection)?.unwrap_or_else(|| {
-            std::fs::metadata(path)
-                .map(|metadata| {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        format!("legacy:{}:{}", metadata.dev(), metadata.ino())
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        format!("legacy:{}", metadata.len())
-                    }
-                })
-                .unwrap_or_else(|_| "legacy:unavailable".to_string())
-        });
-        #[cfg(unix)]
-        let file_identity = std::fs::metadata(path).ok().map(|metadata| {
-            use std::os::unix::fs::MetadataExt;
-            FileIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }
-        });
-        #[cfg(not(unix))]
-        let file_identity = None;
+        let store_id = with_verified_database_legacy(&connection, &database, |connection| {
+            Ok(Self::try_load_store_id(connection)?.unwrap_or_else(|| {
+                format!(
+                    "legacy:{}:{}",
+                    database.identity.device, database.identity.inode
+                )
+            }))
+        })?;
+        verify_database_binding_legacy(&connection, &database)?;
         Ok(Self {
             inner: Arc::new(SqliteTraceInner {
                 connection: Mutex::new(connection),
-                store_identity: sqlite_runtime_store_identity(&store_id, file_identity),
+                store_identity: sqlite_runtime_store_identity(&store_id, Some(database_identity)),
                 store_id,
-                writable_database: None,
+                database: Some(database),
                 lock_root: None,
             }),
         })
@@ -654,60 +722,60 @@ impl SqliteTraceStore {
         run_id: &str,
         payload: serde_json::Value,
     ) -> Result<u64, TraceStoreError> {
-        let mut connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| TraceStoreError::Poisoned)?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let anchored: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM trace_run_anchor_registry WHERE run_id = ?1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if anchored.is_some() {
-            let actual = Self::latest_sequence_and_hash(&tx, run_id)?
-                .map_or(0, |(sequence, _)| sequence.saturating_add(1));
-            return Err(TraceStoreError::SequenceMismatch {
-                expected: actual,
-                actual: actual.saturating_add(1),
-            });
-        }
-        let (sequence, prev_hash) = match Self::latest_sequence_and_hash(&tx, run_id)? {
-            Some((sequence, hash)) => (
-                sequence
-                    .checked_add(1)
-                    .ok_or(TraceStoreError::SequenceOverflow(sequence))?,
-                Some(hash),
-            ),
-            None => (0, None),
-        };
-        let event_hash = compute_event_hash(prev_hash.as_ref(), &payload)?;
-        let payload_bytes = serde_json::to_vec(&payload).map_err(TraceStoreError::Serialization)?;
-        let recorded_at_raw = encode_timestamp(OffsetDateTime::now_utc());
-        let (event_algo, event_value) = hash_parts(&event_hash);
-        let (prev_algo, prev_value) = prev_hash
-            .as_ref()
-            .map(hash_parts)
-            .map(|(algorithm, value)| (Some(algorithm.to_string()), Some(value.to_string())))
-            .unwrap_or((None, None));
-        tx.execute(
-            "INSERT INTO trace_events (run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                run_id,
-                encode_sequence(sequence)?,
-                payload_bytes,
-                recorded_at_raw,
-                event_algo,
-                event_value,
-                prev_algo,
-                prev_value,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(sequence)
+        self.inner.with_legacy_connection(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let anchored: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM trace_run_anchor_registry WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if anchored.is_some() {
+                let actual = Self::latest_sequence_and_hash(&tx, run_id)?
+                    .map_or(0, |(sequence, _)| sequence.saturating_add(1));
+                return Err(TraceStoreError::SequenceMismatch {
+                    expected: actual,
+                    actual: actual.saturating_add(1),
+                });
+            }
+            let (sequence, prev_hash) = match Self::latest_sequence_and_hash(&tx, run_id)? {
+                Some((sequence, hash)) => (
+                    sequence
+                        .checked_add(1)
+                        .ok_or(TraceStoreError::SequenceOverflow(sequence))?,
+                    Some(hash),
+                ),
+                None => (0, None),
+            };
+            let event_hash = compute_event_hash(prev_hash.as_ref(), &payload)?;
+            let payload_bytes =
+                serde_json::to_vec(&payload).map_err(TraceStoreError::Serialization)?;
+            let recorded_at_raw = encode_timestamp(OffsetDateTime::now_utc());
+            let (event_algo, event_value) = hash_parts(&event_hash);
+            let (prev_algo, prev_value) = prev_hash
+                .as_ref()
+                .map(hash_parts)
+                .map(|(algorithm, value)| {
+                    (Some(algorithm.to_string()), Some(value.to_string()))
+                })
+                .unwrap_or((None, None));
+            tx.execute(
+                "INSERT INTO trace_events (run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    run_id,
+                    encode_sequence(sequence)?,
+                    payload_bytes,
+                    recorded_at_raw,
+                    event_algo,
+                    event_value,
+                    prev_algo,
+                    prev_value,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(sequence)
+        })
     }
 }
 
@@ -719,21 +787,18 @@ impl TraceStore for SqliteTraceStore {
 
     /// Reads all trace records for a run from SQLite.
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
-        let connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| TraceStoreError::Poisoned)?;
-        let mut stmt = connection.prepare(
-            "SELECT run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value FROM trace_events WHERE run_id = ?1 ORDER BY sequence",
-        )?;
-        let records = stmt
-            .query_and_then(params![run_id], Self::record_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        if records.is_empty() {
-            return Err(TraceStoreError::RunNotFound);
-        }
-        Ok(records)
+        self.inner.with_legacy_connection(|connection| {
+            let mut stmt = connection.prepare(
+                "SELECT run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value FROM trace_events WHERE run_id = ?1 ORDER BY sequence",
+            )?;
+            let records = stmt
+                .query_and_then(params![run_id], Self::record_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            if records.is_empty() {
+                return Err(TraceStoreError::RunNotFound);
+            }
+            Ok(records)
+        })
     }
 
     /// Reads a sequence range from SQLite for the specified run.
@@ -743,30 +808,28 @@ impl TraceStore for SqliteTraceStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
-        let connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| TraceStoreError::Poisoned)?;
-        let start_value = encode_sequence(start)?;
-        let end_value = encode_sequence(end)?;
-        let mut stmt = connection.prepare(
-            "SELECT run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value FROM trace_events WHERE run_id = ?1 AND sequence >= ?2 AND sequence < ?3 ORDER BY sequence",
-        )?;
-        let records = stmt
-            .query_and_then(
-                params![run_id, start_value, end_value],
-                Self::record_from_row,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        if records.is_empty() && !Self::run_exists(&connection, run_id)? {
-            return Err(TraceStoreError::RunNotFound);
-        }
-        Ok(records)
+        self.inner.with_legacy_connection(|connection| {
+            let start_value = encode_sequence(start)?;
+            let end_value = encode_sequence(end)?;
+            let mut stmt = connection.prepare(
+                "SELECT run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value FROM trace_events WHERE run_id = ?1 AND sequence >= ?2 AND sequence < ?3 ORDER BY sequence",
+            )?;
+            let records = stmt
+                .query_and_then(
+                    params![run_id, start_value, end_value],
+                    Self::record_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            if records.is_empty() && !Self::run_exists(connection, run_id)? {
+                return Err(TraceStoreError::RunNotFound);
+            }
+            Ok(records)
+        })
     }
 
     fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
-        Ok(self.inner.store_identity.clone())
+        self.inner
+            .with_runtime_connection(|_| Ok(self.inner.store_identity.clone()))
     }
 
     fn open_runtime_reader(
@@ -775,6 +838,7 @@ impl TraceStore for SqliteTraceStore {
         limits: RuntimeTraceLimits,
     ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
         validate_runtime_limits(limits)?;
+        self.inner.with_runtime_connection(|_| Ok(()))?;
         Ok(Arc::new(SqliteRuntimeReader {
             inner: Arc::clone(&self.inner),
             run_id: run_id.to_string(),
@@ -825,6 +889,7 @@ impl RuntimeTraceReader for InMemoryRuntimeReader {
             .map_err(|_| RuntimeTracePortError::Unavailable)?;
         compute_legacy_tail(
             self.store_identity.clone(),
+            &self.run_id,
             records
                 .get(&self.run_id)
                 .map(Vec::as_slice)
@@ -859,22 +924,37 @@ impl RuntimeTraceReader for InMemoryRuntimeReader {
     }
 
     fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
-        let actual = self.tail()?;
-        if &actual != expected {
-            return Err(RuntimeTracePortError::FenceRejected);
-        }
+        // Runtime writers acquire these locks in anchor -> records order after
+        // their writer-local guards. Retain both locks through classification
+        // so an append cannot split the observed anchor from its rows.
+        let anchors = self
+            .anchors
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
         let records = self
             .records
             .lock()
             .map_err(|_| RuntimeTracePortError::Unavailable)?;
-        confirm_records_against_tail(
-            records
-                .get(&self.run_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            expected,
-            self.limits,
-        )
+        let run_records = records
+            .get(&self.run_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let relation = if let Some(anchor) = anchors.get(&self.run_id) {
+            confirm_records_against_tails(
+                run_records,
+                &self.run_id,
+                expected,
+                &anchor.tail,
+                self.limits,
+            )?
+            .0
+        } else {
+            let history =
+                validate_runtime_history(run_records, &self.run_id, Some(expected), self.limits)?;
+            let actual = history.legacy_tail(self.store_identity.clone())?;
+            classify_runtime_tail_relation(expected, &actual)?
+        };
+        finish_tail_confirmation(relation)
     }
 }
 
@@ -916,10 +996,22 @@ impl RuntimeTraceReader for InMemoryRuntimeWriter {
     }
 
     fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
-        if self.tail()? != *expected {
-            return Err(RuntimeTracePortError::FenceRejected);
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(RuntimeTracePortError::Closed);
         }
-        self.reader.confirm_tail(expected)
+        let current = self
+            .current_tail
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+        let confirmation = self.reader.confirm_tail(expected);
+        if confirmation.is_ok() && &*current != expected {
+            return Err(RuntimeTracePortError::IntegrityFailure);
+        }
+        confirmation
     }
 }
 
@@ -961,8 +1053,12 @@ impl RuntimeTraceWriter for InMemoryRuntimeWriter {
             .lock()
             .map_err(|_| RuntimeTracePortError::Unavailable)?;
         let run_records = records.entry(self.reader.run_id.clone()).or_default();
-        confirm_records_against_tail(run_records, expected, self.reader.limits)?;
-        let history_bytes = validate_history_payload_bounds(run_records, self.reader.limits)?;
+        let history_bytes = confirm_records_against_tail(
+            run_records,
+            &self.reader.run_id,
+            expected,
+            self.reader.limits,
+        )?;
         if run_records.len() >= self.reader.limits.max_records
             || history_bytes
                 .checked_add(payload_bytes)
@@ -1080,7 +1176,7 @@ fn acquire_in_memory_runtime_writer(
         if anchor.acquired {
             return Err(RuntimeTracePortError::Conflict);
         }
-        confirm_records_against_tail(existing_records, &anchor.tail, limits)?;
+        confirm_records_against_tail(existing_records, &run_id, &anchor.tail, limits)?;
         let revision = anchor
             .tail
             .anchor_revision()
@@ -1153,36 +1249,34 @@ impl RuntimeTraceReader for SqliteRuntimeReader {
     }
 
     fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
-        let connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| RuntimeTracePortError::Unavailable)?;
-        load_sqlite_tail(&connection, &self.inner, &self.run_id, self.limits)
+        self.inner.with_runtime_connection(|connection| {
+            load_sqlite_tail(connection, &self.inner, &self.run_id, self.limits)
+        })
     }
 
     fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
-        let connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| RuntimeTracePortError::Unavailable)?;
-        read_sqlite_runtime_page(&connection, &self.run_id, start, self.limits)
+        self.inner.with_runtime_connection(|connection| {
+            read_sqlite_runtime_page(connection, &self.run_id, start, self.limits)
+        })
     }
 
     fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
-        verify_writable_database_if_present(&self.inner)?;
-        let connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| RuntimeTracePortError::Unavailable)?;
-        let actual = load_sqlite_tail(&connection, &self.inner, &self.run_id, self.limits)?;
-        if &actual != expected {
-            return Err(RuntimeTracePortError::FenceRejected);
-        }
-        confirm_sqlite_rows_against_tail(&connection, &self.run_id, expected, self.limits)
-            .map(|_| ())
+        self.inner.with_runtime_connection(|connection| {
+            let relation = with_sqlite_read_snapshot(connection, |snapshot| {
+                let actual = load_sqlite_tail(snapshot, &self.inner, &self.run_id, self.limits)?;
+                #[cfg(test)]
+                run_sqlite_confirm_snapshot_hook(&self.inner.store_id, &self.run_id);
+                confirm_sqlite_rows_against_tails(
+                    snapshot,
+                    &self.run_id,
+                    expected,
+                    &actual,
+                    self.limits,
+                )
+                .map(|(relation, _, _)| relation)
+            })?;
+            finish_tail_confirmation(relation)
+        })
     }
 }
 
@@ -1209,16 +1303,26 @@ impl RuntimeTraceReader for SqliteRuntimeWriter {
     }
 
     fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeTracePortError::Closed);
         }
-        self.current_tail
-            .lock()
-            .map(|tail| tail.clone())
-            .map_err(|_| RuntimeTracePortError::Unavailable)
+        self.reader.inner.with_runtime_connection(|_| {
+            self.current_tail
+                .lock()
+                .map(|tail| tail.clone())
+                .map_err(|_| RuntimeTracePortError::Unavailable)
+        })
     }
 
     fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeTracePortError::Closed);
         }
@@ -1226,10 +1330,22 @@ impl RuntimeTraceReader for SqliteRuntimeWriter {
     }
 
     fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
-        if self.tail()? != *expected {
-            return Err(RuntimeTracePortError::FenceRejected);
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(RuntimeTracePortError::Closed);
         }
-        self.reader.confirm_tail(expected)
+        let current = self
+            .current_tail
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+        let confirmation = self.reader.confirm_tail(expected);
+        if confirmation.is_ok() && &*current != expected {
+            return Err(RuntimeTracePortError::IntegrityFailure);
+        }
+        confirmation
     }
 }
 
@@ -1247,137 +1363,149 @@ impl RuntimeTraceWriter for SqliteRuntimeWriter {
             return Err(RuntimeTracePortError::Closed);
         }
         let payload_bytes = validate_payload_bound(&payload, self.reader.limits)?;
-        verify_writable_database_if_present(&self.reader.inner)?;
+        let current_snapshot = self
+            .current_tail
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?
+            .clone();
+        if &current_snapshot != expected {
+            return Err(RuntimeTracePortError::FenceRejected);
+        }
+        let (sequence, next_tail) = self
+            .reader
+            .inner
+            .with_runtime_connection(|connection| {
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(map_sqlite_port_error)?;
+                let actual =
+                    load_current_sqlite_anchor(&tx, &self.reader.inner, &self.reader.run_id)?
+                        .ok_or(RuntimeTracePortError::IntegrityFailure)?;
+                if actual != *expected {
+                    return Err(RuntimeTracePortError::FenceRejected);
+                }
+                let (_, _, history_bytes) = confirm_sqlite_rows_against_tails(
+                    &tx,
+                    &self.reader.run_id,
+                    expected,
+                    expected,
+                    self.reader.limits,
+                )?;
+                if expected.next_sequence()
+                    >= u64::try_from(self.reader.limits.max_records)
+                        .map_err(|_| RuntimeTracePortError::LimitExceeded)?
+                    || history_bytes
+                        .checked_add(payload_bytes)
+                        .is_none_or(|bytes| bytes > self.reader.limits.max_bytes)
+                {
+                    return Err(RuntimeTracePortError::LimitExceeded);
+                }
+
+                let sequence = expected.next_sequence();
+                let stable_hash = compute_event_hash(expected.stable_tail_hash(), &payload)
+                    .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+                let recorded_at = OffsetDateTime::now_utc();
+                let record = TraceRecord {
+                    run_id: self.reader.run_id.clone(),
+                    sequence,
+                    payload,
+                    recorded_at,
+                    event_hash: stable_hash.clone(),
+                    prev_event_hash: expected.stable_tail_hash().cloned(),
+                };
+                let envelope_hash =
+                    compute_trace_envelope_hash(expected.envelope_tail_hash(), &record)?;
+                let fence = expected
+                    .fence()
+                    .cloned()
+                    .ok_or(RuntimeTracePortError::FenceRejected)?;
+                let fence_value = fence.value().to_string();
+                tx.execute(
+                    "INSERT OR REPLACE INTO trace_append_permits (run_id, anchor_revision, fence_digest) VALUES (?1, ?2, ?3)",
+                    params![
+                        self.reader.run_id,
+                        encode_port_sequence(expected.anchor_revision())?,
+                        fence_value,
+                    ],
+                )
+                .map_err(map_sqlite_port_error)?;
+                let payload_bytes = serde_json::to_vec(&record.payload)
+                    .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+                let (event_algo, event_value) = hash_parts(&record.event_hash);
+                let (prev_algo, prev_value) = record
+                    .prev_event_hash
+                    .as_ref()
+                    .map(hash_parts)
+                    .map(|(algorithm, value)| {
+                        (Some(algorithm.to_string()), Some(value.to_string()))
+                    })
+                    .unwrap_or((None, None));
+                tx.execute(
+                    "INSERT INTO trace_events (run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        self.reader.run_id,
+                        encode_port_sequence(sequence)?,
+                        payload_bytes,
+                        encode_timestamp(recorded_at),
+                        event_algo,
+                        event_value,
+                        prev_algo,
+                        prev_value,
+                    ],
+                )
+                .map_err(map_sqlite_port_error)?;
+                let next_sequence = sequence
+                    .checked_add(1)
+                    .ok_or(RuntimeTracePortError::LimitExceeded)?;
+                let next_revision = expected
+                    .anchor_revision()
+                    .checked_add(1)
+                    .ok_or(RuntimeTracePortError::IntegrityFailure)?;
+                let changed = tx
+                    .execute(
+                        "UPDATE trace_run_anchors SET next_sequence = ?1, stable_tail_hash_algo = ?2, stable_tail_hash_value = ?3, envelope_tail_hash_algo = ?4, envelope_tail_hash_value = ?5, anchor_revision = ?6 WHERE run_id = ?7 AND store_id = ?8 AND profile = ?9 AND next_sequence = ?10 AND anchor_revision = ?11 AND fence_digest = ?12",
+                        params![
+                            encode_port_sequence(next_sequence)?,
+                            stable_hash.algorithm.as_str(),
+                            stable_hash.value,
+                            envelope_hash.algorithm.as_str(),
+                            envelope_hash.value,
+                            encode_port_sequence(next_revision)?,
+                            self.reader.run_id,
+                            self.reader.inner.store_id,
+                            CURRENT_TRACE_PROFILE,
+                            encode_port_sequence(expected.next_sequence())?,
+                            encode_port_sequence(expected.anchor_revision())?,
+                            fence_value,
+                        ],
+                    )
+                    .map_err(map_sqlite_port_error)?;
+                if changed != 1 {
+                    return Err(RuntimeTracePortError::FenceRejected);
+                }
+                tx.execute(
+                    "DELETE FROM trace_append_permits WHERE run_id = ?1",
+                    params![self.reader.run_id],
+                )
+                .map_err(map_sqlite_port_error)?;
+                tx.commit().map_err(map_sqlite_port_error)?;
+                let next_tail = RuntimeTraceTail::current(
+                    self.reader.inner.store_identity.clone(),
+                    next_sequence,
+                    Some(stable_hash),
+                    Some(envelope_hash),
+                    next_revision,
+                    fence,
+                )?;
+                Ok((sequence, next_tail))
+            })?;
         let mut current_tail = self
             .current_tail
             .lock()
             .map_err(|_| RuntimeTracePortError::Unavailable)?;
-        if &*current_tail != expected {
-            return Err(RuntimeTracePortError::FenceRejected);
+        if *current_tail != current_snapshot {
+            return Err(RuntimeTracePortError::IntegrityFailure);
         }
-        let mut connection = self
-            .reader
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| RuntimeTracePortError::Unavailable)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_port_error)?;
-        let actual = load_current_sqlite_anchor(&tx, &self.reader.inner, &self.reader.run_id)?
-            .ok_or(RuntimeTracePortError::IntegrityFailure)?;
-        if actual != *expected {
-            return Err(RuntimeTracePortError::FenceRejected);
-        }
-        let (_, history_bytes) = confirm_sqlite_tail_metadata_against_rows(
-            &tx,
-            &self.reader.run_id,
-            expected,
-            self.reader.limits,
-        )?;
-        if expected.next_sequence()
-            >= u64::try_from(self.reader.limits.max_records)
-                .map_err(|_| RuntimeTracePortError::LimitExceeded)?
-            || history_bytes
-                .checked_add(payload_bytes)
-                .is_none_or(|bytes| bytes > self.reader.limits.max_bytes)
-        {
-            return Err(RuntimeTracePortError::LimitExceeded);
-        }
-
-        let sequence = expected.next_sequence();
-        let stable_hash = compute_event_hash(expected.stable_tail_hash(), &payload)
-            .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
-        let recorded_at = OffsetDateTime::now_utc();
-        let record = TraceRecord {
-            run_id: self.reader.run_id.clone(),
-            sequence,
-            payload,
-            recorded_at,
-            event_hash: stable_hash.clone(),
-            prev_event_hash: expected.stable_tail_hash().cloned(),
-        };
-        let envelope_hash = compute_trace_envelope_hash(expected.envelope_tail_hash(), &record)?;
-        let fence = expected
-            .fence()
-            .cloned()
-            .ok_or(RuntimeTracePortError::FenceRejected)?;
-        let fence_value = fence.value().to_string();
-        tx.execute(
-            "INSERT OR REPLACE INTO trace_append_permits (run_id, anchor_revision, fence_digest) VALUES (?1, ?2, ?3)",
-            params![
-                self.reader.run_id,
-                encode_port_sequence(expected.anchor_revision())?,
-                fence_value,
-            ],
-        )
-        .map_err(map_sqlite_port_error)?;
-        let payload_bytes = serde_json::to_vec(&record.payload)
-            .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
-        let (event_algo, event_value) = hash_parts(&record.event_hash);
-        let (prev_algo, prev_value) = record
-            .prev_event_hash
-            .as_ref()
-            .map(hash_parts)
-            .map(|(algorithm, value)| (Some(algorithm.to_string()), Some(value.to_string())))
-            .unwrap_or((None, None));
-        tx.execute(
-            "INSERT INTO trace_events (run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                self.reader.run_id,
-                encode_port_sequence(sequence)?,
-                payload_bytes,
-                encode_timestamp(recorded_at),
-                event_algo,
-                event_value,
-                prev_algo,
-                prev_value,
-            ],
-        )
-        .map_err(map_sqlite_port_error)?;
-        let next_sequence = sequence
-            .checked_add(1)
-            .ok_or(RuntimeTracePortError::LimitExceeded)?;
-        let next_revision = expected
-            .anchor_revision()
-            .checked_add(1)
-            .ok_or(RuntimeTracePortError::IntegrityFailure)?;
-        let changed = tx
-            .execute(
-                "UPDATE trace_run_anchors SET next_sequence = ?1, stable_tail_hash_algo = ?2, stable_tail_hash_value = ?3, envelope_tail_hash_algo = ?4, envelope_tail_hash_value = ?5, anchor_revision = ?6 WHERE run_id = ?7 AND store_id = ?8 AND profile = ?9 AND next_sequence = ?10 AND anchor_revision = ?11 AND fence_digest = ?12",
-                params![
-                    encode_port_sequence(next_sequence)?,
-                    stable_hash.algorithm.as_str(),
-                    stable_hash.value,
-                    envelope_hash.algorithm.as_str(),
-                    envelope_hash.value,
-                    encode_port_sequence(next_revision)?,
-                    self.reader.run_id,
-                    self.reader.inner.store_id,
-                    CURRENT_TRACE_PROFILE,
-                    encode_port_sequence(expected.next_sequence())?,
-                    encode_port_sequence(expected.anchor_revision())?,
-                    fence_value,
-                ],
-            )
-            .map_err(map_sqlite_port_error)?;
-        if changed != 1 {
-            return Err(RuntimeTracePortError::FenceRejected);
-        }
-        tx.execute(
-            "DELETE FROM trace_append_permits WHERE run_id = ?1",
-            params![self.reader.run_id],
-        )
-        .map_err(map_sqlite_port_error)?;
-        tx.commit().map_err(map_sqlite_port_error)?;
-        let next_tail = RuntimeTraceTail::current(
-            self.reader.inner.store_identity.clone(),
-            next_sequence,
-            Some(stable_hash),
-            Some(envelope_hash),
-            next_revision,
-            fence,
-        )?;
         *current_tail = next_tail.clone();
         Ok(RuntimeTraceAppend::new(sequence, next_tail))
     }
@@ -1393,44 +1521,39 @@ impl RuntimeTraceWriter for SqliteRuntimeWriter {
         let current = self
             .current_tail
             .lock()
-            .map_err(|_| RuntimeTracePortError::Unavailable)?
-            .clone();
-        let close_result = (|| {
-            verify_writable_database_if_present(&self.reader.inner)?;
-            let mut connection = self
-                .reader
-                .inner
-                .connection
-                .lock()
-                .map_err(|_| RuntimeTracePortError::Unavailable)?;
-            let tx = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(map_sqlite_port_error)?;
-            let revision = current
-                .anchor_revision()
-                .checked_add(1)
-                .ok_or(RuntimeTracePortError::IntegrityFailure)?;
-            let changed = tx
-                .execute(
-                    "UPDATE trace_run_anchors SET anchor_revision = ?1 WHERE run_id = ?2 AND store_id = ?3 AND anchor_revision = ?4 AND fence_digest = ?5",
-                    params![
-                        encode_port_sequence(revision)?,
-                        self.reader.run_id,
-                        self.reader.inner.store_id,
-                        encode_port_sequence(current.anchor_revision())?,
-                        current
-                            .fence()
-                            .ok_or(RuntimeTracePortError::FenceRejected)?
-                            .value()
-                            .to_string(),
-                    ],
-                )
-                .map_err(map_sqlite_port_error)?;
-            if changed != 1 {
-                return Err(RuntimeTracePortError::FenceRejected);
-            }
-            tx.commit().map_err(map_sqlite_port_error)
-        })();
+            .map(|tail| tail.clone())
+            .map_err(|_| RuntimeTracePortError::Unavailable);
+        let close_result = current.and_then(|current| {
+            self.reader.inner.with_runtime_connection(|connection| {
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(map_sqlite_port_error)?;
+                let revision = current
+                    .anchor_revision()
+                    .checked_add(1)
+                    .ok_or(RuntimeTracePortError::IntegrityFailure)?;
+                let changed = tx
+                    .execute(
+                        "UPDATE trace_run_anchors SET anchor_revision = ?1 WHERE run_id = ?2 AND store_id = ?3 AND anchor_revision = ?4 AND fence_digest = ?5",
+                        params![
+                            encode_port_sequence(revision)?,
+                            self.reader.run_id,
+                            self.reader.inner.store_id,
+                            encode_port_sequence(current.anchor_revision())?,
+                            current
+                                .fence()
+                                .ok_or(RuntimeTracePortError::FenceRejected)?
+                                .value()
+                                .to_string(),
+                        ],
+                    )
+                    .map_err(map_sqlite_port_error)?;
+                if changed != 1 {
+                    return Err(RuntimeTracePortError::FenceRejected);
+                }
+                tx.commit().map_err(map_sqlite_port_error)
+            })
+        });
         let mut lock_file = self
             .lock_file
             .lock()
@@ -1462,17 +1585,18 @@ fn acquire_sqlite_runtime_writer(
     }
     let limits = request.limits();
     validate_runtime_limits(limits)?;
-    verify_writable_database_if_present(&inner)?;
+    let database_identity = inner
+        .database
+        .as_ref()
+        .filter(|database| database.access == DatabaseAccess::ReadWrite)
+        .map(|database| database.identity)
+        .ok_or(RuntimeTracePortError::Unsupported)?;
+    inner.with_runtime_connection(|_| Ok(()))?;
     let lock_root = inner
         .lock_root
         .as_ref()
         .ok_or(RuntimeTracePortError::Unsupported)?;
     let run_id = request.scope().run_id().to_string();
-    let database_identity = inner
-        .writable_database
-        .as_ref()
-        .map(|database| database.identity)
-        .ok_or(RuntimeTracePortError::Unsupported)?;
     let shard = runtime_lock_shard(&inner.store_id, database_identity, &run_id);
     let process_lock = ProcessRuntimeLock::acquire(ProcessRuntimeLockKey {
         lock_root: lock_root.identity,
@@ -1487,11 +1611,7 @@ fn acquire_sqlite_runtime_writer(
         }
     })?;
 
-    let tail_result = (|| {
-        let mut connection = inner
-            .connection
-            .lock()
-            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+    let tail_result = inner.with_runtime_connection(|connection| {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_port_error)?;
@@ -1564,7 +1684,7 @@ fn acquire_sqlite_runtime_writer(
         };
         tx.commit().map_err(map_sqlite_port_error)?;
         Ok(tail)
-    })();
+    });
 
     let tail = match tail_result {
         Ok(tail) => tail,
@@ -1664,6 +1784,238 @@ impl Drop for ProcessRuntimeLock {
     }
 }
 
+impl DatabaseAccess {
+    fn sqlite_open_flags(self) -> OpenFlags {
+        let access = match self {
+            Self::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
+            Self::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        };
+        // `SqliteTraceInner::connection` serializes this connection. URI
+        // interpretation is intentionally absent: callers select one file.
+        access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW
+    }
+
+    fn path_open_flags(self) -> OFlags {
+        let access = match self {
+            Self::ReadOnly => OFlags::RDONLY,
+            Self::ReadWrite => OFlags::RDWR,
+        };
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+}
+
+impl SqliteTraceInner {
+    fn with_legacy_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, TraceStoreError>,
+    ) -> Result<T, TraceStoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| TraceStoreError::Poisoned)?;
+        if let Some(database) = self.database.as_ref() {
+            verify_database_binding_legacy(&connection, database)?;
+        }
+        let result = operation(&mut connection);
+        if let Some(database) = self.database.as_ref() {
+            verify_database_binding_legacy(&connection, database)?;
+        }
+        result
+    }
+
+    fn with_runtime_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, RuntimeTracePortError>,
+    ) -> Result<T, RuntimeTracePortError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+        if let Some(database) = self.database.as_ref() {
+            verify_database_binding_port(&connection, database)?;
+        }
+        let result = operation(&mut connection);
+        if let Some(database) = self.database.as_ref() {
+            verify_database_binding_port(&connection, database)?;
+        }
+        result
+    }
+}
+
+fn with_sqlite_read_snapshot<T>(
+    connection: &mut Connection,
+    operation: impl FnOnce(&Connection) -> Result<T, RuntimeTracePortError>,
+) -> Result<T, RuntimeTracePortError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(map_sqlite_port_error)?;
+    let result = operation(&transaction);
+    match result {
+        Ok(value) => {
+            transaction.commit().map_err(map_sqlite_port_error)?;
+            Ok(value)
+        }
+        Err(error) => {
+            transaction.rollback().map_err(map_sqlite_port_error)?;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_sqlite_open_stage_hook(
+    path: PathBuf,
+    hook: impl FnMut(SqliteOpenStage) -> std::io::Result<()> + Send + 'static,
+) -> SqliteOpenStageHookGuard {
+    let hooks = SQLITE_OPEN_STAGE_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut hooks = hooks.lock().expect("SQLite open-stage hooks mutex");
+    assert!(
+        hooks.insert(path.clone(), Box::new(hook)).is_none(),
+        "SQLite open-stage hook already installed"
+    );
+    SqliteOpenStageHookGuard { path }
+}
+
+#[cfg(test)]
+impl Drop for SqliteOpenStageHookGuard {
+    fn drop(&mut self) {
+        let hooks = SQLITE_OPEN_STAGE_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut hooks = match hooks.lock() {
+            Ok(hooks) => hooks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        hooks.remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn install_sqlite_confirm_snapshot_hook(
+    store_id: String,
+    run_id: String,
+    hook: impl FnOnce() + Send + 'static,
+) -> SqliteConfirmSnapshotHookGuard {
+    let key = (store_id, run_id);
+    let hooks = SQLITE_CONFIRM_SNAPSHOT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut hooks = hooks.lock().expect("SQLite confirm-snapshot hooks mutex");
+    assert!(
+        hooks.insert(key.clone(), Box::new(hook)).is_none(),
+        "SQLite confirm-snapshot hook already installed"
+    );
+    SqliteConfirmSnapshotHookGuard { key }
+}
+
+#[cfg(test)]
+impl Drop for SqliteConfirmSnapshotHookGuard {
+    fn drop(&mut self) {
+        let hooks = SQLITE_CONFIRM_SNAPSHOT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut hooks = match hooks.lock() {
+            Ok(hooks) => hooks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        hooks.remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+fn run_sqlite_confirm_snapshot_hook(store_id: &str, run_id: &str) {
+    let hooks = SQLITE_CONFIRM_SNAPSHOT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let hook = {
+        let mut hooks = hooks.lock().expect("SQLite confirm-snapshot hooks mutex");
+        hooks.remove(&(store_id.to_string(), run_id.to_string()))
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn run_sqlite_open_stage_hook(path: &Path, stage: SqliteOpenStage) -> Result<(), TraceStoreError> {
+    let hooks = SQLITE_OPEN_STAGE_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut hooks = hooks
+        .lock()
+        .map_err(|_| TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
+    if let Some(hook) = hooks.get_mut(path) {
+        hook(stage).map_err(|_| TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
+    }
+    Ok(())
+}
+
+fn open_file_backed_sqlite_connection(
+    path: &Path,
+    access: DatabaseAccess,
+) -> Result<Connection, TraceStoreError> {
+    #[cfg(test)]
+    run_sqlite_open_stage_hook(path, SqliteOpenStage::BeforeSqliteOpen)?;
+    let connection = Connection::open_with_flags(path, access.sqlite_open_flags());
+    #[cfg(test)]
+    run_sqlite_open_stage_hook(path, SqliteOpenStage::AfterSqliteOpen)?;
+    connection.map_err(TraceStoreError::from)
+}
+
+fn with_verified_database_legacy<T>(
+    connection: &Connection,
+    database: &VerifiedDatabase,
+    operation: impl FnOnce(&Connection) -> Result<T, TraceStoreError>,
+) -> Result<T, TraceStoreError> {
+    verify_database_binding_legacy(connection, database)?;
+    let result = operation(connection);
+    verify_database_binding_legacy(connection, database)?;
+    result
+}
+
+fn verify_database_binding_legacy(
+    connection: &Connection,
+    database: &VerifiedDatabase,
+) -> Result<(), TraceStoreError> {
+    verify_database_binding_port(connection, database).map_err(|_| opaque_sqlite_binding_error())
+}
+
+fn opaque_sqlite_binding_error() -> TraceStoreError {
+    TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery)
+}
+
+fn verify_database_binding_port(
+    connection: &Connection,
+    database: &VerifiedDatabase,
+) -> Result<(), RuntimeTracePortError> {
+    let descriptor_identity = verify_secure_regular_file_port(&database.descriptor, 0o600)
+        .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+    if descriptor_identity != database.identity {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+    let path_descriptor = open(
+        &database.path,
+        database.access.path_open_flags(),
+        Mode::empty(),
+    )
+    .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+    let path_file = File::from(path_descriptor);
+    let path_identity = verify_secure_regular_file_port(&path_file, 0o600)
+        .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+    if path_identity != database.identity {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+    verify_sqlite_main_handle_unmoved(connection)
+}
+
+fn verify_sqlite_main_handle_unmoved(connection: &Connection) -> Result<(), RuntimeTracePortError> {
+    let mut moved = 0;
+    // SAFETY: `connection` keeps its SQLite handle alive, `main` is
+    // NUL-terminated, and `moved` remains a valid writable integer for the call.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            std::ptr::addr_of_mut!(moved).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || moved != 0 {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+    Ok(())
+}
+
 fn sqlite_runtime_store_identity(
     store_id: &str,
     file_identity: Option<FileIdentity>,
@@ -1693,10 +2045,35 @@ fn runtime_lock_shard(store_id: &str, database_identity: FileIdentity, run_id: &
     usize::from_str_radix(&digest.value[..2], 16).unwrap_or(0)
 }
 
-fn open_secure_database(path: &Path) -> Result<File, TraceStoreError> {
+fn canonical_database_path(path: &Path) -> Result<PathBuf, TraceStoreError> {
+    if path.as_os_str().as_encoded_bytes().starts_with(b"file:") {
+        return Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidPath(
+            path.to_path_buf(),
+        )));
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| TraceStoreError::Sqlite(rusqlite::Error::InvalidPath(path.to_path_buf())))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // SQLite NOFOLLOW also rejects symlinked ancestor spellings (for example,
+    // macOS `/var`). Normalize only the trusted parent; the final database name
+    // remains subject to descriptor and SQLite no-follow opens.
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|_| TraceStoreError::Sqlite(rusqlite::Error::InvalidPath(path.to_path_buf())))?;
+    Ok(parent.join(file_name))
+}
+
+fn open_secure_database(path: &Path, access: DatabaseAccess) -> Result<File, TraceStoreError> {
     let descriptor = open(
         path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        if access == DatabaseAccess::ReadWrite {
+            access.path_open_flags() | OFlags::CREATE
+        } else {
+            access.path_open_flags()
+        },
         Mode::from_raw_mode(0o600),
     )
     .map_err(|_| TraceStoreError::Sqlite(rusqlite::Error::InvalidPath(path.to_path_buf())))?;
@@ -1761,30 +2138,6 @@ fn secure_regular_file_attributes(
         && (mode & 0o777) == expected_mode
 }
 
-fn verify_writable_database_if_present(
-    inner: &SqliteTraceInner,
-) -> Result<(), RuntimeTracePortError> {
-    let Some(database) = inner.writable_database.as_ref() else {
-        return Ok(());
-    };
-    let descriptor_identity = verify_secure_regular_file_port(&database.descriptor, 0o600)?;
-    if descriptor_identity != database.identity {
-        return Err(RuntimeTracePortError::IntegrityFailure);
-    }
-    let path_descriptor = open(
-        &database.path,
-        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
-    let path_file = File::from(path_descriptor);
-    let path_identity = verify_secure_regular_file_port(&path_file, 0o600)?;
-    if path_identity != database.identity {
-        return Err(RuntimeTracePortError::IntegrityFailure);
-    }
-    Ok(())
-}
-
 fn validate_runtime_limits(limits: RuntimeTraceLimits) -> Result<(), RuntimeTracePortError> {
     RuntimeTraceLimits::checked(
         limits.page_records,
@@ -1822,56 +2175,248 @@ fn validate_page_payload_bounds(
     Ok(bytes)
 }
 
-fn validate_history_payload_bounds(
-    records: &[TraceRecord],
-    limits: RuntimeTraceLimits,
-) -> Result<usize, RuntimeTracePortError> {
-    if records.len() > limits.max_records {
-        return Err(RuntimeTracePortError::LimitExceeded);
-    }
-    let mut bytes = 0usize;
-    for record in records {
-        bytes = bytes
-            .checked_add(validate_payload_bound(&record.payload, limits)?)
-            .ok_or(RuntimeTracePortError::LimitExceeded)?;
-        if bytes > limits.max_bytes {
-            return Err(RuntimeTracePortError::LimitExceeded);
-        }
-    }
-    Ok(bytes)
-}
-
 fn compute_legacy_tail(
     store_identity: RuntimeTraceStoreIdentity,
+    run_id: &str,
     records: &[TraceRecord],
     limits: RuntimeTraceLimits,
 ) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
-    validate_history_payload_bounds(records, limits)?;
-    let mut envelope_hash = None;
-    for record in records {
-        envelope_hash = Some(compute_trace_envelope_hash(envelope_hash.as_ref(), record)?);
-    }
-    RuntimeTraceTail::legacy(
-        store_identity,
-        u64::try_from(records.len()).map_err(|_| RuntimeTracePortError::LimitExceeded)?,
-        records.last().map(|record| record.event_hash.clone()),
-        envelope_hash,
-    )
+    validate_runtime_history(records, run_id, None, limits)?.legacy_tail(store_identity)
 }
 
 fn confirm_records_against_tail(
     records: &[TraceRecord],
+    run_id: &str,
     tail: &RuntimeTraceTail,
     limits: RuntimeTraceLimits,
+) -> Result<usize, RuntimeTracePortError> {
+    let (relation, bytes) = confirm_records_against_tails(records, run_id, tail, tail, limits)?;
+    if relation != RuntimeTailRelation::Equal {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeTailRelation {
+    Equal,
+    Advanced,
+}
+
+fn finish_tail_confirmation(relation: RuntimeTailRelation) -> Result<(), RuntimeTracePortError> {
+    match relation {
+        RuntimeTailRelation::Equal => Ok(()),
+        RuntimeTailRelation::Advanced => Err(RuntimeTracePortError::FenceRejected),
+    }
+}
+
+fn classify_runtime_tail_relation(
+    expected: &RuntimeTraceTail,
+    actual: &RuntimeTraceTail,
+) -> Result<RuntimeTailRelation, RuntimeTracePortError> {
+    if expected.store_identity() != actual.store_identity()
+        || expected.profile() != actual.profile()
+        || expected.fence() != actual.fence()
+        || actual.next_sequence() < expected.next_sequence()
+        || actual.anchor_revision() < expected.anchor_revision()
+    {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+    if actual == expected {
+        return Ok(RuntimeTailRelation::Equal);
+    }
+
+    let sequence_advance = actual.next_sequence() - expected.next_sequence();
+    let revision_advance = actual.anchor_revision() - expected.anchor_revision();
+    match expected.profile() {
+        RuntimeTraceProfile::CurrentAnchoredV1
+            if revision_advance > 0 && revision_advance >= sequence_advance =>
+        {
+            Ok(RuntimeTailRelation::Advanced)
+        }
+        RuntimeTraceProfile::LegacyUnanchored
+            if sequence_advance > 0
+                && expected.anchor_revision() == 0
+                && actual.anchor_revision() == 0 =>
+        {
+            Ok(RuntimeTailRelation::Advanced)
+        }
+        _ => Err(RuntimeTracePortError::IntegrityFailure),
+    }
+}
+
+struct RuntimeHistoryValidator<'a> {
+    run_id: &'a str,
+    expected_prefix: Option<&'a RuntimeTraceTail>,
+    limits: RuntimeTraceLimits,
+    next_sequence: u64,
+    stable_tail_hash: Option<ContentHash>,
+    envelope_tail_hash: Option<ContentHash>,
+    payload_bytes: usize,
+    prefix_confirmed: bool,
+}
+
+impl<'a> RuntimeHistoryValidator<'a> {
+    fn new(
+        run_id: &'a str,
+        expected_prefix: Option<&'a RuntimeTraceTail>,
+        limits: RuntimeTraceLimits,
+    ) -> Result<Self, RuntimeTracePortError> {
+        let mut validator = Self {
+            run_id,
+            expected_prefix,
+            limits,
+            next_sequence: 0,
+            stable_tail_hash: None,
+            envelope_tail_hash: None,
+            payload_bytes: 0,
+            prefix_confirmed: false,
+        };
+        if expected_prefix.is_some_and(|expected| expected.next_sequence() == 0) {
+            validator.confirm_expected_prefix()?;
+        }
+        Ok(validator)
+    }
+
+    fn push(&mut self, record: &TraceRecord) -> Result<(), RuntimeTracePortError> {
+        if self.next_sequence
+            >= u64::try_from(self.limits.max_records)
+                .map_err(|_| RuntimeTracePortError::LimitExceeded)?
+        {
+            return Err(RuntimeTracePortError::LimitExceeded);
+        }
+        if record.run_id != self.run_id
+            || record.sequence != self.next_sequence
+            || record.prev_event_hash.as_ref() != self.stable_tail_hash.as_ref()
+        {
+            return Err(RuntimeTracePortError::IntegrityFailure);
+        }
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(validate_payload_bound(&record.payload, self.limits)?)
+            .ok_or(RuntimeTracePortError::LimitExceeded)?;
+        if self.payload_bytes > self.limits.max_bytes {
+            return Err(RuntimeTracePortError::LimitExceeded);
+        }
+        let stable_hash = compute_event_hash(record.prev_event_hash.as_ref(), &record.payload)
+            .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+        if stable_hash != record.event_hash {
+            return Err(RuntimeTracePortError::IntegrityFailure);
+        }
+        self.envelope_tail_hash = Some(compute_trace_envelope_hash(
+            self.envelope_tail_hash.as_ref(),
+            record,
+        )?);
+        self.stable_tail_hash = Some(stable_hash);
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(RuntimeTracePortError::LimitExceeded)?;
+        if self
+            .expected_prefix
+            .is_some_and(|expected| expected.next_sequence() == self.next_sequence)
+        {
+            self.confirm_expected_prefix()?;
+        }
+        Ok(())
+    }
+
+    fn confirm_expected_prefix(&mut self) -> Result<(), RuntimeTracePortError> {
+        let expected = self
+            .expected_prefix
+            .ok_or(RuntimeTracePortError::BackendContract)?;
+        confirm_runtime_history_position(
+            self.next_sequence,
+            self.stable_tail_hash.as_ref(),
+            self.envelope_tail_hash.as_ref(),
+            expected,
+        )?;
+        self.prefix_confirmed = true;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ValidatedRuntimeHistory, RuntimeTracePortError> {
+        if self.expected_prefix.is_some() && !self.prefix_confirmed {
+            return Err(RuntimeTracePortError::IntegrityFailure);
+        }
+        Ok(ValidatedRuntimeHistory {
+            next_sequence: self.next_sequence,
+            stable_tail_hash: self.stable_tail_hash,
+            envelope_tail_hash: self.envelope_tail_hash,
+            payload_bytes: self.payload_bytes,
+        })
+    }
+}
+
+struct ValidatedRuntimeHistory {
+    next_sequence: u64,
+    stable_tail_hash: Option<ContentHash>,
+    envelope_tail_hash: Option<ContentHash>,
+    payload_bytes: usize,
+}
+
+impl ValidatedRuntimeHistory {
+    fn confirm_tail(&self, tail: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        confirm_runtime_history_position(
+            self.next_sequence,
+            self.stable_tail_hash.as_ref(),
+            self.envelope_tail_hash.as_ref(),
+            tail,
+        )
+    }
+
+    fn legacy_tail(
+        &self,
+        store_identity: RuntimeTraceStoreIdentity,
+    ) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        RuntimeTraceTail::legacy(
+            store_identity,
+            self.next_sequence,
+            self.stable_tail_hash.clone(),
+            self.envelope_tail_hash.clone(),
+        )
+    }
+}
+
+fn confirm_runtime_history_position(
+    next_sequence: u64,
+    stable_tail_hash: Option<&ContentHash>,
+    envelope_tail_hash: Option<&ContentHash>,
+    tail: &RuntimeTraceTail,
 ) -> Result<(), RuntimeTracePortError> {
-    let computed = compute_legacy_tail(tail.store_identity().clone(), records, limits)?;
-    if computed.next_sequence() != tail.next_sequence()
-        || computed.stable_tail_hash() != tail.stable_tail_hash()
-        || computed.envelope_tail_hash() != tail.envelope_tail_hash()
+    if next_sequence != tail.next_sequence()
+        || stable_tail_hash != tail.stable_tail_hash()
+        || envelope_tail_hash != tail.envelope_tail_hash()
     {
         return Err(RuntimeTracePortError::IntegrityFailure);
     }
     Ok(())
+}
+
+fn validate_runtime_history(
+    records: &[TraceRecord],
+    run_id: &str,
+    expected_prefix: Option<&RuntimeTraceTail>,
+    limits: RuntimeTraceLimits,
+) -> Result<ValidatedRuntimeHistory, RuntimeTracePortError> {
+    let mut validator = RuntimeHistoryValidator::new(run_id, expected_prefix, limits)?;
+    for record in records {
+        validator.push(record)?;
+    }
+    validator.finish()
+}
+
+fn confirm_records_against_tails(
+    records: &[TraceRecord],
+    run_id: &str,
+    expected: &RuntimeTraceTail,
+    actual: &RuntimeTraceTail,
+    limits: RuntimeTraceLimits,
+) -> Result<(RuntimeTailRelation, usize), RuntimeTracePortError> {
+    let relation = classify_runtime_tail_relation(expected, actual)?;
+    let history = validate_runtime_history(records, run_id, Some(expected), limits)?;
+    history.confirm_tail(actual)?;
+    Ok((relation, history.payload_bytes))
 }
 
 fn read_sqlite_runtime_page(
@@ -1994,7 +2539,7 @@ fn load_sqlite_tail(
             break;
         }
     }
-    compute_legacy_tail(inner.store_identity.clone(), &records, limits)
+    compute_legacy_tail(inner.store_identity.clone(), run_id, &records, limits)
 }
 
 fn load_current_sqlite_anchor(
@@ -2094,71 +2639,48 @@ fn confirm_sqlite_rows_against_tail(
     expected: &RuntimeTraceTail,
     limits: RuntimeTraceLimits,
 ) -> Result<(u64, usize), RuntimeTracePortError> {
-    let bounds = confirm_sqlite_tail_metadata_against_rows(connection, run_id, expected, limits)?;
-    let mut next_sequence = 0u64;
-    let mut stable_tail = None;
-    let mut envelope_tail = None;
-    while next_sequence < expected.next_sequence() {
-        let page = read_sqlite_runtime_page(connection, run_id, next_sequence, limits)?;
-        if page.records().is_empty() || page.next_sequence() <= next_sequence {
+    let (relation, count, bytes) =
+        confirm_sqlite_rows_against_tails(connection, run_id, expected, expected, limits)?;
+    if relation != RuntimeTailRelation::Equal {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+    Ok((count, bytes))
+}
+
+fn confirm_sqlite_rows_against_tails(
+    connection: &Connection,
+    run_id: &str,
+    expected: &RuntimeTraceTail,
+    actual: &RuntimeTraceTail,
+    limits: RuntimeTraceLimits,
+) -> Result<(RuntimeTailRelation, u64, usize), RuntimeTracePortError> {
+    let relation = classify_runtime_tail_relation(expected, actual)?;
+    let (count, bytes) = validate_sqlite_history_bounds(connection, run_id, limits)?;
+    if count != actual.next_sequence() {
+        return Err(RuntimeTracePortError::IntegrityFailure);
+    }
+
+    let mut validator = RuntimeHistoryValidator::new(run_id, Some(expected), limits)?;
+    while validator.next_sequence < actual.next_sequence() {
+        let page = read_sqlite_runtime_page(connection, run_id, validator.next_sequence, limits)?;
+        if page.records().is_empty() || page.next_sequence() <= validator.next_sequence {
             return Err(RuntimeTracePortError::IntegrityFailure);
         }
         for record in page.records() {
-            if record.run_id != run_id
-                || record.sequence != next_sequence
-                || record.prev_event_hash.as_ref() != stable_tail.as_ref()
-            {
-                return Err(RuntimeTracePortError::IntegrityFailure);
-            }
-            let stable_hash = compute_event_hash(record.prev_event_hash.as_ref(), &record.payload)
-                .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
-            if stable_hash != record.event_hash {
-                return Err(RuntimeTracePortError::IntegrityFailure);
-            }
-            envelope_tail = Some(compute_trace_envelope_hash(envelope_tail.as_ref(), record)?);
-            stable_tail = Some(stable_hash);
-            next_sequence = next_sequence
-                .checked_add(1)
-                .ok_or(RuntimeTracePortError::LimitExceeded)?;
+            validator.push(record)?;
         }
-        if page.next_sequence() != next_sequence
-            || page.complete() != (next_sequence == expected.next_sequence())
+        if page.next_sequence() != validator.next_sequence
+            || page.complete() != (validator.next_sequence == actual.next_sequence())
         {
             return Err(RuntimeTracePortError::IntegrityFailure);
         }
     }
-    if stable_tail.as_ref() != expected.stable_tail_hash()
-        || envelope_tail.as_ref() != expected.envelope_tail_hash()
-    {
+    let history = validator.finish()?;
+    history.confirm_tail(actual)?;
+    if history.next_sequence != count {
         return Err(RuntimeTracePortError::IntegrityFailure);
     }
-    Ok(bounds)
-}
-
-fn confirm_sqlite_tail_metadata_against_rows(
-    connection: &Connection,
-    run_id: &str,
-    expected: &RuntimeTraceTail,
-    limits: RuntimeTraceLimits,
-) -> Result<(u64, usize), RuntimeTracePortError> {
-    let (count, bytes) = validate_sqlite_history_bounds(connection, run_id, limits)?;
-    if count != expected.next_sequence() {
-        return Err(RuntimeTracePortError::IntegrityFailure);
-    }
-    let latest = connection.query_row(
-        "SELECT event_hash_algo, event_hash_value FROM trace_events WHERE run_id = ?1 ORDER BY sequence DESC LIMIT 1",
-        params![run_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    );
-    let latest = match latest {
-        Ok((algorithm, value)) => Some(content_hash_from_port_parts(&algorithm, &value)?),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(error) => return Err(map_sqlite_port_error(error)),
-    };
-    if latest.as_ref() != expected.stable_tail_hash() {
-        return Err(RuntimeTracePortError::IntegrityFailure);
-    }
-    Ok((count, bytes))
+    Ok((relation, count, bytes))
 }
 
 fn validate_sqlite_history_bounds(

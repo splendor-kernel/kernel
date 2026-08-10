@@ -80,8 +80,14 @@ physical/operator envelope strings, complete device-profile values/keys, and
 every top-level numeric `params.bytes` body,
 independent of action labels or adapter routing. Every inspected raw or decoded
 string rejects BOM and NUL/control ambiguity; numeric bytes additionally require
-unambiguous UTF-8, so UTF-16 and invalid encodings fail closed. This screening
-never validates receipt authority. It denies malformed parsed
+unambiguous UTF-8, so UTF-16, UTF-32, and invalid encodings fail closed. The sole
+compatibility profile is an exact owner-resolved `write_file`/registered
+filesystem/permission contract with closed `{path, bytes}` params. That profile
+uses a dedicated bounded opaque scan: ordinary NUL/control and JSON-looking file
+bytes are preserved, while recognizable UTF-8/16/32 credentials and malformed or
+ambiguous zero-interleaved encodings deny. Request metadata cannot select this
+profile, and it does not weaken any persisted percept/state/result barrier. This
+screening never validates receipt authority. It denies malformed parsed
 coordinates and depth/node/string/cumulative-byte overflow with the sole fixed
 reason `raw_credential_input_denied`. Its error type is fieldless,
 non-serializable, and non-reflecting. Denied action traces use one constant
@@ -126,11 +132,12 @@ current filesystem/HTTP result shapes. A numeric profile fails closed if any
 member is non-integer, negative, out of `u8` range, null, string, boolean, object,
 or otherwise mixed; malformed members cannot make the scanner abandon the
 envelope. Invalid UTF-8 envelopes are boundedly split around invalid sequences
-and complete recognizable textual spans are screened without retaining or
-reflecting a lossy candidate. Bounded benign JSON, text, filesystem/HTTP results,
-and genuinely opaque binary state remain compatible. Explicit text/JSON
-ambiguity fails closed. Encrypted, compressed, custom-encoded, split, or
-otherwise opaque state remains an explicit nonclaim.
+and complete recognizable UTF-8/16/32 textual spans are screened without
+retaining or reflecting a lossy candidate. Bounded benign JSON, text,
+filesystem/HTTP results, and genuinely opaque binary state remain compatible.
+Explicit text/JSON or zero-interleaved encoding ambiguity fails closed.
+Encrypted, compressed, custom-encoded, split, or otherwise opaque state remains
+an explicit nonclaim.
 
 This barrier is intentionally not the complete RFC 0012
 `CredentialIngressProfile`: it has no operation-specific owner-schema registry,

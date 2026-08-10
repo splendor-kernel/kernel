@@ -179,14 +179,45 @@ signatures, provider tokens in authorities or paths, and nested credential URLs
 deny. Object keys containing non-ASCII/confusable characters or residual percent
 escapes after one bounded decode also fail closed.
 
-Top-level numeric `params.bytes` content is always a strict credential-capable
-coordinate, independent of action labels, declared side-effect class, optional
-adapter routing, or later registry lookup. It requires bounded integer bytes and
-unambiguous UTF-8;
-UTF-8 BOM, UTF-16LE/BE, invalid UTF-8, NUL/control data, non-array, non-integer,
-out-of-range, or over-budget shapes fail closed. Credential-free bounded UTF-8
-bodies remain accepted. Numeric arrays under other field names retain ordinary
-non-byte semantics.
+Top-level numeric `params.bytes` content is a strict credential-capable
+coordinate by default, independent of requester routing metadata. The public
+general-purpose action guards always use this strict profile; an omitted adapter,
+an action-declared adapter, or a caller-supplied `filesystem` adapter can never
+select opaque-byte handling. The strict profile requires bounded
+integer bytes and unambiguous UTF-8; UTF-8 BOM, UTF-16LE/BE, UTF-32LE/BE,
+invalid UTF-8, NUL/control data, non-array, non-integer, out-of-range, or
+over-budget shapes fail closed. Credential-free bounded UTF-8 bodies remain
+accepted.
+
+The exact legacy filesystem write profile instead classifies that same bounded
+array as opaque file content only after a trusted composition root resolves all
+of the following before payload scanning: an immutable `TrustedActionProfile`,
+the profile's exact action-to-adapter registration, the full permission set, and
+the registered adapter's filesystem side-effect contract. The request must then
+have the exact closed `{path, bytes}` params shape and `write_file` operation. An
+omitted request adapter may use the owner-resolved registered adapter; a supplied
+adapter must match it exactly. Missing profiles, missing registrations, profile
+or permission mismatches, and spoofed routes retain the strict profile. The
+Gateway's Rust-only trusted-profile guard helper is denial-only and requires
+owner-resolved input; constructing or forwarding requester metadata does not make
+it trusted. `VerifiedActionGateway` resolves this input from its own immutable
+profile and adapter maps, and the daemon's policy wrapper receives the same
+already-validated run profiles from composition. Kernel policy-proposal paths
+without that owner-resolved evidence retain the strict profile. The opaque
+profile uses a dedicated bounded byte-candidate scan rather than the general
+persisted-value parser. Ordinary file bytes therefore retain NUL and control
+bytes and may begin with malformed-JSON-looking text such as `{not-json`; this
+path does not reinterpret them as persisted JSON. It still scans complete UTF-8
+runs around invalid byte sequences, strictly decodes leading UTF-8/UTF-16/
+UTF-32 byte-order marks, detects likely BOM-less UTF-16LE/BE and UTF-32LE/BE,
+and checks aligned embedded zero-interleaved ASCII runs. Recognizable credential
+text in any of those forms denies before adapter entry. Nested or midstream
+BOMs, malformed declared encodings, competing endian interpretations, and
+truncated or near-zero-interleaved text fail closed. The exception does not
+exempt arbitrary actions, adapters, or field paths, and it does not carry into
+percept, state, adapter-output, trace, or other persistence barriers; those
+general paths retain their strict text/JSON ambiguity rules. Numeric arrays
+under other action-param field names retain ordinary non-byte semantics.
 
 All inspected raw and decoded string and object-key coordinates must also be
 unambiguous text. UTF BOM markers and non-whitespace control/NUL characters fail
@@ -226,16 +257,21 @@ Immediately after `ActionAdapter::execute` returns successfully,
 satisfied-postcondition strings to the same Gateway-owned bounded scanner. The
 scan occurs before invariant or safety post-verification and before any output
 can enter `ActionOutcome`, traces, daemon responses, state, export, or replay.
-Persisted JSON screening includes strings and keys, root numeric byte arrays, and
-selected `bytes`, `body`, and `contents` numeric-byte envelopes, including the
-current filesystem and HTTP result shapes. Once a root/selected array has a
+Persisted JSON screening includes strings and keys plus selected `bytes`, `body`,
+and `contents` numeric-byte envelopes, including the current filesystem and HTTP
+result shapes. A schema-free root array retains ordinary JSON semantics: a
+complete `0..=255` integer array is additionally scanned as a non-authorizing
+UTF-8/likely-UTF-16/likely-UTF-32 credential candidate, while mixed, fractional,
+negative, or out-of-range root arrays are not reclassified as malformed bytes.
+Credential matches still suppress the root result. Once a selected envelope has a
 numeric-byte profile, every member must be an integer in `0..=255`; floats,
 negative/out-of-range values, booleans, nulls, strings, objects, or mixed forms
 deny instead of abandoning reconstruction. Invalid UTF-8 opaque envelopes are
-still inspected, within the same byte budget, for complete recognizable textual
-spans before genuinely opaque benign binary is allowed. No lossy candidate is
-retained or reflected. Declared JSON bodies must parse, textual bodies must be
-unambiguous UTF-8, and scanner/parser/resource uncertainty fails closed.
+still inspected, within the same byte budget, for complete recognizable UTF-8,
+UTF-16, and UTF-32 textual spans before genuinely opaque benign binary is
+allowed. No lossy candidate is retained or reflected. Declared JSON bodies must
+parse, textual bodies must be unambiguous UTF-8, and scanner/parser/encoding/
+resource uncertainty fails closed.
 
 A match or uncertainty after adapter entry is not a pre-effect denial. The
 Gateway returns `ActionStatus::Failed`, keeps the already-safe pre-verification

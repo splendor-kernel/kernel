@@ -4,6 +4,54 @@
 
 ### Added
 
+- **status/incomplete correction:** reserves explicit static daemon-policy action
+  IDs against direct/physical preemption before audit or durable-history lookup,
+  while preserving later completed tick reuse and exact tick-approval
+  continuation. Raw requests carrying those reserved IDs now return only the
+  fixed denial without audit/action history or consuming the future policy ID.
+  Evidence requires complete ordered outcome/state/completion grammar for every
+  completed tick, while allowing a strictly later tick to supersede only an
+  earlier pre-action attempt with no action, outcome, state, pending episode, or
+  effect evidence. Closed, paused, and waiting raw-credential denials no longer
+  scan growing history or append trace records, and both direct and physical
+  OpenAPI routes declare the retryable `503 action_history_unavailable` response.
+  No request, trace-event, Store, Gateway, scanner, or canonical-command schema
+  changed.
+- **status/incomplete correction:** hardened daemon direct/physical action
+  duplicate suppression without adding a private command digest. A completely
+  used run-local `action_id` now returns uniform non-retryable
+  `action_id_conflict` instead of replaying a stored outcome; one initial
+  approval challenge permits only one exact continuation. Direct/physical
+  origins remain one-shot after that continuation; tick-origin IDs may be reused
+  only by the exact action on strictly later completed ticks after any challenge
+  closes. Concurrent trace-tail growth is retried with fresh bounded readers and
+  returns retryable `action_history_changed` on exhaustion; temporary pre-start
+  Store failure returns `action_history_unavailable`. Neither path permanently
+  closes admission. Live per-run contention returns
+  retryable `action_in_progress` without poisoning later authority, incomplete
+  durable history remains reconciliation-required, credential-bearing retries
+  are denied before durable disposition without persisting rejected metadata,
+  and physical cross-node reuse cannot become a profile/outcome oracle. Durable
+  history validation is bounded and runs outside the run mutex. This adds no
+  request, outcome, trace-event, or canonical digest schema and makes no
+  provider/global/distributed/restart exactly-once claim.
+- **status/incomplete correction:** redacted Evidence projections now tokenize
+  every 64-or-longer ASCII-hex run in every typed payload string and object key,
+  independent of source-chain membership or payload path. This closes percept
+  provenance, remote/idempotency, state-coordinate, action, and future typed-field
+  source-hash membership oracles. Structural payload hashes are intentionally
+  tokenized; source history is still fully validated first, and only the newly
+  computed projection-local envelope/completion hashes remain as integrity facts.
+- **status/incomplete correction:** moved durable action-episode interpretation
+  into `splendor-evidence`. The owner now validates strict terminal/outcome
+  grammar, action ID/status/source binding, effect certainty, endpoint-bound
+  approval continuation, and strictly later completed-tick reuse, while daemon handlers consume only a
+  bounded disposition plus live authority state. Approval continuation is bound
+  to its original endpoint class and physical node: direct/physical substitution
+  or cross-node retry fails before another episode, receipt claim, or adapter
+  call, leaves the run waiting, and preserves one-use receipt availability at the
+  original endpoint. No wire, request, outcome, trace variant, or canonical
+  digest changed.
 - **status/incomplete correction:** replaced the advisory persisted-run owner
   shim with default-deny, externally implementable runtime trace reader/writer
   capabilities. Recovery now acquires one append-fenced writer before bounded

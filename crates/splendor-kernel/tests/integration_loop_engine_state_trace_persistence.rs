@@ -1,7 +1,7 @@
 use splendor_gateway::{
     raw_credential_denied_action, ActionAdapter, ActionGateway, ActionId, ActionOutcome,
-    ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
-    RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
+    ActionStatus, AdapterError, AdapterResult, GatewayError, VerifiedActionGateway,
+    RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentRuntimeConfig, ConstraintEngine, ConstraintEvaluation,
@@ -18,11 +18,11 @@ use splendor_store::{
     StateStore, StateStoreError, TraceRecord, TraceStore, TraceStoreError,
 };
 use splendor_types::{
-    Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
-    AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
-    AuthorityObligationReceiptValidationKind, EffectCertainty, Feedback, Percept,
-    PerceptProvenance, PrincipalId, RetryClass, RevocationStatus, SnapshotId, StateNodeId,
-    VerificationResult,
+    Action, ApprovalId, ApprovalTraceContext, AuthorityDecisionId, AuthorityObligationId,
+    AuthorityObligationKind, AuthorityObligationReceipt, AuthorityObligationReceiptId,
+    AuthorityObligationReceiptValidation, AuthorityObligationReceiptValidationKind,
+    EffectCertainty, Feedback, Percept, PerceptProvenance, PrincipalId, RetryClass,
+    RevocationStatus, SnapshotId, StateNodeId, VerificationResult,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -333,6 +333,73 @@ impl ActionAdapter for CountingAdapter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoEffectGatewayOutcome {
+    Denied,
+    NeedsApproval,
+}
+
+struct NoEffectGateway {
+    outcome: NoEffectGatewayOutcome,
+    submissions: Arc<AtomicUsize>,
+}
+
+impl ActionGateway for NoEffectGateway {
+    fn submit(
+        &self,
+        request: splendor_gateway::ActionRequest,
+    ) -> Result<ActionOutcome, GatewayError> {
+        self.submissions.fetch_add(1, Ordering::SeqCst);
+        let (status, reason, verification) = match self.outcome {
+            NoEffectGatewayOutcome::Denied => (
+                ActionStatus::Denied,
+                "fixture_denied",
+                VerificationResult::deny("fixture_denied"),
+            ),
+            NoEffectGatewayOutcome::NeedsApproval => {
+                let approval = ApprovalTraceContext {
+                    approval_id: ApprovalId::new(),
+                    tenant_id: request.tenant_id.clone(),
+                    agent_id: request.agent_id.clone(),
+                    run_id: request.run_id.clone(),
+                    action_id: Some(request.action_id.clone()),
+                    action_name: request.action.name.clone(),
+                    adapter: request.adapter.clone(),
+                    decision: None,
+                    reason: Some("fixture approval required".to_string()),
+                    policy_id: Some("fixture-approval-policy".to_string()),
+                    risk_level: Some("external".to_string()),
+                    issued_at: None,
+                    expires_at: None,
+                    revoked: false,
+                };
+                (
+                    ActionStatus::NeedsApproval,
+                    "approval_required",
+                    VerificationResult {
+                        allowed: false,
+                        reasons: vec!["approval_required".to_string()],
+                        artifacts: serde_json::json!({
+                            "approval_status": "required",
+                            "approval_context": approval,
+                        }),
+                    },
+                )
+            }
+        };
+        Ok(ActionOutcome {
+            action_id: request.action_id,
+            status,
+            verification,
+            post_verification: None,
+            output: None,
+            error: Some(reason.to_string()),
+            approval_challenge: None,
+            completed_at: OffsetDateTime::now_utc(),
+        })
+    }
+}
+
 struct ForbiddenRawEffectAdapter {
     adapter_calls: Arc<AtomicUsize>,
     provider_calls: Arc<AtomicUsize>,
@@ -347,6 +414,9 @@ struct FailIfWrittenStateStore {
 #[derive(Clone, Copy, Debug)]
 enum TraceFailurePoint {
     ActionVerificationCompleted,
+    ApprovalRequested,
+    ActionDenied,
+    ActionNeedsApproval,
     ActionExecuted,
     ActionFailed,
     OutcomeRecorded,
@@ -361,7 +431,15 @@ impl TraceFailurePoint {
             (
                 Self::ActionVerificationCompleted,
                 TraceEventKind::ActionVerificationCompleted { .. }
-            ) | (Self::ActionFailed, TraceEventKind::ActionFailed { .. })
+            ) | (
+                Self::ApprovalRequested,
+                TraceEventKind::ApprovalRequested { .. }
+            ) | (Self::ActionDenied, TraceEventKind::ActionDenied { .. })
+                | (
+                    Self::ActionNeedsApproval,
+                    TraceEventKind::ActionNeedsApproval { .. }
+                )
+                | (Self::ActionFailed, TraceEventKind::ActionFailed { .. })
                 | (Self::ActionExecuted, TraceEventKind::ActionExecuted { .. })
                 | (
                     Self::OutcomeRecorded,
@@ -736,6 +814,237 @@ fn recording_gateway(
         gateway.register_adapter(action_name.clone(), "stub", adapter.clone());
     }
     (registry, Arc::new(gateway))
+}
+
+#[derive(Clone, Copy)]
+enum InjectedPersistenceFailure {
+    Trace,
+    State,
+}
+
+fn fixture_tenant_registry(tenant_id: &splendor_kernel::TenantId) -> TenantRegistry {
+    let registry = TenantRegistry::new();
+    registry.insert(TenantContext::new(
+        tenant_id.clone(),
+        TenantPolicy {
+            allowed_actions: vec!["no-effect".to_string()],
+            allowed_adapters: vec!["stub".to_string()],
+            allowed_permissions: Vec::new(),
+        },
+        QuotaPolicy::default(),
+    ));
+    registry
+}
+
+fn no_effect_engine(
+    tenant_id: splendor_kernel::TenantId,
+    run_id: RunId,
+    outcome: NoEffectGatewayOutcome,
+    submissions: Arc<AtomicUsize>,
+    state_store: Arc<dyn StateStore>,
+    trace_store: Arc<dyn TraceStore>,
+) -> LoopEngine {
+    LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id,
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            state_store,
+            SnapshotPolicy {
+                interval: Some(1),
+                important_labels: Vec::new(),
+            },
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CandidateListPolicy {
+            actions: vec![external_candidate("no-effect", Some(ActionId::new()))],
+        }),
+        Arc::new(NoEffectGateway {
+            outcome,
+            submissions,
+        }),
+        trace_store,
+        Some(run_id),
+    )
+    .expect("no-effect engine")
+}
+
+fn assert_injected_loop_error(error: &LoopError, failure: InjectedPersistenceFailure) {
+    match failure {
+        InjectedPersistenceFailure::Trace => assert!(matches!(error, LoopError::Trace(_))),
+        InjectedPersistenceFailure::State => assert!(matches!(error, LoopError::StateGraph(_))),
+    }
+}
+
+fn assert_no_effect_suffix_failure_latches(
+    outcome: NoEffectGatewayOutcome,
+    state_store: Arc<dyn StateStore>,
+    trace_store: Arc<dyn TraceStore>,
+    arm_failure: impl FnOnce(),
+    failure: InjectedPersistenceFailure,
+    scheduled: bool,
+) {
+    let tenant_id = splendor_kernel::TenantId::new();
+    let run_id = RunId::new();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let mut engine = no_effect_engine(
+        tenant_id.clone(),
+        run_id.clone(),
+        outcome,
+        Arc::clone(&submissions),
+        state_store,
+        trace_store.clone(),
+    );
+    arm_failure();
+
+    if scheduled {
+        let registry = fixture_tenant_registry(&tenant_id);
+        let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+        scheduler.add_agent(engine);
+        let first_error = scheduler
+            .run_once()
+            .expect_err("injected suffix persistence failure");
+        match &first_error {
+            SchedulerError::Loop(error) => assert_injected_loop_error(error, failure),
+            _ => panic!("injected scheduler failure must come from the loop"),
+        }
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        let records_after_failure = trace_store
+            .read(&run_id.to_string())
+            .expect("trace after scheduler suffix failure");
+        assert!(records_after_failure.iter().any(|record| {
+            matches!(
+                serde_json::from_value::<TraceEvent>(record.payload.clone())
+                    .expect("trace event")
+                    .kind,
+                TraceEventKind::ActionVerificationStarted { .. }
+            )
+        }));
+
+        assert!(matches!(
+            scheduler.run_once(),
+            Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+                if reason == "tick_reconciliation_required"
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            trace_store
+                .read(&run_id.to_string())
+                .expect("trace after parked scheduler"),
+            records_after_failure
+        );
+    } else {
+        let first_error = engine
+            .tick(1)
+            .expect_err("injected suffix persistence failure");
+        assert_injected_loop_error(&first_error, failure);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        let records_after_failure = trace_store
+            .read(&run_id.to_string())
+            .expect("trace after direct suffix failure");
+        assert!(records_after_failure.iter().any(|record| {
+            matches!(
+                serde_json::from_value::<TraceEvent>(record.payload.clone())
+                    .expect("trace event")
+                    .kind,
+                TraceEventKind::ActionVerificationStarted { .. }
+            )
+        }));
+
+        assert!(matches!(
+            engine.tick(2),
+            Err(LoopError::Policy(ref reason)) if reason == "tick_reconciliation_required"
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            trace_store
+                .read(&run_id.to_string())
+                .expect("trace after blocked direct tick"),
+            records_after_failure
+        );
+    }
+}
+
+fn assert_state_only_commit_failure_latches(
+    state_store: Arc<dyn StateStore>,
+    arm_failure: impl FnOnce(),
+    scheduled: bool,
+) {
+    let tenant_id = splendor_kernel::TenantId::new();
+    let run_id = RunId::new();
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let gateway_submissions = Arc::new(AtomicUsize::new(0));
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id.clone(),
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            state_store,
+            SnapshotPolicy {
+                interval: Some(1),
+                important_labels: Vec::new(),
+            },
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CountingNoopPolicy {
+            calls: Arc::clone(&policy_calls),
+        }),
+        Arc::new(NoEffectGateway {
+            outcome: NoEffectGatewayOutcome::Denied,
+            submissions: Arc::clone(&gateway_submissions),
+        }),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("state-only engine");
+    arm_failure();
+
+    if scheduled {
+        let registry = fixture_tenant_registry(&tenant_id);
+        let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+        scheduler.add_agent(engine);
+        assert!(matches!(
+            scheduler.run_once(),
+            Err(SchedulerError::Loop(LoopError::StateGraph(_)))
+        ));
+        assert!(matches!(
+            scheduler.run_once(),
+            Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+                if reason == "tick_reconciliation_required"
+        ));
+    } else {
+        assert!(matches!(engine.tick(1), Err(LoopError::StateGraph(_))));
+        assert!(matches!(
+            engine.tick(2),
+            Err(LoopError::Policy(ref reason)) if reason == "tick_reconciliation_required"
+        ));
+    }
+
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gateway_submissions.load(Ordering::SeqCst), 0);
+    let events = trace_store
+        .read(&run_id.to_string())
+        .expect("state-only failure trace")
+        .into_iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("trace event"))
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        TraceEventKind::ActionVerificationStarted { .. }
+            | TraceEventKind::StateCommitted { .. }
+            | TraceEventKind::LoopTickCompleted { .. }
+    )));
 }
 
 impl StateStore for FailIfWrittenStateStore {
@@ -1435,6 +1744,266 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
     assert!(!serde_json::to_string(&replayed)
         .expect("replay serializes")
         .contains(RECEIPT_CANARY));
+}
+
+#[test]
+fn denied_and_needs_approval_trace_suffix_failures_latch_direct_and_scheduled_ticks() {
+    for outcome in [
+        NoEffectGatewayOutcome::Denied,
+        NoEffectGatewayOutcome::NeedsApproval,
+    ] {
+        let failures = match outcome {
+            NoEffectGatewayOutcome::Denied => vec![
+                TraceFailurePoint::ActionVerificationCompleted,
+                TraceFailurePoint::ActionDenied,
+                TraceFailurePoint::OutcomeRecorded,
+                TraceFailurePoint::StateCommitted,
+                TraceFailurePoint::LoopTickCompleted,
+            ],
+            NoEffectGatewayOutcome::NeedsApproval => vec![
+                TraceFailurePoint::ActionVerificationCompleted,
+                TraceFailurePoint::ApprovalRequested,
+                TraceFailurePoint::ActionNeedsApproval,
+                TraceFailurePoint::OutcomeRecorded,
+                TraceFailurePoint::StateCommitted,
+                TraceFailurePoint::LoopTickCompleted,
+            ],
+        };
+        for failure in failures {
+            for scheduled in [false, true] {
+                let trace_store = Arc::new(ArmableTraceStore::new(failure));
+                let armable = trace_store.clone();
+                assert_no_effect_suffix_failure_latches(
+                    outcome,
+                    Arc::new(InMemoryStateStore::default()),
+                    trace_store,
+                    move || armable.arm(),
+                    InjectedPersistenceFailure::Trace,
+                    scheduled,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn denied_and_needs_approval_state_suffix_failures_latch_direct_and_scheduled_ticks() {
+    for outcome in [
+        NoEffectGatewayOutcome::Denied,
+        NoEffectGatewayOutcome::NeedsApproval,
+    ] {
+        for failure in [
+            StateFailurePoint::PutState,
+            StateFailurePoint::CommitNode,
+            StateFailurePoint::Snapshot,
+        ] {
+            for scheduled in [false, true] {
+                let state_store = Arc::new(ArmableStateStore::new(failure));
+                let armable = state_store.clone();
+                assert_no_effect_suffix_failure_latches(
+                    outcome,
+                    state_store,
+                    Arc::new(InMemoryTraceStore::default()),
+                    move || armable.arm(),
+                    InjectedPersistenceFailure::State,
+                    scheduled,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn state_only_commit_failures_latch_direct_and_scheduled_ticks() {
+    for failure in [
+        StateFailurePoint::PutState,
+        StateFailurePoint::CommitNode,
+        StateFailurePoint::Snapshot,
+    ] {
+        for scheduled in [false, true] {
+            let state_store = Arc::new(ArmableStateStore::new(failure));
+            let armable = state_store.clone();
+            assert_state_only_commit_failure_latches(state_store, move || armable.arm(), scheduled);
+        }
+    }
+}
+
+#[test]
+fn completed_denied_and_needs_approval_ticks_remain_schedulable() {
+    for outcome in [
+        NoEffectGatewayOutcome::Denied,
+        NoEffectGatewayOutcome::NeedsApproval,
+    ] {
+        let tenant_id = splendor_kernel::TenantId::new();
+        let run_id = RunId::new();
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let trace_store = Arc::new(InMemoryTraceStore::default());
+        let engine = no_effect_engine(
+            tenant_id.clone(),
+            run_id.clone(),
+            outcome,
+            Arc::clone(&submissions),
+            Arc::new(InMemoryStateStore::default()),
+            trace_store.clone(),
+        );
+        let registry = fixture_tenant_registry(&tenant_id);
+        let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+        scheduler.add_agent(engine);
+
+        for _ in 0..2 {
+            let step = scheduler.run_once().expect("completed no-effect tick");
+            let status = &step.outcome.action_outcomes[0].status;
+            assert!(match outcome {
+                NoEffectGatewayOutcome::Denied => status == &ActionStatus::Denied,
+                NoEffectGatewayOutcome::NeedsApproval => status == &ActionStatus::NeedsApproval,
+            });
+        }
+        assert_eq!(submissions.load(Ordering::SeqCst), 2);
+        let completed = trace_store
+            .read(&run_id.to_string())
+            .expect("completed no-effect trace")
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    serde_json::from_value::<TraceEvent>(record.payload.clone())
+                        .expect("trace event")
+                        .kind,
+                    TraceEventKind::LoopTickCompleted { .. }
+                )
+            })
+            .count();
+        assert_eq!(completed, 2);
+    }
+}
+
+#[test]
+fn stateful_no_effect_completion_failure_keeps_commit_and_blocks_live_and_restart() {
+    let trace_store = Arc::new(ArmableTraceStore::new(TraceFailurePoint::LoopTickCompleted));
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let tenant_id = splendor_kernel::TenantId::new();
+    let agent_id = splendor_kernel::AgentId::new();
+    let run_id = RunId::new();
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let action_names = vec!["must-not-run".to_string()];
+    let (_, gateway) = recording_gateway(
+        &tenant_id,
+        &action_names,
+        Arc::new(CountingAdapter {
+            calls: Arc::clone(&adapter_calls),
+        }),
+    );
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CountingNoopPolicy {
+            calls: Arc::clone(&policy_calls),
+        }),
+        gateway.clone(),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("fresh state-only engine");
+
+    trace_store.arm();
+    let error = engine
+        .tick(1)
+        .expect_err("LoopTickCompleted append must fail the tick");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(splendor_kernel::TraceError::Compatibility(
+            splendor_evidence::TraceCompatibilityError::Store
+        ))
+    ));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+    let records_after_failure = trace_store
+        .read(&run_id.to_string())
+        .expect("trace after failed completion");
+    let events = records_after_failure
+        .iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).expect("event"))
+        .collect::<Vec<_>>();
+    let state_events = events
+        .iter()
+        .filter(|event| matches!(event.kind, TraceEventKind::StateCommitted { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(state_events.len(), 1);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::LoopTickCompleted { .. })));
+    let state_event = state_events[0];
+    let committed_node_id = state_event
+        .identity
+        .state_node_id
+        .as_ref()
+        .expect("committed state identity");
+    let snapshot_id = match &state_event.kind {
+        TraceEventKind::StateCommitted {
+            snapshot_id: Some(snapshot_id),
+            ..
+        } => snapshot_id,
+        _ => panic!("state commit must include its tick snapshot"),
+    };
+    let committed_snapshot = state_store
+        .load_snapshot(snapshot_id)
+        .expect("durably traced state snapshot");
+    assert_eq!(&committed_snapshot.node_id, committed_node_id);
+    assert_eq!(committed_snapshot.state.bytes, vec![1]);
+
+    let second_error = engine
+        .tick(2)
+        .expect_err("failed completion must block another live tick");
+    assert!(matches!(
+        second_error,
+        LoopError::Policy(ref reason) if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("trace after blocked tick"),
+        records_after_failure
+    );
+    drop(engine);
+
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, AgentRuntimeConfig::default()),
+        StateGraph::new(state_store, snapshot_policy),
+        Box::new(CountingNoopPolicy {
+            calls: Arc::clone(&policy_calls),
+        }),
+        gateway,
+        trace_store.clone(),
+        run_id.clone(),
+    );
+    assert!(matches!(
+        resumed,
+        Err(LoopError::Resume(reason)) if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("trace after rejected restart"),
+        records_after_failure
+    );
 }
 
 fn assert_uncertain_effect_restart_is_blocked(

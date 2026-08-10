@@ -1938,7 +1938,7 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     )
     .with_action_name("move_to_waypoint")
     .with_adapter("device-sim");
-    legacy.action_id = Some(action_id);
+    legacy.action_id = Some(action_id.clone());
     let mut forged_legacy = submit.clone();
     forged_legacy.action_request.approval_evidence = Some(legacy);
     let trace_count_before_raw_grant = traces(app.clone(), &created.run_id).await.records.len();
@@ -1958,6 +1958,69 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     let receipt = local_approval_receipt_config()
         .issue_approval_receipt(&challenge, TraceEventId::new(), OffsetDateTime::now_utc())
         .expect("physical approval receipt");
+    let mut wrong_endpoint = submit.action_request.clone();
+    wrong_endpoint.authority_obligation_receipts = vec![receipt.clone()];
+    let action_starts_before_mismatch = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .filter(|event| {
+            event.identity.action_id.as_ref() == Some(&action_id)
+                && matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+        })
+        .count();
+    assert_eq!(action_starts_before_mismatch, 1);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, "/actions", wrong_endpoint).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "action_id_conflict");
+    let after_wrong_endpoint = inspect(app.clone(), &created.run_id).await;
+    assert_eq!(after_wrong_endpoint.status, RunStatus::WaitingForApproval);
+    assert_eq!(after_wrong_endpoint.adapter_executions, 0);
+
+    let other_node_id = NodeId::new();
+    let (status, _registered): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: device_profile(other_node_id.clone(), challenge.tenant_id.clone()),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut wrong_node = submit.clone();
+    wrong_node.action_request.authority_obligation_receipts = vec![receipt.clone()];
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/devices/{other_node_id}/actions"),
+        wrong_node,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "approval_challenge_retry_mismatch");
+    let after_wrong_node = inspect(app.clone(), &created.run_id).await;
+    assert_eq!(after_wrong_node.status, RunStatus::WaitingForApproval);
+    assert_eq!(after_wrong_node.adapter_executions, 0);
+    assert_eq!(
+        traces(app.clone(), &created.run_id)
+            .await
+            .records
+            .into_iter()
+            .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+            .filter(|event| {
+                event.identity.action_id.as_ref() == Some(&action_id)
+                    && matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+            })
+            .count(),
+        action_starts_before_mismatch,
+        "endpoint/node mismatch must not open another action episode"
+    );
+
     let mut altered = submit.clone();
     altered.action_request.action.params = json!({"zone_ref": "zone_b"});
     altered.action_request.authority_obligation_receipts = vec![receipt.clone()];
@@ -1981,14 +2044,11 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     assert_eq!(inspected.status, RunStatus::Running);
     assert_eq!(inspected.adapter_executions, 1);
 
-    let (status, replayed): (StatusCode, ActionOutcome) =
+    let (status, conflict): (StatusCode, ApiErrorBody) =
         call_json(app.clone(), Method::POST, &uri, submit).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(replayed.status, ActionStatus::Denied);
-    assert!(replayed
-        .verification
-        .reasons
-        .contains(&"authority_obligation_receipt_replayed".to_string()));
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict.code, "action_id_conflict");
+    assert_eq!(conflict.details["retryable"], false);
     assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
 }
 
@@ -2149,7 +2209,8 @@ async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: 
     let (status, error): (StatusCode, ApiErrorBody) =
         call_json(app.clone(), Method::POST, &action_uri, post_close_body).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(error.code, "run_not_effect_capable");
+    assert_eq!(error.code, "action_in_progress");
+    assert_eq!(error.details["retryable"], true);
 
     release.send(()).expect("release blocking adapter");
     let (status, outcome) = action_task.await.expect("action task");

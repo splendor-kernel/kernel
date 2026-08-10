@@ -23,6 +23,10 @@ records. It owns a `RunId`, a monotonic sequence counter, and a trace sink.
   and agent emitters that resolve to the same `RunId`; independently initialized
   runtimes for one run are invalid because their persisted cursors can race or
   become stale.
+- Acquire combined runtime locks only in this order: trace cursor, writer
+  lifecycle, then writer-session operation. Fresh distinct-agent admission and
+  event append use that same order; no path may acquire the lifecycle and then
+  wait for the cursor.
 - Emit `TraceEvent` payloads via the configured sink.
 - Expose the next trace sequence so new persisted runs can emit `RunStarted`
   exactly once before the first tick.
@@ -184,6 +188,34 @@ state commits.
   completed-tick event. `ActionVerificationStarted` is the durable conservative
   boundary: loss of any later post-Gateway trace or state write cannot make the
   run runnable again without reconciliation.
+- In a live tick, latch persistence denial immediately after
+  `ActionVerificationStarted` becomes durable and retain a reconciliation block
+  until the complete action/tick suffix reaches `LoopTickCompleted`. A Gateway
+  denial or `NeedsApproval` result that proves no adapter entry does not clear
+  this latch before the suffix is durable. A completed tick clears the transient
+  latch only when its recorded action outcome does not independently require
+  reconciliation.
+- The Evidence owner validates action episodes even when direct or physical
+  daemon actions have no tick identity. A complete tickless episode keeps one
+  exact action identity and action body from `ActionVerificationStarted` through the matching
+  `ActionVerificationCompleted`, a terminal action event, and the action-scoped
+  strict `OutcomeRecorded`. It also retains immutable tick/direct/physical origin
+  across approval continuation and returns a bounded fresh, complete,
+  pending-approval, or reconciliation-required disposition. It does not replace
+  the latest completed tick snapshot and is never re-executed during resume. An
+  incomplete, malformed, source-substituted, illegally repeated, mismatched,
+  duplicate, or effect-uncertain episode requires reconciliation.
+  Direct/physical origins remain one-shot except for one endpoint-bound approval
+  continuation. A tick origin may reuse the exact ID and action on a strictly
+  later completed tick; an open tick challenge must first close through its one
+  direct continuation. Resume shares this model and selects the latest completed
+  target snapshot after legal repeated tick use.
+  `ActionFailed` must carry explicit `adapter_entered: false` evidence, or
+  `adapter_entered: true` with known effect certainty and
+  `reconciliation_required: false`; missing or malformed effect facts fail
+  closed.
+  Tickless actions never fabricate state; a history with no completed snapshot
+  remains snapshot-unavailable.
 - Restore only a snapshot for the latest completed tick whose state node,
   snapshot metadata, and trace linkage bind the requested run, tenant, and agent.
   A latest completed tick without its own snapshot fails with
@@ -195,9 +227,39 @@ state commits.
   insertion, or a record/event envelope identity mismatch returns a structured
   integrity error before policy, scheduler, state restoration, or adapter entry.
 - Retain the highest exact-identity tick observed in all validated events, not
-  only the latest completed tick. A partial pre-effect tick may resume from the
-  latest completed snapshot, but neither direct execution nor a new scheduler may
-  reuse that partial tick ID.
+  only the latest completed tick. A strictly later tick may supersede an earlier
+  incomplete attempt only when that attempt has no action order or
+  `ActionVerificationStarted`, outcome, state commit, pending episode, or effect
+  evidence. The superseded identity remains in the monotonic tick floor and
+  cannot be reused. This permits an ordinary live-scheduler requeue before action
+  start; an unsuperseded open attempt, or an attempt that crossed any of those
+  boundaries, remains reconciliation-required.
+- Evidence requires every completed target tick—including a tick with zero
+  actions—to contain exactly one correctly ordered `OutcomeRecorded`, one later
+  `StateCommitted`, and one later `LoopTickCompleted`. Missing, duplicate,
+  orphaned, or misordered lifecycle events fail closed even when no adapter or
+  effect boundary was entered. A safely superseded pre-action attempt is not a
+  completed tick and therefore has no completion suffix. Missing or malformed
+  effect-certainty facts fail closed rather than being inferred as no effect.
+- If legacy state-node preparation succeeds but the required `StateCommitted`
+  append fails, restore the process-visible prior graph head/tick and retain the
+  prior engine state and agent head. The live engine latches reconciliation before
+  returning the trace error, so a later tick cannot consume the untraced state.
+  Because the compatibility `StateStore` and `TraceStore` remain separate, an
+  immutable detached node/data/snapshot may remain in the state store; it is not
+  current or returned as a successful commit. This is bounded local rollback and
+  fail-stop behavior, not a cross-store atomicity or automatic-reconciliation
+  claim.
+- If `StateGraph::commit` itself fails at any store stage, including for a
+  state-only tick with no adapter entry, latch persistence denial before returning
+  the state error. The next direct tick is rejected and the scheduler parks the
+  engine; no policy re-invocation through that live engine or scheduler may turn
+  a partial state write into an implicit retry.
+- If `StateCommitted` succeeds but the required `LoopTickCompleted` append fails,
+  retain that durably traced state and live head, latch reconciliation, and return
+  the completion append error. Do not roll the committed state back, and do not
+  admit another live tick; restart treats the incomplete stateful tick as
+  reconciliation-required.
 
 `with_trace_store_and_work_order` and `resume_from_trace_store_with_work_order`
 create their own runtime and remain suitable only when that loop is the sole

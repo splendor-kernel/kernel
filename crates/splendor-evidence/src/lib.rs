@@ -8,9 +8,10 @@
 mod trace_compat;
 
 pub use trace_compat::{
-    acquire_current_trace_writer, append_stable_trace_event, inspect_trace, open_trace_reader,
-    project_trace, resume_trace, InspectTraceResult, ResumeTraceResult, TraceCompatibilityError,
-    TraceProjection,
+    acquire_current_trace_writer, append_stable_trace_event, inspect_durable_action_history,
+    inspect_trace, open_trace_reader, project_trace, project_trace_range, resume_trace,
+    DurableActionHistoryDisposition, DurableActionHistorySource, InspectTraceResult,
+    ResumeTraceResult, TraceCompatibilityError, TraceProjection,
 };
 
 #[cfg(test)]

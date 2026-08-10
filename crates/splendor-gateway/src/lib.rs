@@ -41,10 +41,11 @@
 mod credential_ingress;
 
 pub use credential_ingress::{
-    guard_action, guard_action_request, guard_action_routing, guard_action_routing_and_receipts,
-    guard_credential_capable_strings, guard_credential_capable_value, guard_persisted_percept,
-    guard_persisted_state, raw_credential_denied_action, raw_credential_denied_outcome,
-    RawCredentialInputDenied, CREDENTIAL_INGRESS_MAX_DEPTH, CREDENTIAL_INGRESS_MAX_NODES,
+    guard_action, guard_action_request, guard_action_request_with_trusted_profile,
+    guard_action_routing, guard_action_routing_and_receipts, guard_credential_capable_strings,
+    guard_credential_capable_value, guard_persisted_percept, guard_persisted_state,
+    raw_credential_denied_action, raw_credential_denied_outcome, RawCredentialInputDenied,
+    CREDENTIAL_INGRESS_MAX_DEPTH, CREDENTIAL_INGRESS_MAX_NODES,
     CREDENTIAL_INGRESS_MAX_STRING_BYTES, CREDENTIAL_INGRESS_MAX_TOTAL_BYTES,
     RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
@@ -1592,7 +1593,25 @@ impl VerifiedActionGateway {
 
 impl ActionGateway for VerifiedActionGateway {
     fn submit(&self, action: ActionRequest) -> Result<ActionOutcome, GatewayError> {
-        if guard_action_request(&action).is_err() {
+        // Resolve immutable registry metadata before inspecting the untrusted
+        // payload. Request routing alone must never select opaque-byte handling.
+        let registration = self.adapters.get(&action.action.name);
+        let trusted_ingress_profile = self
+            .trusted_action_profiles
+            .as_ref()
+            .and_then(|profiles| profiles.get(&action.action.name))
+            .filter(|profile| {
+                registration.is_some_and(|entry| entry.adapter_id == profile.adapter)
+            });
+        let credential_guard = match (trusted_ingress_profile, registration) {
+            (Some(profile), Some(registration)) => guard_action_request_with_trusted_profile(
+                &action,
+                profile,
+                &registration.adapter_id,
+            ),
+            _ => guard_action_request(&action),
+        };
+        if credential_guard.is_err() {
             return Ok(raw_credential_denied_outcome(action.action_id));
         }
         if let Err(error) = action.validate_identity() {
@@ -1621,7 +1640,6 @@ impl ActionGateway for VerifiedActionGateway {
             return Ok(denied_outcome(action.action_id, verification));
         }
 
-        let registration = self.adapters.get(&action.action.name);
         let authority_adapter = action
             .adapter
             .as_deref()

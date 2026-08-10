@@ -478,8 +478,10 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ActionAdmissionConflict'
         '503':
-          $ref: '#/components/responses/Unavailable'
+          $ref: '#/components/responses/ActionHistoryUnavailable'
   /health:
     get:
       summary: Read daemon health.
@@ -1020,6 +1022,8 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/ActionAdmissionConflict' }
+        '503': { $ref: '#/components/responses/ActionHistoryUnavailable' }
   /operator/interventions:
     post:
       summary: Request local operator intervention for an ambiguous physical action.
@@ -1173,6 +1177,36 @@ components:
             $ref: '#/components/schemas/ApiError'
     Conflict:
       description: Run state, duplicate ID, or trace ordering conflict.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    ActionAdmissionConflict:
+      description: >-
+        Direct/physical action admission conflict. A completed or otherwise
+        non-advancing action ID returns action_id_conflict with retryable=false
+        and never returns its stored outcome; live per-run contention returns
+        action_in_progress with retryable=true; incomplete durable history
+        returns tick_reconciliation_required. Tail movement through three fresh
+        bounded reads returns retryable action_history_changed, while pre-start
+        Store unavailability returns retryable action_history_unavailable; neither
+        closes admission. A pending approval permits exactly one endpoint-bound
+        continuation: tick/direct origins use /actions and physical origins use
+        the original node path. Direct/physical origins are otherwise one-shot.
+        Tick origins may reuse an exact ID/action only on strictly later completed
+        ticks after any pending continuation closes. Source mismatch conflicts before a new action
+        episode or receipt claim; cross-node mismatch fails exact challenge binding
+        before receipt claim.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    ActionHistoryUnavailable:
+      description: >-
+        Durable action history could not be read before a direct or physical
+        action started. The daemon returns action_history_unavailable with
+        details.retryable=true, releases the temporary admission reservation,
+        and does not enter the Gateway or adapter.
       content:
         application/json:
           schema:
@@ -3733,7 +3767,7 @@ components:
         authority_obligation_receipts:
           type: array
           maxItems: 64
-          description: Raw non-authorizing receipts validated against the exact regenerated live C02 decision. A waiting run accepts only the action ID, payload, adapter, quota, preconditions, and requested_at bound by its pending challenge.
+          description: Raw non-authorizing receipts validated against the exact regenerated live C02 decision. A waiting run accepts only the action ID, payload, adapter, quota, preconditions, requested_at, endpoint class, and physical node when applicable that are bound by its pending challenge. Tick/direct challenges continue through /actions; physical challenges continue through the original node path.
           items:
             $ref: '#/components/schemas/AuthorityObligationReceipt'
     HealthResponse:

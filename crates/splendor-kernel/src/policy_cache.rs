@@ -6,8 +6,8 @@
 //! alternate adapter execution path.
 
 use splendor_gateway::{
-    guard_action_request, raw_credential_denied_outcome, ActionGateway, ActionOutcome,
-    ActionRequest, ActionStatus, GatewayError,
+    guard_action_request, guard_action_request_with_trusted_profile, raw_credential_denied_outcome,
+    ActionGateway, ActionOutcome, ActionRequest, ActionStatus, GatewayError, TrustedActionProfile,
 };
 use splendor_types::{
     AgentId, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleTraceContext, RevocationStatus,
@@ -960,18 +960,43 @@ impl PolicyDistributionStatus for PolicyCache {
 pub struct PolicyDistributionGateway {
     inner: Arc<dyn ActionGateway>,
     status: Arc<dyn PolicyDistributionStatus>,
+    trusted_action_profiles: Vec<TrustedActionProfile>,
 }
 
 impl PolicyDistributionGateway {
     /// Wraps an existing action gateway with policy distribution enforcement.
     pub fn new(inner: Arc<dyn ActionGateway>, status: Arc<dyn PolicyDistributionStatus>) -> Self {
-        Self { inner, status }
+        Self {
+            inner,
+            status,
+            trusted_action_profiles: Vec::new(),
+        }
+    }
+
+    /// Installs owner-validated action profiles for pre-policy content screening.
+    ///
+    /// The composition root must have validated these same profiles and exact
+    /// adapter registrations on the wrapped `VerifiedActionGateway`. Requester
+    /// metadata is never a valid source for this list. An absent profile keeps
+    /// the strict credential-text scan.
+    pub fn set_owner_trusted_action_profiles(&mut self, profiles: Vec<TrustedActionProfile>) {
+        self.trusted_action_profiles = profiles;
     }
 }
 
 impl ActionGateway for PolicyDistributionGateway {
     fn submit(&self, request: ActionRequest) -> Result<ActionOutcome, GatewayError> {
-        if guard_action_request(&request).is_err() {
+        let trusted_profile = self
+            .trusted_action_profiles
+            .iter()
+            .find(|profile| profile.action_name == request.action.name);
+        let credential_guard = match trusted_profile {
+            Some(profile) => {
+                guard_action_request_with_trusted_profile(&request, profile, &profile.adapter)
+            }
+            None => guard_action_request(&request),
+        };
+        if credential_guard.is_err() {
             return Ok(raw_credential_denied_outcome(request.action_id));
         }
         let verification = self

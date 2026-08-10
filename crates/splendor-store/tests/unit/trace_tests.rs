@@ -2,8 +2,9 @@ use super::*;
 use crate::{RuntimeTraceScope, MAX_RUNTIME_TRACE_PAGE_RECORDS};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier, TryLockError};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::{Duration as StdDuration, Instant};
 use tempfile::NamedTempFile;
 
 fn block_on<F: Future>(mut future: F) -> F::Output {
@@ -43,6 +44,59 @@ fn runtime_writer_request_with_limits(
     limits: RuntimeTraceLimits,
 ) -> RuntimeTraceWriterRequest {
     RuntimeTraceWriterRequest::current(RuntimeTraceScope::new(run_id, "tenant", "agent"), limits)
+}
+
+fn anchored_growth_fixture(
+    store: &dyn TraceStore,
+    run_id: &str,
+) -> (RuntimeTraceReaderHandle, RuntimeTraceTail, RuntimeTraceTail) {
+    let writer = store
+        .acquire_runtime_writer(runtime_writer_request(run_id, "tenant", "agent"))
+        .expect("runtime writer");
+    let first = writer
+        .append(
+            &writer.tail().expect("initial tail"),
+            serde_json::json!({"index": 0}),
+        )
+        .expect("first append")
+        .into_tail();
+    writer
+        .append(&first, serde_json::json!({"index": 1}))
+        .expect("second append");
+    writer.close().expect("close runtime writer");
+    let reader = store
+        .open_runtime_reader(run_id, RuntimeTraceLimits::default())
+        .expect("runtime reader");
+    let actual = reader.tail().expect("actual tail");
+    (reader, first, actual)
+}
+
+fn rewrite_records_as_valid_chain(records: &mut [TraceRecord], replacement: serde_json::Value) {
+    records[0].payload = replacement;
+    let mut stable_tail = None;
+    let mut envelope_tail = None;
+    for record in records {
+        record.prev_event_hash = stable_tail.clone();
+        record.event_hash = compute_event_hash(stable_tail.as_ref(), &record.payload)
+            .expect("rewritten event hash");
+        stable_tail = Some(record.event_hash.clone());
+        envelope_tail = Some(
+            compute_trace_envelope_hash(envelope_tail.as_ref(), record)
+                .expect("rewritten envelope hash"),
+        );
+    }
+}
+
+fn tail_with_incompatible_fence(tail: &RuntimeTraceTail) -> RuntimeTraceTail {
+    RuntimeTraceTail::current(
+        tail.store_identity().clone(),
+        tail.next_sequence(),
+        tail.stable_tail_hash().cloned(),
+        tail.envelope_tail_hash().cloned(),
+        tail.anchor_revision(),
+        RuntimeTraceFence::from_opaque_material("incompatible-fence"),
+    )
+    .expect("incompatible fenced tail")
 }
 
 fn assert_runtime_writer_limits(store: &dyn TraceStore, prefix: &str) {
@@ -405,6 +459,53 @@ fn sqlite_trace_store_preserves_generic_sequence_payloads() {
     assert_generic_sequence_payloads_round_trip(&store, "run-1");
 }
 
+#[cfg(unix)]
+#[test]
+fn sqlite_file_uri_semantics_are_rejected() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let uri_path = PathBuf::from(format!(
+        "file:splendor-trace-uri-{}.sqlite3?mode=memory",
+        Uuid::new_v4()
+    ));
+
+    let writable = SqliteTraceStore::open_with_lock_root(&uri_path, directory.path().join("locks"));
+    let read_only = SqliteTraceStore::open_read_only(&uri_path);
+    let _ = std::fs::remove_file(&uri_path);
+
+    assert!(matches!(
+        writable,
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidPath(_)))
+    ));
+    assert!(matches!(
+        read_only,
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidPath(_)))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_file_backed_store_accepts_symlinked_parent_spelling() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("trace directory");
+    let real_parent = directory.path().join("real-parent");
+    let parent_alias = directory.path().join("parent-alias");
+    std::fs::create_dir(&real_parent).expect("real database parent");
+    symlink(&real_parent, &parent_alias).expect("database parent alias");
+    let path = parent_alias.join("trace.sqlite3");
+
+    let writable = SqliteTraceStore::open(&path).expect("writable trace store through alias");
+    TraceStore::append(&writable, "run", serde_json::json!({"event": 1}))
+        .expect("append through alias");
+    drop(writable);
+
+    let read_only = SqliteTraceStore::open_read_only(&path).expect("read-only store through alias");
+    assert_eq!(
+        TraceStore::read(&read_only, "run").expect("read through alias")[0].payload,
+        serde_json::json!({"event": 1})
+    );
+}
+
 #[test]
 fn sqlite_conditional_append_races_return_one_success_and_one_typed_conflict() {
     const RACE_COUNT: usize = 16;
@@ -553,6 +654,145 @@ fn runtime_writer_append_and_close_are_linearized_and_post_close_append_is_denie
         SqliteTraceStore::open(directory.path().join("trace.sqlite3")).expect("sqlite trace store"),
     );
     assert_runtime_append_close_linearization(sqlite, "sqlite");
+}
+
+#[test]
+fn in_memory_tail_confirmation_holds_anchor_before_records_without_deadlock() {
+    let store = Arc::new(InMemoryTraceStore::default());
+    let writer = store
+        .acquire_runtime_writer(runtime_writer_request("linearized-run", "tenant", "agent"))
+        .expect("runtime writer");
+    let expected = writer
+        .append(
+            &writer.tail().expect("initial tail"),
+            serde_json::json!({"index": 0}),
+        )
+        .expect("initial append")
+        .into_tail();
+    let reader = store
+        .open_runtime_reader("linearized-run", RuntimeTraceLimits::default())
+        .expect("runtime reader");
+
+    let records_guard = store.inner.lock().expect("hold records lock");
+    let (confirmation_tx, confirmation_rx) = mpsc::channel();
+    let confirmation_expected = expected.clone();
+    let confirmation = std::thread::spawn(move || {
+        confirmation_tx
+            .send(reader.confirm_tail(&confirmation_expected))
+            .expect("send confirmation result");
+    });
+
+    let deadline = Instant::now() + StdDuration::from_secs(2);
+    loop {
+        match store.runtime_anchors.try_lock() {
+            Err(TryLockError::WouldBlock) => break,
+            Err(TryLockError::Poisoned(_)) => panic!("runtime anchor mutex poisoned"),
+            Ok(guard) => drop(guard),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "confirmation did not retain the anchor while waiting for records"
+        );
+        std::thread::yield_now();
+    }
+
+    let append_writer = Arc::clone(&writer);
+    let append_expected = expected.clone();
+    let (append_tx, append_rx) = mpsc::channel();
+    let append = std::thread::spawn(move || {
+        append_tx
+            .send(append_writer.append(&append_expected, serde_json::json!({"index": 1})))
+            .expect("send append result");
+    });
+    drop(records_guard);
+
+    confirmation_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("confirmation completed")
+        .expect("confirmation linearized before append");
+    append_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("append completed")
+        .expect("append completed after confirmation");
+    confirmation.join().expect("confirmation thread");
+    append.join().expect("append thread");
+    writer.close().expect("close runtime writer");
+}
+
+fn rewrite_in_memory_prefix_as_valid_history(store: &InMemoryTraceStore, run_id: &str) {
+    let mut anchors = store.runtime_anchors.lock().expect("runtime anchors");
+    let mut records = store.inner.lock().expect("runtime records");
+    let run_records = records.get_mut(run_id).expect("run records");
+    rewrite_records_as_valid_chain(run_records, serde_json::json!({"rewritten": true}));
+    let anchor = anchors.get_mut(run_id).expect("runtime anchor");
+    let current = anchor.tail.clone();
+    let envelope_tail = run_records
+        .iter()
+        .try_fold(None, |previous, record| {
+            compute_trace_envelope_hash(previous.as_ref(), record).map(Some)
+        })
+        .expect("rewritten envelope tail");
+    anchor.tail = RuntimeTraceTail::current(
+        current.store_identity().clone(),
+        u64::try_from(run_records.len()).expect("record count"),
+        run_records.last().map(|record| record.event_hash.clone()),
+        envelope_tail,
+        current.anchor_revision(),
+        current.fence().cloned().expect("runtime fence"),
+    )
+    .expect("rewritten runtime anchor");
+}
+
+#[test]
+fn in_memory_tail_confirmation_distinguishes_growth_from_integrity_failure() {
+    let store = InMemoryTraceStore::default();
+    let (reader, expected, actual) = anchored_growth_fixture(&store, "valid-growth");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::FenceRejected)
+    );
+    assert_eq!(
+        reader.confirm_tail(&tail_with_incompatible_fence(&expected)),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+    reader.confirm_tail(&actual).expect("equal actual tail");
+
+    let store = InMemoryTraceStore::default();
+    let (reader, expected, _) = anchored_growth_fixture(&store, "rewritten-prefix");
+    rewrite_in_memory_prefix_as_valid_history(&store, "rewritten-prefix");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+
+    let store = InMemoryTraceStore::default();
+    let (reader, expected, _) = anchored_growth_fixture(&store, "corrupt-extension");
+    let anchors = store.runtime_anchors.lock().expect("runtime anchors");
+    let mut records = store.inner.lock().expect("runtime records");
+    records.get_mut("corrupt-extension").expect("run records")[1].payload =
+        serde_json::json!({"corrupt": true});
+    drop(records);
+    drop(anchors);
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+
+    let store = InMemoryTraceStore::default();
+    let (reader, expected, _) = anchored_growth_fixture(&store, "truncated");
+    let anchors = store.runtime_anchors.lock().expect("runtime anchors");
+    let _ = store
+        .inner
+        .lock()
+        .expect("runtime records")
+        .get_mut("truncated")
+        .expect("run records")
+        .pop();
+    drop(anchors);
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
 }
 
 #[test]
@@ -705,6 +945,278 @@ fn sqlite_anchored_fixture(
     (store, reader, tail)
 }
 
+fn rewrite_sqlite_prefix_as_valid_history(path: &Path, store: &SqliteTraceStore, run_id: &str) {
+    let mut records = TraceStore::read(store, run_id).expect("runtime records");
+    rewrite_records_as_valid_chain(&mut records, serde_json::json!({"rewritten": true}));
+    let envelope_tail = records
+        .iter()
+        .try_fold(None, |previous, record| {
+            compute_trace_envelope_hash(previous.as_ref(), record).map(Some)
+        })
+        .expect("rewritten envelope tail")
+        .expect("non-empty envelope tail");
+    let stable_tail = records
+        .last()
+        .expect("non-empty runtime records")
+        .event_hash
+        .clone();
+
+    let mut connection = Connection::open(path).expect("tamper connection");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("rewrite transaction");
+    transaction
+        .execute_batch("DROP TRIGGER trace_anchored_update_guard")
+        .expect("disable fixture update guard");
+    for record in &records {
+        let payload = serde_json::to_vec(&record.payload).expect("rewritten payload bytes");
+        let (previous_algorithm, previous_value) = record
+            .prev_event_hash
+            .as_ref()
+            .map(|hash| (Some(hash.algorithm.as_str()), Some(hash.value.as_str())))
+            .unwrap_or((None, None));
+        transaction
+            .execute(
+                "UPDATE trace_events SET payload = ?1, event_hash_algo = ?2, event_hash_value = ?3, prev_hash_algo = ?4, prev_hash_value = ?5 WHERE run_id = ?6 AND sequence = ?7",
+                params![
+                    payload,
+                    record.event_hash.algorithm.as_str(),
+                    record.event_hash.value.as_str(),
+                    previous_algorithm,
+                    previous_value,
+                    run_id,
+                    encode_port_sequence(record.sequence).expect("encoded sequence"),
+                ],
+            )
+            .expect("rewrite runtime row");
+    }
+    transaction
+        .execute(
+            "UPDATE trace_run_anchors SET stable_tail_hash_algo = ?1, stable_tail_hash_value = ?2, envelope_tail_hash_algo = ?3, envelope_tail_hash_value = ?4, anchor_revision = anchor_revision + 1 WHERE run_id = ?5",
+            params![
+                stable_tail.algorithm.as_str(),
+                stable_tail.value,
+                envelope_tail.algorithm.as_str(),
+                envelope_tail.value,
+                run_id,
+            ],
+        )
+        .expect("rewrite runtime anchor");
+    transaction.commit().expect("commit rewritten history");
+}
+
+#[test]
+fn sqlite_tail_confirmation_uses_one_snapshot_across_concurrent_append() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("snapshot.sqlite3");
+    let writer_store = SqliteTraceStore::open(&path).expect("writer trace store");
+    let journal_mode = writer_store
+        .inner
+        .with_legacy_connection(|connection| {
+            connection
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                .map_err(TraceStoreError::from)
+        })
+        .expect("enable WAL fixture");
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    let reader_store = SqliteTraceStore::open(&path).expect("independent reader trace store");
+    let run_id = format!("snapshot-{}", Uuid::new_v4());
+    let writer = writer_store
+        .acquire_runtime_writer(runtime_writer_request(&run_id, "tenant", "agent"))
+        .expect("runtime writer");
+    let expected = writer
+        .append(
+            &writer.tail().expect("initial tail"),
+            serde_json::json!({"index": 0}),
+        )
+        .expect("initial append")
+        .into_tail();
+    let reader = reader_store
+        .open_runtime_reader(&run_id, RuntimeTraceLimits::default())
+        .expect("runtime reader");
+
+    let (snapshot_tx, snapshot_rx) = mpsc::channel();
+    let (append_done_tx, append_done_rx) = mpsc::channel();
+    let _hook = install_sqlite_confirm_snapshot_hook(
+        reader_store.inner.store_id.clone(),
+        run_id.clone(),
+        move || {
+            snapshot_tx.send(()).expect("signal captured snapshot");
+            append_done_rx
+                .recv_timeout(StdDuration::from_secs(2))
+                .expect("append committed while snapshot remained open");
+        },
+    );
+    let confirmation_expected = expected.clone();
+    let (confirmation_tx, confirmation_rx) = mpsc::channel();
+    let confirmation = std::thread::spawn(move || {
+        confirmation_tx
+            .send(reader.confirm_tail(&confirmation_expected))
+            .expect("send confirmation result");
+    });
+    snapshot_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("confirmation captured actual tail");
+
+    let append_writer = Arc::clone(&writer);
+    let append_expected = expected.clone();
+    let (append_result_tx, append_result_rx) = mpsc::channel();
+    let append = std::thread::spawn(move || {
+        append_result_tx
+            .send(append_writer.append(&append_expected, serde_json::json!({"index": 1})))
+            .expect("send append result");
+    });
+    let appended = append_result_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("concurrent append completed")
+        .expect("concurrent append succeeded");
+    append_done_tx.send(()).expect("release snapshot hook");
+    confirmation_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("snapshot confirmation completed")
+        .expect("old snapshot confirmed atomically");
+    append.join().expect("append thread");
+    confirmation.join().expect("confirmation thread");
+
+    let reader = reader_store
+        .open_runtime_reader(&run_id, RuntimeTraceLimits::default())
+        .expect("fresh runtime reader");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::FenceRejected)
+    );
+    reader
+        .confirm_tail(appended.tail())
+        .expect("fresh actual tail confirms after rollback/release");
+    writer.close().expect("close runtime writer");
+}
+
+#[test]
+fn sqlite_tail_confirmation_distinguishes_growth_from_integrity_failure() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("valid-growth.sqlite3");
+    let store = SqliteTraceStore::open(&path).expect("trace store");
+    let (reader, expected, actual) = anchored_growth_fixture(&store, "valid-growth");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::FenceRejected)
+    );
+    assert_eq!(
+        reader.confirm_tail(&tail_with_incompatible_fence(&expected)),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+    reader.confirm_tail(&actual).expect("equal actual tail");
+
+    let path = directory.path().join("rewritten-prefix.sqlite3");
+    let store = SqliteTraceStore::open(&path).expect("trace store");
+    let (reader, expected, _) = anchored_growth_fixture(&store, "rewritten-prefix");
+    rewrite_sqlite_prefix_as_valid_history(&path, &store, "rewritten-prefix");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure),
+        "failed confirmation rolled back its read transaction"
+    );
+
+    let path = directory.path().join("corrupt-extension.sqlite3");
+    let store = SqliteTraceStore::open(&path).expect("trace store");
+    let (reader, expected, _) = anchored_growth_fixture(&store, "corrupt-extension");
+    let connection = Connection::open(&path).expect("tamper connection");
+    connection
+        .execute_batch("DROP TRIGGER trace_anchored_update_guard")
+        .expect("disable fixture update guard");
+    connection
+        .execute(
+            "UPDATE trace_events SET payload = ?1 WHERE run_id = ?2 AND sequence = 1",
+            params![
+                serde_json::to_vec(&serde_json::json!({"corrupt": true}))
+                    .expect("corrupt payload bytes"),
+                "corrupt-extension",
+            ],
+        )
+        .expect("corrupt extension");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+
+    let path = directory.path().join("truncated.sqlite3");
+    let store = SqliteTraceStore::open(&path).expect("trace store");
+    let (reader, expected, _) = anchored_growth_fixture(&store, "truncated");
+    let connection = Connection::open(&path).expect("tamper connection");
+    connection
+        .execute_batch("DROP TRIGGER trace_anchored_delete_guard")
+        .expect("disable fixture delete guard");
+    connection
+        .execute(
+            "DELETE FROM trace_events WHERE run_id = ?1 AND sequence = 1",
+            params!["truncated"],
+        )
+        .expect("truncate extension");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
+}
+
+#[test]
+fn tail_confirmation_enforces_limits_over_the_current_full_history() {
+    let memory = InMemoryTraceStore::default();
+    let (_, expected, _) = anchored_growth_fixture(&memory, "memory-limited");
+    let limits = RuntimeTraceLimits::checked(1, 1, 1_024, 1_024).expect("limited reader");
+    let reader = memory
+        .open_runtime_reader("memory-limited", limits)
+        .expect("memory reader");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::LimitExceeded)
+    );
+
+    let directory = tempfile::tempdir().expect("trace directory");
+    let sqlite =
+        SqliteTraceStore::open(directory.path().join("limited.sqlite3")).expect("trace store");
+    let (_, expected, _) = anchored_growth_fixture(&sqlite, "sqlite-limited");
+    let reader = sqlite
+        .open_runtime_reader("sqlite-limited", limits)
+        .expect("SQLite reader");
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::LimitExceeded)
+    );
+}
+
+fn assert_revision_only_tail_advance(store: &dyn TraceStore, run_id: &str) {
+    let writer = store
+        .acquire_runtime_writer(runtime_writer_request(run_id, "tenant", "agent"))
+        .expect("runtime writer");
+    let expected = writer.tail().expect("acquired tail");
+    writer.close().expect("close runtime writer");
+    let reader = store
+        .open_runtime_reader(run_id, RuntimeTraceLimits::default())
+        .expect("runtime reader");
+    let actual = reader.tail().expect("closed tail");
+    assert_eq!(actual.next_sequence(), expected.next_sequence());
+    assert!(actual.anchor_revision() > expected.anchor_revision());
+    assert_eq!(
+        reader.confirm_tail(&expected),
+        Err(RuntimeTracePortError::FenceRejected)
+    );
+    reader.confirm_tail(&actual).expect("equal closed tail");
+}
+
+#[test]
+fn tail_confirmation_accepts_monotonic_revision_only_movement_as_transient() {
+    assert_revision_only_tail_advance(&InMemoryTraceStore::default(), "memory-revision");
+
+    let directory = tempfile::tempdir().expect("trace directory");
+    let sqlite =
+        SqliteTraceStore::open(directory.path().join("revision.sqlite3")).expect("trace store");
+    assert_revision_only_tail_advance(&sqlite, "sqlite-revision");
+}
+
 #[test]
 fn sqlite_anchor_and_history_identity_rows_are_immutable_to_legacy_sql() {
     let directory = tempfile::tempdir().expect("trace directory");
@@ -752,10 +1264,10 @@ fn sqlite_anchor_detects_middle_tail_and_complete_history_truncation() {
             )
             .expect("fixture truncation");
 
-        assert!(matches!(
+        assert_eq!(
             reader.confirm_tail(&tail),
-            Err(RuntimeTracePortError::IntegrityFailure | RuntimeTracePortError::FenceRejected)
-        ));
+            Err(RuntimeTracePortError::IntegrityFailure)
+        );
     }
 }
 
@@ -782,10 +1294,10 @@ fn sqlite_stale_high_water_hash_and_fence_metadata_fail_closed() {
             .expect("tamper connection")
             .execute_batch(statement)
             .expect("tamper anchor fixture");
-        assert!(matches!(
+        assert_eq!(
             reader.confirm_tail(&tail),
-            Err(RuntimeTracePortError::IntegrityFailure | RuntimeTracePortError::FenceRejected)
-        ));
+            Err(RuntimeTracePortError::IntegrityFailure)
+        );
         assert!(matches!(
             store.acquire_runtime_writer(runtime_writer_request("run", "tenant", "agent")),
             Err(RuntimeTracePortError::IntegrityFailure | RuntimeTracePortError::Conflict)
@@ -827,14 +1339,150 @@ fn sqlite_stale_high_water_hash_and_fence_metadata_fail_closed() {
             "UPDATE trace_run_anchors SET fence_digest = 'blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', anchor_revision = anchor_revision + 1 WHERE run_id = 'run'",
         )
         .expect("corrupt fence fixture");
-    assert!(matches!(
+    assert_eq!(
         writer.confirm_tail(&tail),
-        Err(RuntimeTracePortError::IntegrityFailure | RuntimeTracePortError::FenceRejected)
-    ));
+        Err(RuntimeTracePortError::IntegrityFailure)
+    );
     assert!(matches!(
         writer.append(&tail, serde_json::json!({"event": 2})),
         Err(RuntimeTracePortError::IntegrityFailure | RuntimeTracePortError::FenceRejected)
     ));
+}
+
+#[cfg(unix)]
+fn initialize_distinct_sqlite_stores(
+    path_a: &std::path::Path,
+    path_b: &std::path::Path,
+) -> (RuntimeTraceStoreIdentity, RuntimeTraceStoreIdentity) {
+    let store_a = SqliteTraceStore::open(path_a).expect("initialize store A");
+    TraceStore::append(&store_a, "run-a", serde_json::json!({"store": "A"}))
+        .expect("append store A row");
+    let identity_a = store_a.runtime_store_identity().expect("store A identity");
+    drop(store_a);
+
+    let store_b = SqliteTraceStore::open(path_b).expect("initialize store B");
+    TraceStore::append(&store_b, "run-b", serde_json::json!({"store": "B"}))
+        .expect("append store B row");
+    let identity_b = store_b.runtime_store_identity().expect("store B identity");
+    drop(store_b);
+
+    assert_ne!(identity_a, identity_b);
+    (identity_a, identity_b)
+}
+
+#[cfg(unix)]
+fn install_a_to_b_to_a_open_hook(
+    path_a: &std::path::Path,
+    path_b: &std::path::Path,
+    parked_a: &std::path::Path,
+) -> (
+    SqliteOpenStageHookGuard,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_phase = Arc::clone(&phase);
+    let hook_path = canonical_database_path(path_a).expect("canonical hook path");
+    let path_a = path_a.to_path_buf();
+    let path_b = path_b.to_path_buf();
+    let parked_a = parked_a.to_path_buf();
+    let hook = install_sqlite_open_stage_hook(hook_path, move |stage| {
+        let expected_phase = match stage {
+            SqliteOpenStage::BeforeSqliteOpen => 0,
+            SqliteOpenStage::AfterSqliteOpen => 1,
+        };
+        if observed_phase.load(std::sync::atomic::Ordering::SeqCst) != expected_phase {
+            return Err(std::io::Error::other("unexpected SQLite open-stage order"));
+        }
+        match stage {
+            SqliteOpenStage::BeforeSqliteOpen => {
+                std::fs::rename(&path_a, &parked_a)?;
+                std::fs::rename(&path_b, &path_a)?;
+            }
+            SqliteOpenStage::AfterSqliteOpen => {
+                std::fs::rename(&path_a, &path_b)?;
+                std::fs::rename(&parked_a, &path_a)?;
+            }
+        }
+        observed_phase.store(expected_phase + 1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    (hook, phase)
+}
+
+#[cfg(unix)]
+fn assert_distinct_sqlite_stores_unchanged(
+    path_a: &std::path::Path,
+    path_b: &std::path::Path,
+    identity_a: &RuntimeTraceStoreIdentity,
+    identity_b: &RuntimeTraceStoreIdentity,
+) {
+    let store_a = SqliteTraceStore::open_read_only(path_a).expect("reopen store A");
+    assert_eq!(
+        &store_a.runtime_store_identity().expect("store A identity"),
+        identity_a
+    );
+    assert_eq!(
+        TraceStore::read(&store_a, "run-a").expect("store A row")[0].payload,
+        serde_json::json!({"store": "A"})
+    );
+    assert!(matches!(
+        TraceStore::read(&store_a, "run-b"),
+        Err(TraceStoreError::RunNotFound)
+    ));
+
+    let store_b = SqliteTraceStore::open_read_only(path_b).expect("reopen store B");
+    assert_eq!(
+        &store_b.runtime_store_identity().expect("store B identity"),
+        identity_b
+    );
+    assert_eq!(
+        TraceStore::read(&store_b, "run-b").expect("store B row")[0].payload,
+        serde_json::json!({"store": "B"})
+    );
+    assert!(matches!(
+        TraceStore::read(&store_b, "run-a"),
+        Err(TraceStoreError::RunNotFound)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_writable_constructor_rejects_a_to_b_to_a_main_file_substitution() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path_a = directory.path().join("trace-a.sqlite3");
+    let path_b = directory.path().join("trace-b.sqlite3");
+    let parked_a = directory.path().join("trace-a.parked");
+    let (identity_a, identity_b) = initialize_distinct_sqlite_stores(&path_a, &path_b);
+    let (hook, phase) = install_a_to_b_to_a_open_hook(&path_a, &path_b, &parked_a);
+
+    assert!(matches!(
+        SqliteTraceStore::open(&path_a),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(hook);
+
+    assert_distinct_sqlite_stores_unchanged(&path_a, &path_b, &identity_a, &identity_b);
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_read_only_constructor_rejects_a_to_b_to_a_main_file_substitution() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path_a = directory.path().join("trace-a.sqlite3");
+    let path_b = directory.path().join("trace-b.sqlite3");
+    let parked_a = directory.path().join("trace-a.parked");
+    let (identity_a, identity_b) = initialize_distinct_sqlite_stores(&path_a, &path_b);
+    let (hook, phase) = install_a_to_b_to_a_open_hook(&path_a, &path_b, &parked_a);
+
+    assert!(matches!(
+        SqliteTraceStore::open_read_only(&path_a),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(hook);
+
+    assert_distinct_sqlite_stores_unchanged(&path_a, &path_b, &identity_a, &identity_b);
 }
 
 #[cfg(unix)]
@@ -907,17 +1555,71 @@ fn secure_runtime_lock_attributes_reject_foreign_owner_type_mode_and_links() {
 
 #[cfg(unix)]
 #[test]
-fn sqlite_writer_detects_database_rename_and_replacement_before_append() {
+fn sqlite_writable_operations_detect_database_rename_and_replacement() {
     let directory = tempfile::tempdir().expect("trace directory");
     let path = directory.path().join("trace.sqlite3");
     let moved = directory.path().join("moved.sqlite3");
     let store = SqliteTraceStore::open(&path).expect("trace store");
+    let database = store.inner.database.as_ref().expect("writable database");
+    let lock_root = store.inner.lock_root.as_ref().expect("runtime lock root");
+    let shard = runtime_lock_shard(&store.inner.store_id, database.identity, "run");
+    let process_lock_key = ProcessRuntimeLockKey {
+        lock_root: lock_root.identity,
+        shard,
+    };
     let writer = store
         .acquire_runtime_writer(runtime_writer_request("run", "tenant", "agent"))
         .expect("runtime writer");
     let tail = writer.tail().expect("runtime tail");
+    let reader = store
+        .open_runtime_reader("run", RuntimeTraceLimits::default())
+        .expect("runtime reader");
 
     std::fs::rename(&path, &moved).expect("rename database");
+    assert!(matches!(
+        TraceStore::append(&store, "legacy", serde_json::json!({"after": "rename"})),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert!(matches!(
+        TraceStore::read(&store, "run"),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert!(matches!(
+        TraceStore::read_range(&store, "run", 0, 1),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert!(matches!(
+        store.runtime_store_identity(),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        store.open_runtime_reader("run", RuntimeTraceLimits::default()),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        reader.tail(),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        reader.read_page(0),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        reader.confirm_tail(&tail),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        writer.tail(),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        writer.read_page(0),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        writer.confirm_tail(&tail),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
     assert!(matches!(
         writer.append(&tail, serde_json::json!({"after": "rename"})),
         Err(RuntimeTracePortError::IntegrityFailure)
@@ -931,6 +1633,62 @@ fn sqlite_writer_detects_database_rename_and_replacement_before_append() {
     writer
         .close()
         .expect_err("renamed writer cannot close as valid");
+    let process_lock = ProcessRuntimeLock::acquire(process_lock_key)
+        .expect("failed close released process writer lock");
+    let lock_file = lock_root
+        .open_shard(shard)
+        .expect("open released OS lock shard");
+    flock(&lock_file, FlockOperation::NonBlockingLockExclusive)
+        .expect("failed close released OS writer lock");
+    flock(&lock_file, FlockOperation::Unlock).expect("unlock test shard");
+    drop(process_lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_read_only_operations_detect_database_rename() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("trace.sqlite3");
+    let moved = directory.path().join("moved.sqlite3");
+    let writable = SqliteTraceStore::open(&path).expect("writable trace store");
+    TraceStore::append(&writable, "run", serde_json::json!({"event": 1})).expect("seed trace row");
+    drop(writable);
+
+    let store = SqliteTraceStore::open_read_only(&path).expect("read-only trace store");
+    let reader = store
+        .open_runtime_reader("run", RuntimeTraceLimits::default())
+        .expect("runtime reader");
+    let tail = reader.tail().expect("runtime tail");
+    std::fs::rename(&path, &moved).expect("rename database");
+
+    assert!(matches!(
+        TraceStore::read(&store, "run"),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert!(matches!(
+        TraceStore::read_range(&store, "run", 0, 1),
+        Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
+    ));
+    assert!(matches!(
+        store.runtime_store_identity(),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        store.open_runtime_reader("run", RuntimeTraceLimits::default()),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        reader.tail(),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        reader.read_page(0),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        reader.confirm_tail(&tail),
+        Err(RuntimeTracePortError::IntegrityFailure)
+    ));
 }
 
 #[cfg(unix)]
@@ -949,11 +1707,7 @@ fn sqlite_lock_root_and_precreated_shards_fail_closed_when_unsafe() {
     let path = directory.path().join("unsafe-shard.sqlite3");
     let lock_root = directory.path().join("private-locks");
     let store = SqliteTraceStore::open_with_lock_root(&path, &lock_root).expect("trace store");
-    let database = store
-        .inner
-        .writable_database
-        .as_ref()
-        .expect("writable database");
+    let database = store.inner.database.as_ref().expect("writable database");
     let shard = runtime_lock_shard(&store.inner.store_id, database.identity, "run");
     let shard_path = lock_root.join(format!("shard-{shard:02x}.lock"));
     std::fs::write(&shard_path, []).expect("precreated shard");
@@ -979,7 +1733,7 @@ fn sqlite_lock_root_and_precreated_shards_fail_closed_when_unsafe() {
         .expect("symlink fixture store");
     let database = symlink_store
         .inner
-        .writable_database
+        .database
         .as_ref()
         .expect("writable database");
     let shard = runtime_lock_shard(
@@ -1018,11 +1772,7 @@ fn sqlite_lock_shards_are_bounded_and_collisions_deny_safely() {
     let path = directory.path().join("trace.sqlite3");
     let lock_root = directory.path().join("private-locks");
     let store = SqliteTraceStore::open_with_lock_root(&path, &lock_root).expect("trace store");
-    let database = store
-        .inner
-        .writable_database
-        .as_ref()
-        .expect("writable database");
+    let database = store.inner.database.as_ref().expect("writable database");
     let mut by_shard = std::collections::HashMap::new();
     let mut collision = None;
     for index in 0..(RUNTIME_TRACE_LOCK_SHARDS * 4) {

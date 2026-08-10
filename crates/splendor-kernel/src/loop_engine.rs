@@ -1102,6 +1102,10 @@ impl LoopEngine {
                     action: action.clone(),
                 },
             )?;
+            // This durable event opens an action episode. Until every required
+            // action and tick suffix record is durable, any later persistence
+            // failure must park the engine even when no adapter is entered.
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
 
             let mut effect_boundary = None;
             let mut outcome = if screened.raw_credential_denied {
@@ -1192,9 +1196,9 @@ impl LoopEngine {
                 tick_requires_reconciliation |= boundary.reconciliation_required_after_tick;
                 self.reconciliation_block = Some(TickReconciliationBlock::EffectInFlight);
             } else if !tick_effect_entered {
-                // The gateway result proved that no adapter was entered, and no
-                // earlier action in this tick has an in-flight effect.
-                self.reconciliation_block = None;
+                // The gateway result proved that no adapter was entered, but
+                // the durable action episode still needs its complete suffix.
+                self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
             }
 
             let action_escalations = if screened.raw_credential_denied {
@@ -1375,30 +1379,54 @@ impl LoopEngine {
         metadata.agent_id = Some(self.agent.agent_id.clone());
         metadata.run_id = Some(self.runtime.run_id().clone());
         metadata.trace_event_id = Some(state_trace_event_id);
-        let commit = self
+        let previous_state_head = self.state_graph.head().cloned();
+        let previous_state_tick = self.state_graph.tick();
+        let commit = match self
             .state_graph
-            .commit(decision.next_state.clone(), metadata)?;
-        self.state = decision.next_state;
-        self.agent.set_state_head(commit.node_id.clone());
+            .commit(decision.next_state.clone(), metadata)
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+                return Err(error.into());
+            }
+        };
 
-        self.runtime.record_event_with_identity(
+        if let Err(error) = self.runtime.record_event_with_identity(
             self.trace_identity(tick_id)
                 .with_state_node_id(commit.node_id.clone()),
             TraceEventKind::StateCommitted {
                 state_hash: commit.node_id.hash().clone(),
                 snapshot_id: commit.snapshot_id.clone(),
             },
-        )?;
+        ) {
+            // The legacy StateStore and TraceStore are separate durability
+            // boundaries. The immutable prepared node may remain in the store,
+            // but it must not become this live engine's visible head or state.
+            // Park the engine before returning so no later tick can consume it.
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+            self.state_graph.set_head(previous_state_head);
+            self.state_graph.set_tick(previous_state_tick);
+            return Err(error.into());
+        }
+        self.state = decision.next_state;
+        self.agent.set_state_head(commit.node_id.clone());
 
-        self.record_tick_event(
+        if let Err(error) = self.record_tick_event(
             tick_id,
             TraceEventKind::LoopTickCompleted {
                 tick_id,
                 integrity: None,
             },
-        )?;
+        ) {
+            // StateCommitted is already durable and remains the truthful live
+            // head. Park before returning the original completion append error
+            // so no later tick can advance from an incomplete trace lifecycle.
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+            return Err(error);
+        }
 
-        if tick_effect_entered && !tick_requires_reconciliation {
+        if !tick_requires_reconciliation {
             self.reconciliation_block = None;
         }
 

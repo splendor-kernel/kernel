@@ -399,6 +399,30 @@ impl crate::TraceSink for FailingStateHandoffImportedTraceSink {
     }
 }
 
+#[derive(Clone)]
+struct ArmableStateCommittedTraceSink {
+    events: Arc<Mutex<Vec<TraceEvent>>>,
+    armed: Arc<AtomicBool>,
+}
+
+impl ArmableStateCommittedTraceSink {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl crate::TraceSink for ArmableStateCommittedTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        if matches!(event.kind, TraceEventKind::StateCommitted { .. })
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
+        }
+        self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
+    }
+}
+
 struct StaticPerceptor;
 
 impl Perceptor for StaticPerceptor {
@@ -1278,6 +1302,133 @@ fn loop_engine_trace_failure_before_action_dispatch_stops_gateway_and_state_adva
 }
 
 #[test]
+fn state_committed_append_failure_restores_visible_state_and_latches_next_tick() {
+    struct IncrementStateWithoutActions {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Policy for IncrementStateWithoutActions {
+        fn name(&self) -> &str {
+            "increment-state-without-actions"
+        }
+
+        fn decide(
+            &self,
+            state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, LoopError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = state.bytes.first().copied().unwrap_or_default() + 1;
+            Ok(PolicyDecision::new(
+                Vec::new(),
+                StateData {
+                    bytes: vec![next],
+                    content_type: state.content_type.clone(),
+                },
+                Some("state-only".to_string()),
+            ))
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = ArmableStateCommittedTraceSink {
+        events: Arc::clone(&events),
+        armed: Arc::new(AtomicBool::new(false)),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink.clone()),
+        ..KernelRuntimeConfig::default()
+    });
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let gateway_calls = Arc::new(Mutex::new(0));
+    let initial_state = StateData {
+        bytes: vec![0],
+        content_type: Some("application/octet-stream".to_string()),
+    };
+    let mut engine = LoopEngine::with_runtime(
+        AgentContext::new(
+            AgentId::new(),
+            TenantId::new(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        initial_state,
+        Box::new(IncrementStateWithoutActions {
+            calls: Arc::clone(&policy_calls),
+        }),
+        Arc::new(CountingGateway {
+            calls: Arc::clone(&gateway_calls),
+        }),
+        runtime,
+    );
+
+    let first = engine.tick(1).expect("first state-only tick");
+    let prior_head = first.state_commit.node_id;
+    assert_eq!(engine.state.bytes, vec![1]);
+    assert_eq!(engine.state_graph.tick(), 1);
+    assert_eq!(engine.state_graph.head(), Some(&prior_head));
+    assert_eq!(engine.agent.state_head.as_ref(), Some(&prior_head));
+
+    sink.arm();
+    let error = engine
+        .tick(2)
+        .expect_err("StateCommitted append must fail the tick");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(crate::TraceError::Store(TraceStoreError::Poisoned))
+    ));
+    assert!(engine.requires_reconciliation());
+    assert!(matches!(
+        engine.reconciliation_block,
+        Some(TickReconciliationBlock::PersistenceDenied)
+    ));
+    assert_eq!(engine.state.bytes, vec![1]);
+    assert_eq!(engine.state_graph.tick(), 1);
+    assert_eq!(engine.state_graph.head(), Some(&prior_head));
+    assert_eq!(engine.agent.state_head.as_ref(), Some(&prior_head));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*gateway_calls.lock().expect("gateway calls"), 0);
+
+    let event_count = events.lock().expect("events lock").len();
+    let second_error = engine
+        .tick(3)
+        .expect_err("failed commit trace must block another tick");
+    assert!(matches!(
+        second_error,
+        LoopError::Policy(ref reason) if reason == TICK_RECONCILIATION_REQUIRED
+    ));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*gateway_calls.lock().expect("gateway calls"), 0);
+    let recorded = events.lock().expect("events lock");
+    assert_eq!(recorded.len(), event_count);
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::StateCommitted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::LoopTickStarted { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::LoopTickCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn loop_engine_rejects_invalid_escalation_policy_before_installing() {
     let store = Arc::new(InMemoryStateStore::default());
     let graph = StateGraph::new(store, SnapshotPolicy::default());
@@ -1361,8 +1512,21 @@ fn loop_engine_state_commit_failure_does_not_complete_tick() {
 
     let error = engine.tick(1).expect_err("state commit failure");
     assert!(matches!(error, LoopError::StateGraph(_)));
+    assert!(engine.requires_reconciliation());
+    assert!(matches!(
+        engine.reconciliation_block,
+        Some(TickReconciliationBlock::PersistenceDenied)
+    ));
     assert_eq!(engine.state_graph.tick(), 0);
     assert!(engine.agent.state_head.is_none());
+
+    let second_error = engine
+        .tick(2)
+        .expect_err("state commit failure must block another tick");
+    assert!(matches!(
+        second_error,
+        LoopError::Policy(ref reason) if reason == TICK_RECONCILIATION_REQUIRED
+    ));
 
     let recorded = events.lock().expect("events lock");
     assert!(recorded
@@ -2230,7 +2394,7 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
         assert!(runtime
             .admit_fresh_engine(&target_tenant, &target_agent)
             .expect("fresh admission"));
-        let state_event_id = TraceEventId::from_run_sequence(&run_id, 2);
+        let state_event_id = TraceEventId::from_run_sequence(&run_id, 3);
         let data_ref = state_store
             .put_state(StateData {
                 bytes: b"other-private-state".to_vec(),
@@ -2269,6 +2433,23 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
                 TraceEventKind::LoopTickStarted { tick_id: 1 },
             )
             .expect("tick start");
+        runtime
+            .record_event_with_identity(
+                tick_identity.clone(),
+                TraceEventKind::OutcomeRecorded {
+                    outcome: serde_json::json!({
+                        "tick_id": 1,
+                        "duration_ms": 1,
+                        "needs_intervention": false,
+                        "needs_approval": false,
+                        "escalations": [],
+                        "actions": [],
+                    }),
+                    feedback: None,
+                    reward: None,
+                },
+            )
+            .expect("tick outcome");
         runtime
             .record_event_with_identity(
                 tick_identity.clone().with_state_node_id(node_id.clone()),
@@ -2875,7 +3056,7 @@ fn recovery_writer_excludes_contenders_through_every_recovery_phase() {
 }
 
 #[test]
-fn resumed_scheduler_advances_past_an_incomplete_persisted_tick() {
+fn resume_rejects_an_incomplete_persisted_no_action_tick() {
     let trace_store = Arc::new(InMemoryTraceStore::default());
     let state_store = Arc::new(InMemoryStateStore::default());
     let run_id = RunId::new();
@@ -2920,40 +3101,28 @@ fn resumed_scheduler_advances_past_an_incomplete_persisted_tick() {
         .expect("persist partial tick identity");
     drop(partial_writer);
     drop(partial_runtime);
+    let before = trace_store
+        .read(&run_id.to_string())
+        .expect("trace before rejected resume");
 
-    let mut resumed = LoopEngine::resume_from_trace_store(
-        AgentContext::new(
-            agent_id,
-            tenant_id.clone(),
-            crate::AgentRuntimeConfig::default(),
-        ),
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
         StateGraph::new(state_store, snapshot_policy),
         Box::new(StaticPolicy),
         Arc::new(StubGateway),
-        trace_store,
-        run_id,
-    )
-    .expect("resume from incomplete pre-effect tick");
+        trace_store.clone(),
+        run_id.clone(),
+    );
     assert!(matches!(
-        resumed.tick(2),
-        Err(LoopError::TickIdentityConflict {
-            attempted: 2,
-            last_persisted: 2
-        })
+        resumed,
+        Err(LoopError::Resume(reason)) if reason == "tick_reconciliation_required"
     ));
-    let registry = crate::TenantRegistry::new();
-    registry.insert(crate::TenantContext::new(
-        tenant_id,
-        crate::TenantPolicy::default(),
-        crate::QuotaPolicy::default(),
-    ));
-    let mut scheduler =
-        crate::Scheduler::with_registry(crate::SchedulerConfig::default(), registry);
-    scheduler.add_agent(resumed);
-
-    let step = scheduler.run_once().expect("next durable tick");
-    assert_eq!(step.tick_id, 3);
-    assert_eq!(step.outcome.tick_id, 3);
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("trace after rejected resume"),
+        before
+    );
 }
 
 #[test]

@@ -19,17 +19,20 @@ use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_evidence::{
-    open_trace_reader, project_trace, TraceCompatibilityError, TraceProjection,
+    inspect_durable_action_history as inspect_evidence_durable_action_history, open_trace_reader,
+    project_trace, project_trace_range, DurableActionHistoryDisposition,
+    DurableActionHistorySource, TraceCompatibilityError, TraceProjection,
 };
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_request,
-    guard_action_routing_and_receipts, guard_credential_capable_strings,
-    guard_credential_capable_value, guard_persisted_percept, raw_credential_denied_action,
-    raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
-    ActionStatus, AuthorityObligationVerifier, CircuitBreakerEvaluator,
-    GatewayAuthorityDecisionSummary, PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder,
-    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
-    StaticCircuitBreakerEvaluator, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
+    guard_action_request_with_trusted_profile, guard_action_routing_and_receipts,
+    guard_credential_capable_strings, guard_credential_capable_value, guard_persisted_percept,
+    raw_credential_denied_action, raw_credential_denied_outcome, ActionGateway, ActionId,
+    ActionOutcome, ActionRequest, ActionStatus, AuthorityObligationVerifier,
+    CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary, PolicyApprovalVerifier,
+    PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier, SimulatedRiskLevel,
+    SimulatedSafetySnapshot, SimulatedSafetyVerifier, StaticCircuitBreakerEvaluator,
+    VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
@@ -871,6 +874,7 @@ struct RunSlot {
     trace_store: Arc<dyn TraceStore>,
     gateway: Arc<dyn ActionGateway>,
     run_authority: RunAuthorityHandle,
+    effect_admission: Arc<RunEffectAdmissionGuard>,
     work_order_id: WorkOrderId,
     work_order_envelope: WorkOrderEnvelope,
     bound_work_order_payload_digest: String,
@@ -878,6 +882,7 @@ struct RunSlot {
     authority_obligation_verifier: Arc<dyn AuthorityObligationVerifier>,
     authority_obligation_receipt_verifier: Option<Arc<AuthorityObligationReceiptVerifier>>,
     action_profiles: Vec<splendor_gateway::TrustedActionProfile>,
+    reserved_policy_action_ids: HashSet<ActionId>,
     approval_policies: Vec<ApprovalPolicy>,
     tenant_registry: TenantRegistry,
     circuit_breakers: SharedCircuitBreakerEvaluator,
@@ -891,6 +896,289 @@ struct RunSlot {
     tick_count: u64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+struct RunEffectAdmissionGuard {
+    // One run admits one direct/physical attempt at a time. A live contention is
+    // retryable and must not be confused with crash-recovery uncertainty.
+    admission: Mutex<RunEffectAdmission>,
+    run_authority: RunAuthorityHandle,
+}
+
+#[derive(Debug)]
+struct RunEffectAdmission {
+    state: RunEffectAdmissionState,
+    next_nonce: u64,
+}
+
+#[derive(Debug)]
+enum RunEffectAdmissionState {
+    Open,
+    InFlight(EffectAdmissionKey),
+    ReconciliationRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EffectAdmissionKey {
+    nonce: u64,
+    action_id: ActionId,
+    endpoint_source: DaemonActionEndpointSource,
+}
+
+impl RunEffectAdmissionGuard {
+    fn new(run_authority: RunAuthorityHandle) -> Self {
+        Self {
+            admission: Mutex::new(RunEffectAdmission {
+                state: RunEffectAdmissionState::Open,
+                next_nonce: 1,
+            }),
+            run_authority,
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        action_id: ActionId,
+        endpoint_source: DaemonActionEndpointSource,
+    ) -> Result<EffectAdmissionReservation, ApiError> {
+        let mut admission = self.admission.lock().map_err(|_| {
+            self.run_authority.close_effect_admission();
+            effect_reconciliation_required()
+        })?;
+        match admission.state {
+            RunEffectAdmissionState::Open => {}
+            RunEffectAdmissionState::InFlight(_) => return Err(action_in_progress()),
+            RunEffectAdmissionState::ReconciliationRequired => {
+                return Err(effect_reconciliation_required())
+            }
+        }
+        let nonce = admission.next_nonce;
+        admission.next_nonce = admission.next_nonce.checked_add(1).ok_or_else(|| {
+            admission.state = RunEffectAdmissionState::ReconciliationRequired;
+            self.run_authority.close_effect_admission();
+            effect_reconciliation_required()
+        })?;
+        let key = EffectAdmissionKey {
+            nonce,
+            action_id,
+            endpoint_source,
+        };
+        admission.state = RunEffectAdmissionState::InFlight(key.clone());
+        drop(admission);
+        Ok(EffectAdmissionReservation {
+            guard: Arc::clone(self),
+            key,
+            active: true,
+            durable_start_possible: false,
+        })
+    }
+
+    // Credential-bearing input is already denied before admission lookup. If a
+    // live or reconciliation owner exists, return the same fixed denial without
+    // appending another action episode or exposing admission state.
+    fn try_reserve_suppressed(
+        self: &Arc<Self>,
+        action_id: ActionId,
+        endpoint_source: DaemonActionEndpointSource,
+    ) -> Option<EffectAdmissionReservation> {
+        let mut admission = match self.admission.lock() {
+            Ok(admission) => admission,
+            Err(_) => {
+                self.run_authority.close_effect_admission();
+                return None;
+            }
+        };
+        if !matches!(admission.state, RunEffectAdmissionState::Open) {
+            return None;
+        }
+        let nonce = admission.next_nonce;
+        let Some(next_nonce) = admission.next_nonce.checked_add(1) else {
+            admission.state = RunEffectAdmissionState::ReconciliationRequired;
+            self.run_authority.close_effect_admission();
+            return None;
+        };
+        admission.next_nonce = next_nonce;
+        let key = EffectAdmissionKey {
+            nonce,
+            action_id,
+            endpoint_source,
+        };
+        admission.state = RunEffectAdmissionState::InFlight(key.clone());
+        drop(admission);
+        Some(EffectAdmissionReservation {
+            guard: Arc::clone(self),
+            key,
+            active: true,
+            durable_start_possible: false,
+        })
+    }
+
+    fn ensure_open(&self) -> Result<(), ApiError> {
+        let admission = self.admission.lock().map_err(|_| {
+            self.run_authority.close_effect_admission();
+            effect_reconciliation_required()
+        })?;
+        match admission.state {
+            RunEffectAdmissionState::Open => Ok(()),
+            RunEffectAdmissionState::InFlight(_) => Err(action_in_progress()),
+            RunEffectAdmissionState::ReconciliationRequired => {
+                Err(effect_reconciliation_required())
+            }
+        }
+    }
+
+    fn revalidate(&self, key: &EffectAdmissionKey) -> Result<(), ApiError> {
+        let admission = self.admission.lock().map_err(|_| {
+            self.run_authority.close_effect_admission();
+            effect_reconciliation_required()
+        })?;
+        if matches!(&admission.state, RunEffectAdmissionState::InFlight(current) if current == key)
+        {
+            Ok(())
+        } else {
+            drop(admission);
+            self.require_reconciliation(key);
+            Err(effect_reconciliation_required())
+        }
+    }
+
+    fn release(&self, key: &EffectAdmissionKey) {
+        let Ok(mut admission) = self.admission.lock() else {
+            self.run_authority.close_effect_admission();
+            return;
+        };
+        if matches!(&admission.state, RunEffectAdmissionState::InFlight(current) if current == key)
+        {
+            admission.state = RunEffectAdmissionState::Open;
+        } else {
+            admission.state = RunEffectAdmissionState::ReconciliationRequired;
+            drop(admission);
+            self.run_authority.close_effect_admission();
+        }
+    }
+
+    fn require_reconciliation(&self, _key: &EffectAdmissionKey) {
+        if let Ok(mut admission) = self.admission.lock() {
+            admission.state = RunEffectAdmissionState::ReconciliationRequired;
+        }
+        self.run_authority.close_effect_admission();
+    }
+}
+
+struct EffectAdmissionReservation {
+    guard: Arc<RunEffectAdmissionGuard>,
+    key: EffectAdmissionKey,
+    active: bool,
+    durable_start_possible: bool,
+}
+
+impl EffectAdmissionReservation {
+    fn revalidate(&self) -> Result<(), ApiError> {
+        self.guard.revalidate(&self.key)
+    }
+
+    fn mark_durable_start_possible(&mut self) {
+        self.durable_start_possible = true;
+    }
+
+    fn complete_without_gateway(mut self) {
+        self.active = false;
+        self.guard.release(&self.key);
+    }
+
+    fn reconcile(mut self) {
+        self.active = false;
+        self.guard.require_reconciliation(&self.key);
+    }
+
+    fn enter_gateway(mut self) -> GatewayEffectAdmission {
+        self.active = false;
+        GatewayEffectAdmission {
+            guard: Arc::clone(&self.guard),
+            key: self.key.clone(),
+            active: true,
+        }
+    }
+}
+
+impl Drop for EffectAdmissionReservation {
+    fn drop(&mut self) {
+        if self.active {
+            if self.durable_start_possible {
+                self.guard.require_reconciliation(&self.key);
+            } else {
+                self.guard.release(&self.key);
+            }
+        }
+    }
+}
+
+struct GatewayEffectAdmission {
+    guard: Arc<RunEffectAdmissionGuard>,
+    key: EffectAdmissionKey,
+    active: bool,
+}
+
+impl GatewayEffectAdmission {
+    fn finish_error(mut self) {
+        self.active = false;
+        // Verification start is already durable or its append result is
+        // ambiguous before Gateway entry. A Gateway error has no complete
+        // durable action suffix, even when it proves no adapter entry.
+        self.guard.require_reconciliation(&self.key);
+    }
+
+    fn arm_suffix(mut self, reconciliation_required: bool) -> EffectSuffixAdmission {
+        self.active = false;
+        // Dropping this token before `complete` intentionally leaves admission
+        // closed, including every fallible post-Gateway outcome persistence path.
+        EffectSuffixAdmission {
+            guard: Arc::clone(&self.guard),
+            key: self.key.clone(),
+            clear_after_suffix: !reconciliation_required,
+            reconciliation_required,
+            suffix_complete: false,
+        }
+    }
+}
+
+impl Drop for GatewayEffectAdmission {
+    fn drop(&mut self) {
+        if self.active {
+            self.guard.require_reconciliation(&self.key);
+        }
+    }
+}
+
+struct EffectSuffixAdmission {
+    guard: Arc<RunEffectAdmissionGuard>,
+    key: EffectAdmissionKey,
+    clear_after_suffix: bool,
+    reconciliation_required: bool,
+    suffix_complete: bool,
+}
+
+impl EffectSuffixAdmission {
+    fn reconciliation_required(&self) -> bool {
+        self.reconciliation_required
+    }
+
+    fn complete(mut self) {
+        self.suffix_complete = true;
+        if self.clear_after_suffix {
+            self.guard.release(&self.key);
+        } else {
+            self.guard.require_reconciliation(&self.key);
+        }
+    }
+}
+
+impl Drop for EffectSuffixAdmission {
+    fn drop(&mut self) {
+        if !self.suffix_complete {
+            self.guard.require_reconciliation(&self.key);
+        }
+    }
 }
 
 struct RunPolicyCacheMutationRecorder<'a> {
@@ -1973,6 +2261,29 @@ fn ensure_configured_actions_are_credential_free(
     Ok(())
 }
 
+fn guard_run_action_request(
+    state: &DaemonState,
+    slot: &RunSlot,
+    request: &ActionRequest,
+) -> Result<(), splendor_gateway::RawCredentialInputDenied> {
+    let Some(profile) = slot
+        .action_profiles
+        .iter()
+        .find(|profile| profile.action_name == request.action.name)
+    else {
+        return guard_action_request(request);
+    };
+    if state
+        .inner
+        .action_adapters
+        .resolve(&profile.adapter)
+        .is_none()
+    {
+        return guard_action_request(request);
+    }
+    guard_action_request_with_trusted_profile(request, profile, &profile.adapter)
+}
+
 fn raw_credential_input_api_error() -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
@@ -2371,10 +2682,10 @@ async fn create_run(
         None => (None, None),
     };
     let verified_gateway: Arc<dyn ActionGateway> = Arc::new(gateway);
-    let gateway: Arc<dyn ActionGateway> = Arc::new(PolicyDistributionGateway::new(
-        verified_gateway,
-        Arc::new(policy_cache.clone()),
-    ));
+    let mut policy_gateway =
+        PolicyDistributionGateway::new(verified_gateway, Arc::new(policy_cache.clone()));
+    policy_gateway.set_owner_trusted_action_profiles(action_profiles.clone());
+    let gateway: Arc<dyn ActionGateway> = Arc::new(policy_gateway);
 
     let state_graph = StateGraph::new(
         Arc::clone(&state_store),
@@ -2385,6 +2696,11 @@ async fn create_run(
     );
     let initial_state = encode_initial_state(request.initial_state)?;
     let action_admitted_at = OffsetDateTime::now_utc();
+    let reserved_policy_action_ids = request
+        .policy_actions
+        .iter()
+        .filter_map(|candidate| candidate.action_id.clone())
+        .collect();
     let policy_actions = request
         .policy_actions
         .into_iter()
@@ -2429,6 +2745,7 @@ async fn create_run(
 
     let bound_work_order_payload_digest =
         bound_work_order_payload_digest(&validated_work_order, &run_id)?;
+    let effect_admission = Arc::new(RunEffectAdmissionGuard::new(run_authority.clone()));
     let slot = RunSlot {
         run_id: run_id.clone(),
         tenant_id: request.tenant_id,
@@ -2439,6 +2756,7 @@ async fn create_run(
         trace_store,
         gateway,
         run_authority,
+        effect_admission,
         work_order_id: validated_work_order.work_order_id.clone(),
         work_order_envelope: request.work_order,
         bound_work_order_payload_digest,
@@ -2446,6 +2764,7 @@ async fn create_run(
         authority_obligation_verifier,
         authority_obligation_receipt_verifier,
         action_profiles,
+        reserved_policy_action_ids,
         approval_policies: request.approval_policies.clone(),
         tenant_registry,
         circuit_breakers,
@@ -2623,13 +2942,17 @@ async fn pause_run(
         None,
         request.audit_attribution,
     )?;
-    record_daemon_audit(&slot, "splendor.runs.pause", security.audit_attribution)?;
     if !matches!(slot.status, RunStatus::Pending | RunStatus::Running) {
         return Err(invalid_lifecycle_transition(
             &slot.status,
             "run must be pending or running before pause",
         ));
     }
+    // The per-run mutex linearizes status inspection with action reservation:
+    // action-first makes pause conflict, while pause-first changes status before
+    // a later action can be admitted.
+    slot.effect_admission.ensure_open()?;
+    record_daemon_audit(&slot, "splendor.runs.pause", security.audit_attribution)?;
     record_run_event(
         &slot,
         TraceEventKind::RunPaused {
@@ -3334,8 +3657,13 @@ async fn traces(
         None,
         None,
     )?;
-    let records = validated_trace_records(&slot, &run_id, TraceProjection::Redacted)?;
-    let records = select_trace_range(records, query.start, query.end);
+    let records = validated_trace_records_in_range(
+        &slot,
+        &run_id,
+        TraceProjection::Redacted,
+        query.start,
+        query.end,
+    )?;
     Ok(Json(TracePageResponse { run_id, records }))
 }
 
@@ -3362,16 +3690,20 @@ async fn export_traces(
         None,
         request.audit_attribution,
     )?;
+    validate_trace_range(request.start, request.end)?;
     record_daemon_audit(
         &slot,
         "splendor.traces.export.redacted",
         security.audit_attribution,
     )?;
-    let trusted = validated_trace_records(&slot, &run_id, TraceProjection::Trusted)?;
-    let trusted = select_trace_range(trusted, request.start, request.end);
-    let integrity_hash = trace_export_integrity_hash(&trusted);
-    let records = validated_trace_records(&slot, &run_id, TraceProjection::Redacted)?;
-    let records = select_trace_range(records, request.start, request.end);
+    let records = validated_trace_records_in_range(
+        &slot,
+        &run_id,
+        TraceProjection::Redacted,
+        request.start,
+        request.end,
+    )?;
+    let integrity_hash = trace_export_integrity_hash(&records);
     Ok(Json(TraceExportResponse {
         run_id,
         record_count: records.len(),
@@ -3479,17 +3811,44 @@ fn validated_trace_records(
     project_trace(reader.as_ref(), run_id, projection).map_err(trace_compatibility_error)
 }
 
-fn select_trace_range(
-    records: Vec<TraceRecord>,
+fn validated_trace_records_in_range(
+    slot: &RunSlot,
+    run_id: &RunId,
+    projection: TraceProjection,
     start: Option<u64>,
     end: Option<u64>,
-) -> Vec<TraceRecord> {
+) -> Result<Vec<TraceRecord>, ApiError> {
+    validate_trace_range(start, end)?;
+    let reader = open_trace_reader(
+        slot.trace_store.as_ref(),
+        run_id,
+        RuntimeTraceLimits::default(),
+    )
+    .map_err(trace_compatibility_error)?;
     match (start, end) {
-        (Some(start), Some(end)) => records
-            .into_iter()
-            .filter(|record| record.sequence >= start && record.sequence < end)
-            .collect(),
-        _ => records,
+        (None, None) => {
+            project_trace(reader.as_ref(), run_id, projection).map_err(trace_compatibility_error)
+        }
+        (start, end) => project_trace_range(
+            reader.as_ref(),
+            run_id,
+            projection,
+            start.unwrap_or(0),
+            end.unwrap_or(u64::MAX),
+        )
+        .map_err(trace_compatibility_error),
+    }
+}
+
+fn validate_trace_range(start: Option<u64>, end: Option<u64>) -> Result<(), ApiError> {
+    if start.zip(end).is_some_and(|(start, end)| start > end) {
+        Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_trace_range",
+            "trace range start must not exceed end",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -3499,6 +3858,175 @@ fn trace_compatibility_error(_error: TraceCompatibilityError) -> ApiError {
         "trace_evidence_unavailable",
         "trace evidence could not be validated",
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonActionEndpointSource {
+    Direct,
+    Physical,
+}
+
+enum DurableActionDisposition {
+    Fresh,
+    ContinueApproval,
+    Conflict,
+    ReconciliationRequired,
+}
+
+struct DurableActionLookupSnapshot {
+    trace_store: Arc<dyn TraceStore>,
+    run_id: RunId,
+    tenant_id: TenantId,
+    agent_id: splendor_types::AgentId,
+}
+
+impl DurableActionLookupSnapshot {
+    fn from_slot(slot: &RunSlot) -> Self {
+        Self {
+            trace_store: Arc::clone(&slot.trace_store),
+            run_id: slot.run_id.clone(),
+            tenant_id: slot.tenant_id.clone(),
+            agent_id: slot.agent_id.clone(),
+        }
+    }
+}
+
+const DURABLE_ACTION_HISTORY_READ_ATTEMPTS: usize = 3;
+
+fn read_durable_action_history(
+    snapshot: &DurableActionLookupSnapshot,
+    action_id: &ActionId,
+) -> Result<DurableActionHistoryDisposition, ApiError> {
+    for attempt in 0..DURABLE_ACTION_HISTORY_READ_ATTEMPTS {
+        let reader = open_trace_reader(
+            snapshot.trace_store.as_ref(),
+            &snapshot.run_id,
+            RuntimeTraceLimits::default(),
+        )
+        .map_err(|_| action_history_unavailable())?;
+        match inspect_evidence_durable_action_history(
+            reader.as_ref(),
+            &snapshot.run_id,
+            &snapshot.tenant_id,
+            &snapshot.agent_id,
+            action_id,
+        ) {
+            Ok(history) => return Ok(history),
+            Err(TraceCompatibilityError::TailMoved)
+                if attempt + 1 < DURABLE_ACTION_HISTORY_READ_ATTEMPTS => {}
+            Err(TraceCompatibilityError::TailMoved) => return Err(action_history_changed()),
+            Err(TraceCompatibilityError::Store | TraceCompatibilityError::WriterConflict) => {
+                return Err(action_history_unavailable())
+            }
+            Err(_) => return Ok(DurableActionHistoryDisposition::ReconciliationRequired),
+        }
+    }
+    Err(action_history_changed())
+}
+
+fn durable_action_disposition(
+    history: &DurableActionHistoryDisposition,
+    slot: &RunSlot,
+    action_id: &ActionId,
+    carries_approval_continuation: bool,
+    endpoint_source: DaemonActionEndpointSource,
+) -> DurableActionDisposition {
+    let pending_matches = slot.status == RunStatus::WaitingForApproval
+        && slot
+            .pending_approval
+            .as_ref()
+            .is_some_and(|pending| &pending.action_id == action_id);
+    match history {
+        DurableActionHistoryDisposition::Fresh => DurableActionDisposition::Fresh,
+        DurableActionHistoryDisposition::ReconciliationRequired => {
+            DurableActionDisposition::ReconciliationRequired
+        }
+        DurableActionHistoryDisposition::Complete { .. } => DurableActionDisposition::Conflict,
+        DurableActionHistoryDisposition::PendingApproval { source } => {
+            let endpoint_matches = matches!(
+                (source, endpoint_source),
+                (
+                    DurableActionHistorySource::Tick | DurableActionHistorySource::Direct,
+                    DaemonActionEndpointSource::Direct,
+                ) | (
+                    DurableActionHistorySource::Physical,
+                    DaemonActionEndpointSource::Physical,
+                )
+            );
+            if pending_matches && endpoint_matches && carries_approval_continuation {
+                DurableActionDisposition::ContinueApproval
+            } else {
+                DurableActionDisposition::Conflict
+            }
+        }
+    }
+}
+
+fn action_id_conflict() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "action_id_conflict",
+        "action identity has already been used",
+    )
+    .details(serde_json::json!({
+        "disposition": "conflict",
+        "retryable": false,
+    }))
+}
+
+fn reserved_policy_action_id_conflicts(
+    slot: &RunSlot,
+    action_id: &ActionId,
+    carries_approval_continuation: bool,
+    endpoint_source: DaemonActionEndpointSource,
+) -> bool {
+    if !slot.reserved_policy_action_ids.contains(action_id) {
+        return false;
+    }
+
+    let exact_tick_approval_continuation = carries_approval_continuation
+        && endpoint_source == DaemonActionEndpointSource::Direct
+        && slot.status == RunStatus::WaitingForApproval
+        && slot.pending_approval.as_ref().is_some_and(|pending| {
+            &pending.action_id == action_id && pending.physical_action_resource_coordinate.is_none()
+        });
+    !exact_tick_approval_continuation
+}
+
+fn action_in_progress() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "action_in_progress",
+        "a run action is already in progress",
+    )
+    .details(serde_json::json!({
+        "disposition": "in_progress",
+        "retryable": true,
+    }))
+}
+
+fn action_history_changed() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "action_history_changed",
+        "action history changed while it was being validated",
+    )
+    .details(serde_json::json!({
+        "disposition": "history_changed",
+        "retryable": true,
+    }))
+}
+
+fn action_history_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "action_history_unavailable",
+        "action history is temporarily unavailable",
+    )
+    .details(serde_json::json!({
+        "disposition": "unavailable",
+        "retryable": true,
+    }))
 }
 
 async fn submit_action(
@@ -3524,8 +4052,8 @@ async fn submit_action(
         authority_obligation_evidence: None,
         authority_obligation_receipts: request.authority_obligation_receipts.clone(),
     };
-    let (gateway, pending_approval_retry) = {
-        let mut slot = run.lock().map_err(|_| lock_error())?;
+    let (audit_attribution, raw_credential_denied) = {
+        let slot = run.lock().map_err(|_| lock_error())?;
         if request.tenant_id != slot.tenant_id || request.agent_id != slot.agent_id {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -3540,21 +4068,66 @@ async fn submit_action(
                 trace_linked: request.causal_trace_id.is_some(),
                 gateway_verification: GatewayVerificationState::Required,
             },
-            request.credential,
+            request.credential.clone(),
             None,
-            request.audit_attribution,
+            request.audit_attribution.clone(),
         )?;
-        if guard_action_request(&action_request).is_err() {
-            record_daemon_audit(&slot, "splendor.actions.submit", security.audit_attribution)?;
-            let outcome = record_raw_credential_action_denial(
-                &slot,
-                &effective_action_id,
-                RawCredentialIngressSource::Direct {
-                    causal_trace_id: request.causal_trace_id.clone(),
-                },
-            )?;
-            slot.updated_at = OffsetDateTime::now_utc();
-            return Ok(Json(outcome));
+        (
+            security.audit_attribution,
+            guard_run_action_request(&state, &slot, &action_request).is_err(),
+        )
+    };
+    if raw_credential_denied {
+        return handle_raw_credential_action_denial(
+            &run,
+            &effective_action_id,
+            request.action_id.as_ref(),
+            DaemonActionEndpointSource::Direct,
+            audit_attribution,
+        );
+    }
+
+    let (mut effect_admission, lookup_snapshot) = {
+        let slot = run.lock().map_err(|_| lock_error())?;
+        if reserved_policy_action_id_conflicts(
+            &slot,
+            &effective_action_id,
+            request.approval_evidence.is_some()
+                || !request.authority_obligation_receipts.is_empty(),
+            DaemonActionEndpointSource::Direct,
+        ) {
+            return Err(action_id_conflict());
+        }
+        let effect_admission = slot.effect_admission.reserve(
+            effective_action_id.clone(),
+            DaemonActionEndpointSource::Direct,
+        )?;
+        (
+            effect_admission,
+            DurableActionLookupSnapshot::from_slot(&slot),
+        )
+    };
+    let history = read_durable_action_history(&lookup_snapshot, &effective_action_id)?;
+    let (gateway, pending_approval_retry, effect_admission) = {
+        let slot = run.lock().map_err(|_| lock_error())?;
+        effect_admission.revalidate()?;
+        match durable_action_disposition(
+            &history,
+            &slot,
+            &effective_action_id,
+            request.approval_evidence.is_some()
+                || !request.authority_obligation_receipts.is_empty(),
+            DaemonActionEndpointSource::Direct,
+        ) {
+            DurableActionDisposition::Fresh | DurableActionDisposition::ContinueApproval => {}
+            DurableActionDisposition::Conflict => {
+                record_daemon_audit(&slot, "splendor.actions.submit", audit_attribution.clone())?;
+                return Err(action_id_conflict());
+            }
+            DurableActionDisposition::ReconciliationRequired => {
+                effect_admission.reconcile();
+                return Err(effect_reconciliation_required());
+            }
         }
         let effective_adapter = action_request.adapter.clone().or_else(|| {
             slot.action_profiles
@@ -3572,7 +4145,6 @@ async fn submit_action(
                 OffsetDateTime::now_utc(),
             )
             .map_err(run_action_admission_error)?;
-        record_daemon_audit(&slot, "splendor.actions.submit", security.audit_attribution)?;
         if let Some(profile) = slot
             .action_profiles
             .iter()
@@ -3594,7 +4166,9 @@ async fn submit_action(
                 ));
             }
         }
+        record_daemon_audit(&slot, "splendor.actions.submit", audit_attribution)?;
 
+        effect_admission.mark_durable_start_possible();
         record_run_action_event(
             &slot,
             &effective_action_id,
@@ -3602,15 +4176,26 @@ async fn submit_action(
                 action: request.action.clone(),
             },
         )?;
-        (Arc::clone(&slot.gateway), pending_approval_retry)
-    };
-    let mut outcome = gateway.submit(action_request).map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "gateway_error",
-            error.to_string(),
+        (
+            Arc::clone(&slot.gateway),
+            pending_approval_retry,
+            effect_admission,
         )
-    })?;
+    };
+    let gateway_admission = effect_admission.enter_gateway();
+    let mut outcome = match gateway.submit(action_request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            gateway_admission.finish_error();
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway_error",
+                error.to_string(),
+            ));
+        }
+    };
+    let effect_suffix_admission =
+        gateway_admission.arm_suffix(trusted_gateway_post_effect(&outcome).unwrap_or(false));
     bind_raw_approval_denial_to_pending_challenge(
         &mut outcome,
         pending_approval_retry.as_ref(),
@@ -3642,8 +4227,7 @@ async fn submit_action(
         }
         ActionStatus::Denied => {
             record_approval_event_if_present(&slot, &outcome)?;
-            if run_status_allows_external_effects(&slot.status) || pending_approval_retry.is_some()
-            {
+            if !run_status_is_terminal(&slot.status) {
                 update_status_for_approval_denial(&mut slot, &outcome);
             }
             record_run_action_event(
@@ -3656,7 +4240,7 @@ async fn submit_action(
             )
         }
         ActionStatus::NeedsApproval => {
-            let can_transition = run_status_allows_external_effects(&slot.status);
+            let can_transition = !run_status_is_terminal(&slot.status);
             if can_transition {
                 slot.pending_approval =
                     Some(outcome.approval_challenge.clone().ok_or_else(|| {
@@ -3718,6 +4302,7 @@ async fn submit_action(
             )
         }
     }?;
+    resume_after_approved_action(&mut slot, pending_approval_retry.as_ref(), &outcome)?;
     record_run_action_event(
         &slot,
         &effective_action_id,
@@ -3731,8 +4316,8 @@ async fn submit_action(
             reward: None,
         },
     )?;
-    resume_after_approved_action(&mut slot, pending_approval_retry.as_ref(), &outcome)?;
     slot.updated_at = OffsetDateTime::now_utc();
+    effect_suffix_admission.complete();
     Ok(Json(outcome))
 }
 
@@ -3985,27 +4570,6 @@ async fn submit_physical_action(
     Json(request): Json<SubmitPhysicalActionRequest>,
 ) -> Result<Json<ActionOutcome>, ApiError> {
     state.ensure_runtime_available()?;
-    let profile = state
-        .inner
-        .device_profiles
-        .lock()
-        .map_err(|_| lock_error())?
-        .get(&node_id)
-        .cloned()
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_registered",
-                "device profile not registered",
-            )
-        })?;
-    if profile.tenant_id != request.action_request.tenant_id {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "wrong_scope",
-            "device tenant does not match action tenant",
-        ));
-    }
     let action_name = request.action_request.action.name.clone();
     let effective_action_id = request
         .action_request
@@ -4032,12 +4596,8 @@ async fn submit_physical_action(
         authority_obligation_receipts: request.action_request.authority_obligation_receipts.clone(),
     };
     let run = state.run_slot(&request.action_request.run_id)?;
-    let (physical_gateway, pending_approval_retry, offline): (
-        Arc<dyn ActionGateway>,
-        Option<ApprovalChallenge>,
-        bool,
-    ) = {
-        let mut slot = run.lock().map_err(|_| lock_error())?;
+    let (audit_attribution, raw_credential_denied) = {
+        let slot = run.lock().map_err(|_| lock_error())?;
         if request.action_request.tenant_id != slot.tenant_id
             || request.action_request.agent_id != slot.agent_id
         {
@@ -4058,21 +4618,102 @@ async fn submit_physical_action(
             None,
             request.action_request.audit_attribution.clone(),
         )?;
-        if guard_action_request(&action_request).is_err()
-            || guard_physical_envelope(&request).is_err()
-        {
-            record_daemon_audit(
-                &slot,
-                "splendor.devices.actions.submit",
-                security.audit_attribution,
-            )?;
-            let outcome = record_raw_credential_action_denial(
-                &slot,
-                &effective_action_id,
-                RawCredentialIngressSource::Physical,
-            )?;
-            slot.updated_at = OffsetDateTime::now_utc();
-            return Ok(Json(outcome));
+        (
+            security.audit_attribution,
+            guard_run_action_request(&state, &slot, &action_request).is_err()
+                || guard_physical_envelope(&request).is_err(),
+        )
+    };
+    if raw_credential_denied {
+        return handle_raw_credential_action_denial(
+            &run,
+            &effective_action_id,
+            request.action_request.action_id.as_ref(),
+            DaemonActionEndpointSource::Physical,
+            audit_attribution,
+        );
+    }
+
+    let (mut effect_admission, lookup_snapshot) = {
+        let slot = run.lock().map_err(|_| lock_error())?;
+        if reserved_policy_action_id_conflicts(
+            &slot,
+            &effective_action_id,
+            request.action_request.approval_evidence.is_some()
+                || !request
+                    .action_request
+                    .authority_obligation_receipts
+                    .is_empty(),
+            DaemonActionEndpointSource::Physical,
+        ) {
+            return Err(action_id_conflict());
+        }
+        let effect_admission = slot.effect_admission.reserve(
+            effective_action_id.clone(),
+            DaemonActionEndpointSource::Physical,
+        )?;
+        (
+            effect_admission,
+            DurableActionLookupSnapshot::from_slot(&slot),
+        )
+    };
+    let history = read_durable_action_history(&lookup_snapshot, &effective_action_id)?;
+    let (physical_gateway, pending_approval_retry, offline, effect_admission): (
+        Arc<dyn ActionGateway>,
+        Option<ApprovalChallenge>,
+        bool,
+        EffectAdmissionReservation,
+    ) = {
+        let slot = run.lock().map_err(|_| lock_error())?;
+        effect_admission.revalidate()?;
+        match durable_action_disposition(
+            &history,
+            &slot,
+            &effective_action_id,
+            request.action_request.approval_evidence.is_some()
+                || !request
+                    .action_request
+                    .authority_obligation_receipts
+                    .is_empty(),
+            DaemonActionEndpointSource::Physical,
+        ) {
+            DurableActionDisposition::Fresh | DurableActionDisposition::ContinueApproval => {}
+            DurableActionDisposition::Conflict => {
+                record_daemon_audit(
+                    &slot,
+                    "splendor.devices.actions.submit",
+                    audit_attribution.clone(),
+                )?;
+                return Err(action_id_conflict());
+            }
+            DurableActionDisposition::ReconciliationRequired => {
+                effect_admission.reconcile();
+                return Err(effect_reconciliation_required());
+            }
+        }
+        // Completed or otherwise used identities return above before consulting
+        // device registration, so a cross-node retry cannot become a profile or
+        // stored-response oracle.
+        let profile = state
+            .inner
+            .device_profiles
+            .lock()
+            .map_err(|_| lock_error())?
+            .get(&node_id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "device_not_registered",
+                    "device profile not registered",
+                )
+            })?;
+        if profile.tenant_id != request.action_request.tenant_id {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "wrong_scope",
+                "device tenant does not match action tenant",
+            ));
         }
         if matches_forbidden_physical_action(&action_name)
             || !is_allowed_physical_action(&action_name)
@@ -4137,49 +4778,6 @@ async fn submit_physical_action(
                     .map(|adapter| (profile.adapter.clone(), adapter))
             })
             .transpose()?;
-        record_daemon_audit(
-            &slot,
-            "splendor.devices.actions.submit",
-            security.audit_attribution.clone(),
-        )?;
-        record_run_action_event(
-            &slot,
-            &effective_action_id,
-            TraceEventKind::ActionVerificationStarted {
-                action: request.action_request.action.clone(),
-            },
-        )?;
-        record_physical_run_event(
-            &slot,
-            "safety.verification.started",
-            &request.action_request.action,
-            serde_json::json!({"node_id": node_id, "action": action_name}),
-        )?;
-        if let Some(proposal_id) = &request.safety_context.cloud_helper_proposal_id {
-            record_physical_run_event(
-                &slot,
-                "cloud_helper.proposal.received",
-                &request.action_request.action,
-                serde_json::json!({"proposal_id": proposal_id, "direct_authority": request.safety_context.cloud_helper_direct_authority}),
-            )?;
-        }
-        if offline {
-            record_physical_run_event(
-                &slot,
-                "offline.entered",
-                &request.action_request.action,
-                serde_json::json!({"node_id": node_id}),
-            )?;
-        }
-
-        if offline && safety_snapshot.policy_cache_expired && safety_snapshot.high_risk {
-            record_physical_run_event(
-                &slot,
-                "policy.cache.expired",
-                &request.action_request.action,
-                serde_json::json!({"policy_id": profile.policy_cache.policy_id, "action": action_name}),
-            )?;
-        }
         if let Some(evidence) = &request.operator_intervention_evidence {
             if let Err(error) = validate_operator_evidence(
                 &state,
@@ -4225,22 +4823,71 @@ async fn submit_physical_action(
         if let Some((adapter_id, adapter)) = configured_adapter {
             physical_gateway.register_adapter(action_name.clone(), adapter_id, adapter);
         }
+        let physical_gateway: Arc<dyn ActionGateway> = Arc::new(PolicyDistributionGateway::new(
+            Arc::new(physical_gateway),
+            Arc::new(slot.policy_cache.clone()),
+        ));
+        record_daemon_audit(&slot, "splendor.devices.actions.submit", audit_attribution)?;
+        effect_admission.mark_durable_start_possible();
+        record_run_action_event(
+            &slot,
+            &effective_action_id,
+            TraceEventKind::ActionVerificationStarted {
+                action: request.action_request.action.clone(),
+            },
+        )?;
+        record_physical_run_event(
+            &slot,
+            "safety.verification.started",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id, "action": action_name}),
+        )?;
+        if let Some(proposal_id) = &request.safety_context.cloud_helper_proposal_id {
+            record_physical_run_event(
+                &slot,
+                "cloud_helper.proposal.received",
+                &request.action_request.action,
+                serde_json::json!({"proposal_id": proposal_id, "direct_authority": request.safety_context.cloud_helper_direct_authority}),
+            )?;
+        }
+        if offline {
+            record_physical_run_event(
+                &slot,
+                "offline.entered",
+                &request.action_request.action,
+                serde_json::json!({"node_id": node_id}),
+            )?;
+        }
+
+        if offline && safety_snapshot.policy_cache_expired && safety_snapshot.high_risk {
+            record_physical_run_event(
+                &slot,
+                "policy.cache.expired",
+                &request.action_request.action,
+                serde_json::json!({"policy_id": profile.policy_cache.policy_id, "action": action_name}),
+            )?;
+        }
         (
-            Arc::new(PolicyDistributionGateway::new(
-                Arc::new(physical_gateway),
-                Arc::new(slot.policy_cache.clone()),
-            )),
+            physical_gateway,
             pending_approval_retry,
             offline,
+            effect_admission,
         )
     };
-    let mut outcome = physical_gateway.submit(action_request).map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "gateway_error",
-            error.to_string(),
-        )
-    })?;
+    let gateway_admission = effect_admission.enter_gateway();
+    let mut outcome = match physical_gateway.submit(action_request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            gateway_admission.finish_error();
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway_error",
+                error.to_string(),
+            ));
+        }
+    };
+    let effect_suffix_admission =
+        gateway_admission.arm_suffix(trusted_gateway_post_effect(&outcome).unwrap_or(false));
     bind_raw_approval_denial_to_pending_challenge(
         &mut outcome,
         pending_approval_retry.as_ref(),
@@ -4287,7 +4934,7 @@ async fn submit_physical_action(
             )?;
         }
         ActionStatus::NeedsApproval => {
-            let can_transition = run_status_allows_external_effects(&slot.status);
+            let can_transition = !run_status_is_terminal(&slot.status);
             if can_transition {
                 slot.pending_approval =
                     Some(outcome.approval_challenge.clone().ok_or_else(|| {
@@ -4317,6 +4964,16 @@ async fn submit_physical_action(
                 slot.status = RunStatus::WaitingForApproval;
             }
         }
+        ActionStatus::NeedsIntervention => {
+            record_approval_event_if_present(&slot, &outcome)?;
+            transition_run_status_from_action(&mut slot, RunStatus::Failed);
+            record_physical_denial(
+                &slot,
+                &effective_action_id,
+                &request.action_request.action,
+                &outcome,
+            )?;
+        }
         _ => {
             record_approval_event_if_present(&slot, &outcome)?;
             if pending_approval_retry.is_some() {
@@ -4330,17 +4987,7 @@ async fn submit_physical_action(
             )?;
         }
     }
-    record_run_action_event(
-        &slot,
-        &effective_action_id,
-        TraceEventKind::OutcomeRecorded {
-            outcome: serde_json::json!({"source": "daemon.physical_action", "action_outcome": outcome}),
-            feedback: None,
-            reward: None,
-        },
-    )?;
     resume_after_approved_action(&mut slot, pending_approval_retry.as_ref(), &outcome)?;
-    slot.updated_at = OffsetDateTime::now_utc();
     if offline {
         record_physical_run_event(
             &slot,
@@ -4355,6 +5002,20 @@ async fn submit_physical_action(
             serde_json::json!({"node_id": node_id}),
         )?;
     }
+    if effect_suffix_admission.reconciliation_required() && outcome.status == ActionStatus::Failed {
+        transition_run_status_from_action(&mut slot, RunStatus::Failed);
+    }
+    record_run_action_event(
+        &slot,
+        &effective_action_id,
+        TraceEventKind::OutcomeRecorded {
+            outcome: serde_json::json!({"source": "daemon.physical_action", "action_outcome": outcome}),
+            feedback: None,
+            reward: None,
+        },
+    )?;
+    slot.updated_at = OffsetDateTime::now_utc();
+    effect_suffix_admission.complete();
     Ok(Json(outcome))
 }
 
@@ -5473,12 +6134,6 @@ enum LifecycleKind {
     Resume,
 }
 
-fn run_status_allows_external_effects(status: &RunStatus) -> bool {
-    // Pending remains effect-capable for the stable direct `/actions`
-    // compatibility path; all suspended, resuming, and terminal states deny.
-    matches!(status, RunStatus::Pending | RunStatus::Running)
-}
-
 fn run_status_is_terminal(status: &RunStatus) -> bool {
     matches!(
         status,
@@ -5506,6 +6161,34 @@ fn run_action_admission_error(error: splendor_kernel::RunActionAdmissionError) -
         _ => StatusCode::CONFLICT,
     };
     ApiError::new(status, error.reason_code(), error.message())
+}
+
+fn effect_reconciliation_required() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "tick_reconciliation_required",
+        "run effect admission is closed pending reconciliation",
+    )
+}
+
+fn trusted_gateway_post_effect(outcome: &ActionOutcome) -> Option<bool> {
+    let post_verification = outcome.post_verification.as_ref();
+    let adapter_entry_inferred = outcome.status == ActionStatus::Executed
+        || outcome.output.is_some()
+        || post_verification.is_some();
+    if !adapter_entry_inferred {
+        return None;
+    }
+
+    let adapter_entry_recorded = post_verification
+        .and_then(|result| result.artifacts.get("adapter_entered"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let reconciliation_required = post_verification
+        .and_then(|result| result.artifacts.get("reconciliation_required"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    Some(reconciliation_required || !adapter_entry_recorded)
 }
 
 fn resume_after_approved_action(
@@ -5546,7 +6229,7 @@ fn transition_run_status(slot: &mut RunSlot, next: RunStatus) {
 }
 
 fn transition_run_status_from_action(slot: &mut RunSlot, next: RunStatus) {
-    if run_status_allows_external_effects(&slot.status) {
+    if !run_status_is_terminal(&slot.status) {
         transition_run_status(slot, next);
     }
 }
@@ -5674,6 +6357,7 @@ async fn run_lifecycle_tick(
     if let Some(validated) = validated_resume_work_order.as_ref() {
         ensure_resume_work_order_matches_original(&slot, validated)?;
     }
+    slot.effect_admission.ensure_open()?;
     let endpoint = match kind {
         LifecycleKind::Start => "splendor.runs.start",
         LifecycleKind::Resume => "splendor.runs.resume",
@@ -5950,8 +6634,86 @@ fn record_run_action_event(
 }
 
 enum RawCredentialIngressSource {
-    Direct { causal_trace_id: Option<TraceId> },
+    Direct,
     Physical,
+}
+
+fn handle_raw_credential_action_denial(
+    run: &SharedRunSlot,
+    action_id: &ActionId,
+    caller_action_id: Option<&ActionId>,
+    endpoint_source: DaemonActionEndpointSource,
+    audit_attribution: Option<AuditAttribution>,
+) -> Result<Json<ActionOutcome>, ApiError> {
+    let fixed_outcome = raw_credential_denied_outcome(action_id.clone());
+    let (mut admission, snapshot) = {
+        let slot = match run.lock() {
+            Ok(slot) => slot,
+            Err(_) => return Ok(Json(fixed_outcome)),
+        };
+        if !matches!(
+            run_action_admission_state(&slot.status),
+            RunActionAdmissionState::EffectCapable
+        ) || caller_action_id
+            .is_some_and(|action_id| slot.reserved_policy_action_ids.contains(action_id))
+        {
+            return Ok(Json(fixed_outcome));
+        }
+        let Some(admission) = slot
+            .effect_admission
+            .try_reserve_suppressed(action_id.clone(), endpoint_source)
+        else {
+            return Ok(Json(fixed_outcome));
+        };
+        let audit_endpoint = match endpoint_source {
+            DaemonActionEndpointSource::Direct => "splendor.actions.submit",
+            DaemonActionEndpointSource::Physical => "splendor.devices.actions.submit",
+        };
+        record_daemon_audit(&slot, audit_endpoint, audit_attribution)?;
+        (admission, DurableActionLookupSnapshot::from_slot(&slot))
+    };
+
+    let history = match read_durable_action_history(&snapshot, action_id) {
+        Ok(history) => history,
+        Err(_) => return Ok(Json(fixed_outcome)),
+    };
+    let mut slot = match run.lock() {
+        Ok(slot) => slot,
+        Err(_) => {
+            admission.reconcile();
+            return Ok(Json(fixed_outcome));
+        }
+    };
+    if admission.revalidate().is_err() {
+        admission.reconcile();
+        return Ok(Json(fixed_outcome));
+    }
+    match history {
+        DurableActionHistoryDisposition::Fresh => {
+            admission.mark_durable_start_possible();
+            let outcome = record_raw_credential_action_denial(
+                &slot,
+                action_id,
+                match endpoint_source {
+                    DaemonActionEndpointSource::Direct => RawCredentialIngressSource::Direct,
+                    DaemonActionEndpointSource::Physical => RawCredentialIngressSource::Physical,
+                },
+            )?;
+            slot.updated_at = OffsetDateTime::now_utc();
+            admission.complete_without_gateway();
+            Ok(Json(outcome))
+        }
+        DurableActionHistoryDisposition::ReconciliationRequired => {
+            admission.reconcile();
+            Ok(Json(fixed_outcome))
+        }
+        DurableActionHistoryDisposition::Complete { .. }
+        | DurableActionHistoryDisposition::PendingApproval { .. } => {
+            slot.updated_at = OffsetDateTime::now_utc();
+            admission.complete_without_gateway();
+            Ok(Json(fixed_outcome))
+        }
+    }
 }
 
 fn record_raw_credential_action_denial(
@@ -5985,9 +6747,8 @@ fn record_raw_credential_action_denial(
         },
     )?;
     let recorded_outcome = match source {
-        RawCredentialIngressSource::Direct { causal_trace_id } => serde_json::json!({
+        RawCredentialIngressSource::Direct => serde_json::json!({
             "source": "daemon.action",
-            "causal_trace_id": causal_trace_id,
             "action_outcome": &outcome,
         }),
         RawCredentialIngressSource::Physical => serde_json::json!({
@@ -6112,7 +6873,7 @@ fn update_status_for_approval_denial(slot: &mut RunSlot, outcome: &ActionOutcome
         "denied" | "revoked" | "schema_unsupported" => Some(RunStatus::Denied),
         _ => None,
     };
-    if let Some(next) = next {
+    if let Some(next) = next.filter(|_| !run_status_is_terminal(&slot.status)) {
         transition_run_status(slot, next);
     }
 }
@@ -7146,6 +7907,51 @@ mod tests {
             initial_state: None,
             snapshot_interval: None,
         }
+    }
+
+    fn unit_effect_admission_guard() -> Arc<RunEffectAdmissionGuard> {
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let request = unit_create_run_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            Some(run_id.clone()),
+            "wo_effect_admission_guard",
+            "req_effect_admission_guard",
+            "idem_effect_admission_guard",
+        );
+        let mut keyring = WorkOrderKeyring::new();
+        keyring
+            .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
+            .expect("unit work-order key");
+        let validated = splendor_types::validate_work_order(
+            &request.work_order,
+            &WorkOrderValidationContext {
+                tenant_id,
+                agent_id,
+                run_id: Some(run_id.clone()),
+                expected_placement_target: None,
+                now: OffsetDateTime::now_utc(),
+            },
+            &keyring,
+        )
+        .expect("validated unit work order");
+        let authority = RunAuthorityHandle::admit_signed_work_order_compatibility(
+            &validated,
+            run_id.clone(),
+            format!("splendor.daemon.run:{run_id}"),
+        )
+        .expect("unit run authority");
+        Arc::new(RunEffectAdmissionGuard::new(authority))
+    }
+
+    fn poison_effect_admission(guard: &Arc<RunEffectAdmissionGuard>) {
+        let guard = Arc::clone(guard);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _admission = guard.admission.lock().expect("effect admission lock");
+            panic!("poison effect admission lock");
+        }));
     }
 
     fn physical_request(
@@ -8548,6 +9354,7 @@ mod tests {
         .expect("unit run authority");
         let bound_work_order_payload_digest =
             bound_work_order_payload_digest(&work_order, &run_id).expect("bound work-order digest");
+        let effect_admission = Arc::new(RunEffectAdmissionGuard::new(run_authority.clone()));
         let slot = RunSlot {
             run_id,
             tenant_id: tenant_id.clone(),
@@ -8558,6 +9365,7 @@ mod tests {
             trace_store: Arc::new(InMemoryTraceStore::default()),
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
             run_authority,
+            effect_admission,
             work_order_id: work_order.work_order_id.clone(),
             work_order_envelope: request.work_order.clone(),
             bound_work_order_payload_digest,
@@ -8567,6 +9375,7 @@ mod tests {
             ),
             authority_obligation_receipt_verifier: None,
             action_profiles: Vec::new(),
+            reserved_policy_action_ids: HashSet::new(),
             approval_policies: Vec::new(),
             tenant_registry: TenantRegistry::new(),
             circuit_breakers: SharedCircuitBreakerEvaluator::default(),
@@ -8601,6 +9410,206 @@ mod tests {
         .expect_err("empty scheduler cannot record agent event");
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.body.code, "trace_error");
+    }
+
+    #[test]
+    fn prestart_drop_reopens_but_gateway_error_after_start_closes_admission() {
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let request = unit_create_run_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            Some(run_id.clone()),
+            "wo_effect_admission_unit",
+            "req_effect_admission_unit",
+            "idem_effect_admission_unit",
+        );
+        let mut keyring = WorkOrderKeyring::new();
+        keyring
+            .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
+            .expect("unit work-order key");
+        let validated = splendor_types::validate_work_order(
+            &request.work_order,
+            &WorkOrderValidationContext {
+                tenant_id,
+                agent_id,
+                run_id: Some(run_id.clone()),
+                expected_placement_target: None,
+                now: OffsetDateTime::now_utc(),
+            },
+            &keyring,
+        )
+        .expect("validated unit work order");
+        let authority = RunAuthorityHandle::admit_signed_work_order_compatibility(
+            &validated,
+            run_id.clone(),
+            format!("splendor.daemon.run:{run_id}"),
+        )
+        .expect("unit run authority");
+        let guard = Arc::new(RunEffectAdmissionGuard::new(authority));
+
+        drop(
+            guard
+                .reserve(ActionId::new(), DaemonActionEndpointSource::Direct)
+                .expect("prestart reservation"),
+        );
+        guard.ensure_open().expect("prestart drop reopens");
+
+        let mut reservation = guard
+            .reserve(ActionId::new(), DaemonActionEndpointSource::Direct)
+            .expect("durable-start reservation");
+        let concurrent = match guard.reserve(ActionId::new(), DaemonActionEndpointSource::Physical)
+        {
+            Ok(_) => panic!("live admission must reject a concurrent action"),
+            Err(error) => error,
+        };
+        assert_eq!(concurrent.body.code, "action_in_progress");
+        assert_eq!(concurrent.body.details["retryable"], true);
+        reservation.mark_durable_start_possible();
+        reservation.enter_gateway().finish_error();
+        let error = guard
+            .ensure_open()
+            .expect_err("Gateway error closes admission");
+        assert_eq!(error.body.code, "tick_reconciliation_required");
+        let reserve_error = match guard.reserve(ActionId::new(), DaemonActionEndpointSource::Direct)
+        {
+            Ok(_) => panic!("closed admission cannot be reserved"),
+            Err(error) => error,
+        };
+        assert_eq!(reserve_error.body.code, "tick_reconciliation_required");
+    }
+
+    #[test]
+    fn effect_admission_contention_overflow_and_token_mismatch_fail_closed() {
+        let guard = unit_effect_admission_guard();
+        let reservation = guard
+            .reserve(ActionId::new(), DaemonActionEndpointSource::Direct)
+            .expect("initial reservation");
+        assert!(guard
+            .try_reserve_suppressed(ActionId::new(), DaemonActionEndpointSource::Physical)
+            .is_none());
+        drop(reservation);
+        guard.ensure_open().expect("prestart release reopens");
+
+        {
+            let mut admission = guard.admission.lock().expect("effect admission lock");
+            admission.next_nonce = u64::MAX;
+        }
+        assert!(guard
+            .try_reserve_suppressed(ActionId::new(), DaemonActionEndpointSource::Direct)
+            .is_none());
+        assert_eq!(
+            guard
+                .ensure_open()
+                .expect_err("suppressed nonce overflow closes admission")
+                .body
+                .code,
+            "tick_reconciliation_required"
+        );
+
+        let guard = unit_effect_admission_guard();
+        {
+            let mut admission = guard.admission.lock().expect("effect admission lock");
+            admission.next_nonce = u64::MAX;
+        }
+        let overflow = match guard.reserve(ActionId::new(), DaemonActionEndpointSource::Direct) {
+            Ok(_) => panic!("ordinary nonce overflow must close admission"),
+            Err(error) => error,
+        };
+        assert_eq!(overflow.body.code, "tick_reconciliation_required");
+
+        let guard = unit_effect_admission_guard();
+        let reservation = guard
+            .reserve(ActionId::new(), DaemonActionEndpointSource::Direct)
+            .expect("mismatch reservation");
+        let mismatched_key = EffectAdmissionKey {
+            nonce: reservation.key.nonce + 1,
+            action_id: reservation.key.action_id.clone(),
+            endpoint_source: reservation.key.endpoint_source,
+        };
+        assert_eq!(
+            guard
+                .revalidate(&mismatched_key)
+                .expect_err("mismatched token closes admission")
+                .body
+                .code,
+            "tick_reconciliation_required"
+        );
+        drop(reservation);
+        assert_eq!(
+            guard
+                .ensure_open()
+                .expect_err("mismatched release remains closed")
+                .body
+                .code,
+            "tick_reconciliation_required"
+        );
+
+        let guard = unit_effect_admission_guard();
+        let gateway_admission = guard
+            .reserve(ActionId::new(), DaemonActionEndpointSource::Direct)
+            .expect("gateway reservation")
+            .enter_gateway();
+        drop(gateway_admission);
+        assert_eq!(
+            guard
+                .ensure_open()
+                .expect_err("abandoned gateway token closes admission")
+                .body
+                .code,
+            "tick_reconciliation_required"
+        );
+    }
+
+    #[test]
+    fn poisoned_effect_admission_mutex_closes_every_entry_point() {
+        let key = || EffectAdmissionKey {
+            nonce: 1,
+            action_id: ActionId::new(),
+            endpoint_source: DaemonActionEndpointSource::Direct,
+        };
+
+        let guard = unit_effect_admission_guard();
+        poison_effect_admission(&guard);
+        let poisoned_reserve =
+            match guard.reserve(ActionId::new(), DaemonActionEndpointSource::Direct) {
+                Ok(_) => panic!("poisoned reserve must fail closed"),
+                Err(error) => error,
+            };
+        assert_eq!(poisoned_reserve.body.code, "tick_reconciliation_required");
+
+        let guard = unit_effect_admission_guard();
+        poison_effect_admission(&guard);
+        assert!(guard
+            .try_reserve_suppressed(ActionId::new(), DaemonActionEndpointSource::Direct)
+            .is_none());
+
+        let guard = unit_effect_admission_guard();
+        poison_effect_admission(&guard);
+        assert_eq!(
+            guard
+                .ensure_open()
+                .expect_err("poisoned lifecycle admission fails closed")
+                .body
+                .code,
+            "tick_reconciliation_required"
+        );
+
+        let guard = unit_effect_admission_guard();
+        poison_effect_admission(&guard);
+        assert_eq!(
+            guard
+                .revalidate(&key())
+                .expect_err("poisoned token validation fails closed")
+                .body
+                .code,
+            "tick_reconciliation_required"
+        );
+
+        let guard = unit_effect_admission_guard();
+        poison_effect_admission(&guard);
+        guard.release(&key());
     }
 
     #[test]
@@ -9739,67 +10748,6 @@ mod tests {
         );
         assert_non_tick_action_trace(&state, &run_id, &denied_action_id);
 
-        let failed_request = physical_request(
-            run_id.clone(),
-            tenant_id.clone(),
-            agent_id.clone(),
-            "move_to_waypoint",
-            safe_context(),
-        );
-        fail_next.store(true, Ordering::SeqCst);
-        let failed_action_id = failed_request
-            .action_request
-            .action_id
-            .clone()
-            .expect("failed physical action id");
-        let failed = submit_physical_action(
-            Path(node_id.clone()),
-            State(state.clone()),
-            Json(failed_request),
-        )
-        .await
-        .expect("physical adapter failure returns an outcome")
-        .0;
-        assert_eq!(failed.status, ActionStatus::Failed, "{failed:?}");
-        assert_non_tick_action_trace(&state, &run_id, &failed_action_id);
-        {
-            let run = state.run_slot(&run_id).expect("run");
-            let slot = run.lock().expect("run");
-            let failed_events = slot
-                .trace_store
-                .read(&run_id.to_string())
-                .expect("physical failure trace records")
-                .into_iter()
-                .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
-                .filter(|event| event.identity.action_id.as_ref() == Some(&failed_action_id))
-                .collect::<Vec<_>>();
-            assert!(!failed_events
-                .iter()
-                .any(|event| matches!(event.kind, TraceEventKind::ActionDenied { .. })));
-            let failed_trace = failed_events
-                .iter()
-                .find_map(|event| match &event.kind {
-                    TraceEventKind::ActionFailed { error, result, .. } => Some((error, result)),
-                    _ => None,
-                })
-                .expect("physical failure is traced as action.failed");
-            assert_eq!(
-                failed_trace.0,
-                failed.error.as_ref().expect("adapter error")
-            );
-            assert!(failed.verification.allowed);
-            let post = failed
-                .post_verification
-                .as_ref()
-                .expect("adapter effect facts");
-            assert_eq!(failed_trace.1, post);
-            assert!(!post.allowed);
-            assert_eq!(post.artifacts["adapter_entered"], true);
-            assert_eq!(post.artifacts["effect_certainty"], "uncertain");
-            assert_eq!(post.artifacts["retry_class"], "not_retryable");
-            assert_eq!(post.artifacts["reconciliation_required"], true);
-        }
-
         let executions_before_replay = unit_adapter_execution_count(&state, &run_id);
         let replay = replay_run(
             Path(run_id.clone()),
@@ -9824,11 +10772,21 @@ mod tests {
 
         let mut low_battery = safe_context();
         low_battery.battery_percent = Some(0.10);
+        let intervention_run_id = RunId::new();
+        create_unit_run(
+            &state,
+            tenant_id.clone(),
+            agent_id.clone(),
+            intervention_run_id.clone(),
+            10,
+            None,
+        )
+        .await;
         let intervention = submit_physical_action(
             Path(node_id.clone()),
             State(state.clone()),
             Json(physical_request(
-                run_id.clone(),
+                intervention_run_id.clone(),
                 tenant_id.clone(),
                 agent_id.clone(),
                 "move_to_waypoint",
@@ -9846,6 +10804,15 @@ mod tests {
         assert_eq!(
             intervention.verification.artifacts["source"].as_str(),
             Some("safety_verifier")
+        );
+        assert_eq!(
+            state
+                .run_slot(&intervention_run_id)
+                .expect("intervention run")
+                .lock()
+                .expect("intervention run")
+                .status,
+            RunStatus::Failed
         );
 
         let mut stale_policy = safe_context();
@@ -9914,6 +10881,67 @@ mod tests {
             "physical_action_not_profile_allowed"
         );
 
+        let failed_request = physical_request(
+            run_id.clone(),
+            tenant_id.clone(),
+            agent_id.clone(),
+            "move_to_waypoint",
+            safe_context(),
+        );
+        fail_next.store(true, Ordering::SeqCst);
+        let failed_action_id = failed_request
+            .action_request
+            .action_id
+            .clone()
+            .expect("failed physical action id");
+        let failed = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(failed_request),
+        )
+        .await
+        .expect("physical adapter failure returns an outcome")
+        .0;
+        assert_eq!(failed.status, ActionStatus::Failed, "{failed:?}");
+        assert_non_tick_action_trace(&state, &run_id, &failed_action_id);
+        {
+            let run = state.run_slot(&run_id).expect("run");
+            let slot = run.lock().expect("run");
+            let failed_events = slot
+                .trace_store
+                .read(&run_id.to_string())
+                .expect("physical failure trace records")
+                .into_iter()
+                .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+                .filter(|event| event.identity.action_id.as_ref() == Some(&failed_action_id))
+                .collect::<Vec<_>>();
+            assert!(!failed_events
+                .iter()
+                .any(|event| matches!(event.kind, TraceEventKind::ActionDenied { .. })));
+            let failed_trace = failed_events
+                .iter()
+                .find_map(|event| match &event.kind {
+                    TraceEventKind::ActionFailed { error, result, .. } => Some((error, result)),
+                    _ => None,
+                })
+                .expect("physical failure is traced as action.failed");
+            assert_eq!(
+                failed_trace.0,
+                failed.error.as_ref().expect("adapter error")
+            );
+            assert!(failed.verification.allowed);
+            let post = failed
+                .post_verification
+                .as_ref()
+                .expect("adapter effect facts");
+            assert_eq!(failed_trace.1, post);
+            assert!(!post.allowed);
+            assert_eq!(post.artifacts["adapter_entered"], true);
+            assert_eq!(post.artifacts["effect_certainty"], "uncertain");
+            assert_eq!(post.artifacts["retry_class"], "not_retryable");
+            assert_eq!(post.artifacts["reconciliation_required"], true);
+        }
+
         let mut wrong_tenant = physical_request(
             run_id,
             TenantId::new(),
@@ -9934,17 +10962,7 @@ mod tests {
         let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
-        let run_id = RunId::new();
         let node_id = NodeId::new();
-        create_unit_run(
-            &state,
-            tenant_id.clone(),
-            agent_id.clone(),
-            run_id.clone(),
-            100,
-            None,
-        )
-        .await;
 
         let forged_safe_context = SafetyContext {
             allowed_zone_refs: vec!["zone_a".to_string()],
@@ -10005,6 +11023,16 @@ mod tests {
         unsafe_profiles.push(("cloud_authority", cloud_authority));
 
         for (scenario, profile) in &unsafe_profiles {
+            let run_id = RunId::new();
+            create_unit_run(
+                &state,
+                tenant_id.clone(),
+                agent_id.clone(),
+                run_id.clone(),
+                10,
+                None,
+            )
+            .await;
             state
                 .inner
                 .device_profiles
@@ -10034,41 +11062,46 @@ mod tests {
                 physical_safety_artifact(&outcome).is_some(),
                 "missing safety evidence for scenario={scenario}: {outcome:?}"
             );
-        }
-        assert_eq!(unit_adapter_execution_count(&state, &run_id), 0);
+            assert_eq!(unit_adapter_execution_count(&state, &run_id), 0);
 
-        let run = state.run_slot(&run_id).expect("run");
-        let slot = run.lock().expect("run");
-        let safety_events = slot
-            .trace_store
-            .read(&run_id.to_string())
-            .expect("trace")
-            .into_iter()
-            .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
-            .filter_map(|event| match event.kind {
-                TraceEventKind::DaemonAudit { endpoint, .. }
-                    if endpoint == "safety.verification.completed"
-                        || endpoint == "safety.verification.denied" =>
-                {
-                    Some(endpoint)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            safety_events
-                .iter()
-                .filter(|event| event.as_str() == "safety.verification.completed")
-                .count(),
-            unsafe_profiles.len()
-        );
-        assert_eq!(
-            safety_events
-                .iter()
-                .filter(|event| event.as_str() == "safety.verification.denied")
-                .count(),
-            unsafe_profiles.len()
-        );
+            let run = state.run_slot(&run_id).expect("run");
+            let slot = run.lock().expect("run");
+            if outcome.status == ActionStatus::NeedsIntervention {
+                assert_eq!(slot.status, RunStatus::Failed, "scenario={scenario}");
+            }
+            let safety_events = slot
+                .trace_store
+                .read(&run_id.to_string())
+                .expect("trace")
+                .into_iter()
+                .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+                .filter_map(|event| match event.kind {
+                    TraceEventKind::DaemonAudit { endpoint, .. }
+                        if endpoint == "safety.verification.completed"
+                            || endpoint == "safety.verification.denied" =>
+                    {
+                        Some(endpoint)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                safety_events
+                    .iter()
+                    .filter(|event| event.as_str() == "safety.verification.completed")
+                    .count(),
+                1,
+                "scenario={scenario}"
+            );
+            assert_eq!(
+                safety_events
+                    .iter()
+                    .filter(|event| event.as_str() == "safety.verification.denied")
+                    .count(),
+                1,
+                "scenario={scenario}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11031,6 +12064,31 @@ mod tests {
         let run_id = RunId::new();
         let node_id = NodeId::new();
 
+        let unknown_run = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect_err("unknown run denied before device disposition");
+        assert_eq!(unknown_run.status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown_run.body.code, "invalid_run");
+
+        create_unit_run(
+            &state,
+            tenant_id.clone(),
+            agent_id.clone(),
+            run_id.clone(),
+            10,
+            None,
+        )
+        .await;
         let unregistered = submit_physical_action(
             Path(node_id.clone()),
             State(state.clone()),
@@ -11043,19 +12101,10 @@ mod tests {
             )),
         )
         .await
-        .expect_err("unregistered device denied");
+        .expect_err("unregistered device denied for an existing run");
         assert_eq!(unregistered.status, StatusCode::NOT_FOUND);
         assert_eq!(unregistered.body.code, "device_not_registered");
 
-        create_unit_run(
-            &state,
-            tenant_id.clone(),
-            agent_id.clone(),
-            run_id.clone(),
-            10,
-            None,
-        )
-        .await;
         let _ = register_device_profile(
             State(state.clone()),
             Json(RegisterDeviceProfileRequest {

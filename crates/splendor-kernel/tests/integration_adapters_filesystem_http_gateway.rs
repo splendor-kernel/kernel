@@ -2,8 +2,8 @@ use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig};
 use splendor_gateway::{
     raw_credential_denied_action, ActionAdapter, ActionGateway, ActionId, ActionRequest,
-    ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
-    RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
+    ActionStatus, AdapterError, AdapterResult, TrustedActionProfile, VerifiedActionGateway,
+    RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentId, AgentRuntimeConfig, LoopEngine, LoopError, Perceptor,
@@ -727,6 +727,116 @@ fn filesystem_adapter_harness_preserves_opaque_binary_read_output() {
         serde_json::json!([0, 1, 255])
     );
     assert_action_executed_trace(&run, 0, "read_file");
+}
+
+#[test]
+fn verified_gateway_owner_profile_round_trips_real_opaque_filesystem_bytes() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let registry = build_registry(
+        &tenant_id,
+        &["write_file".to_string(), "read_file".to_string()],
+        &["filesystem".to_string()],
+    );
+    registry.begin_tick(TICK_ID, OffsetDateTime::now_utc());
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry));
+    gateway.register_adapter("write_file", "filesystem", filesystem.clone());
+    gateway.register_adapter("read_file", "filesystem", filesystem.clone());
+    gateway
+        .set_trusted_action_profiles(vec![
+            TrustedActionProfile {
+                action_name: "write_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+            TrustedActionProfile {
+                action_name: "read_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+        ])
+        .expect("trusted filesystem profiles");
+
+    let request = |action: Action| ActionRequest {
+        action_id: ActionId::new(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        tick_id: Some(TICK_ID.into()),
+        action,
+        adapter: None,
+        quota_usage: QuotaUsage::single_action(),
+        satisfied_preconditions: Vec::new(),
+        requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
+        approval_evidence: None,
+        authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let bytes = vec![0, 65, 255];
+    let write = gateway
+        .submit(request(action(
+            "write_file",
+            serde_json::json!({"path": "opaque.bin", "bytes": bytes}),
+            SideEffectClass::Filesystem,
+        )))
+        .expect("write outcome");
+    assert_eq!(write.status, ActionStatus::Executed, "{write:?}");
+
+    let read = gateway
+        .submit(request(action(
+            "read_file",
+            serde_json::json!({"path": "opaque.bin"}),
+            SideEffectClass::Filesystem,
+        )))
+        .expect("read outcome");
+    assert_eq!(read.status, ActionStatus::Executed, "{read:?}");
+    assert_eq!(
+        read.output.as_ref().expect("read output")["bytes"],
+        serde_json::json!([0, 65, 255])
+    );
+    assert_eq!(filesystem.executions(), 2);
+}
+
+#[test]
+fn loop_engine_without_owner_profile_keeps_opaque_filesystem_bytes_strict() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = FilesystemAdapter::new(FilesystemAdapterConfig {
+        base_dir: temp.path().to_path_buf(),
+        ..FilesystemAdapterConfig::default()
+    });
+    let counting = Arc::new(CountingAdapter::new(filesystem));
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "filesystem-opaque-strict",
+        vec![HarnessRegistration::new(
+            "write_file",
+            "filesystem",
+            counting.clone(),
+        )],
+        vec![action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        )],
+    ));
+
+    assert_action_status(&run, 0, ActionStatus::Denied);
+    assert_eq!(
+        run.outcome.action_outcomes[0].error.as_deref(),
+        Some(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(counting.executions(), 0);
 }
 
 #[test]

@@ -1,16 +1,23 @@
+use splendor_evidence::{
+    inspect_durable_action_history, open_trace_reader, resume_trace,
+    DurableActionHistoryDisposition, DurableActionHistorySource,
+};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway,
 };
 use splendor_kernel::{
-    ActionCandidate, AgentContext, AgentRuntimeConfig, LoopEngine, Perceptor, Policy,
-    PolicyDecision, QuotaPolicy, RunId, Scheduler, SchedulerConfig, SideEffectClass,
-    SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry, TraceEvent,
-    TraceEventKind,
+    ActionCandidate, AgentContext, AgentRuntimeConfig, LoopEngine, LoopError, Perceptor, Policy,
+    PolicyDecision, QuotaPolicy, RunId, Scheduler, SchedulerConfig, SchedulerError,
+    SideEffectClass, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
+    TraceEvent, TraceEventKind,
 };
-use splendor_store::{InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceStore};
+use splendor_store::{
+    InMemoryStateStore, InMemoryTraceStore, RuntimeTraceLimits, StateData, StateStore, TraceStore,
+};
 use splendor_types::{
     Action, DeterministicIdFactory, FixedClock, Percept, PerceptProvenance, TenantId,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
@@ -71,6 +78,27 @@ impl Policy for IncrementPolicy {
             content_type: None,
         };
         Ok(PolicyDecision::new(vec![candidate], next_state, None))
+    }
+}
+
+struct FailOnceIncrementPolicy {
+    action_name: String,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Policy for FailOnceIncrementPolicy {
+    fn name(&self) -> &str {
+        "fail-once-increment-policy"
+    }
+
+    fn decide(&self, state: &StateData, percepts: &[Percept]) -> Result<PolicyDecision, LoopError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(LoopError::Policy("failed-before-action-start".to_string()));
+        }
+        IncrementPolicy {
+            action_name: self.action_name.clone(),
+        }
+        .decide(state, percepts)
     }
 }
 
@@ -412,6 +440,105 @@ fn scheduler_resumes_from_trace_store_and_continues_state() {
         last_snapshot_bytes(trace_store.as_ref(), state_store.as_ref(), &run_id),
         vec![2]
     );
+}
+
+#[test]
+fn scheduler_pre_action_failure_is_safely_superseded_in_durable_evidence() {
+    let ids = fixture_ids();
+    let tenant_id = ids
+        .tenant_id("pre-action-supersession-tenant")
+        .expect("tenant");
+    let agent_id = ids
+        .agent_id("pre-action-supersession-agent")
+        .expect("agent");
+    let run_id = ids.run_id("pre-action-supersession-run").expect("run");
+    let actions = ["recover"];
+    let registry = build_registry(&tenant_id, &actions);
+    let gateway = build_gateway(&registry, &actions);
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let graph = StateGraph::new(
+        state_store,
+        SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        },
+    );
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let agent = AgentContext::new(
+        agent_id.clone(),
+        tenant_id.clone(),
+        AgentRuntimeConfig::default(),
+    );
+    let mut engine = LoopEngine::with_trace_store(
+        agent,
+        graph,
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(FailOnceIncrementPolicy {
+            action_name: "recover".to_string(),
+            calls: Arc::clone(&policy_calls),
+        }),
+        gateway,
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.add_perceptor(StaticPerceptor::new(fixture_time()));
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+    scheduler.add_agent(engine);
+
+    assert!(matches!(
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+            if reason == "failed-before-action-start"
+    ));
+    let recovered = scheduler
+        .run_once()
+        .expect("scheduler requeues an ordinary pre-action failure");
+    assert_eq!(recovered.tick_id, 2);
+    assert_eq!(recovered.outcome.action_outcomes.len(), 1);
+    assert_eq!(
+        recovered.outcome.action_outcomes[0].status,
+        ActionStatus::Executed
+    );
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
+    let action_id = recovered.outcome.action_outcomes[0].action_id.clone();
+
+    let events = read_events(trace_store.as_ref(), &run_id);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::LoopTickStarted { tick_id: 1 })));
+    assert!(!events.iter().any(|event| {
+        event.identity.tick_id.as_ref().map(|tick| tick.get()) == Some(1)
+            && matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+    }));
+    assert!(events.iter().any(|event| matches!(
+        event.kind,
+        TraceEventKind::LoopTickCompleted { tick_id: 2, .. }
+    )));
+
+    let reader = open_trace_reader(trace_store.as_ref(), &run_id, RuntimeTraceLimits::default())
+        .expect("durable evidence reader");
+    assert_eq!(
+        inspect_durable_action_history(
+            reader.as_ref(),
+            &run_id,
+            &tenant_id,
+            &agent_id,
+            &action_id,
+        )
+        .expect("completed second-tick action history"),
+        DurableActionHistoryDisposition::Complete {
+            source: DurableActionHistorySource::Tick,
+        },
+    );
+    let resumed = resume_trace(reader.as_ref(), &run_id, &tenant_id, &agent_id)
+        .expect("second tick remains resumable");
+    assert_eq!(resumed.tick_id, 2);
+    assert_eq!(resumed.max_tick_id, 2);
 }
 
 #[test]

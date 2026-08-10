@@ -147,6 +147,13 @@ Read traces with explicit redaction policy:
 GET /runs/{run_id}/traces?redaction_policy=none
 ```
 
+Use `start` and `end` independently for half-open sequence ranges. For example,
+`?redaction_policy=none&start=10` reads from sequence 10 onward,
+`&end=10` reads sequences before 10, and `&start=10&end=10` returns an empty
+projection. Reversed bounds are rejected. Each selected redacted range starts a
+new projection-local hash chain, while validation still covers the complete
+trusted source history.
+
 Start inspect-only replay:
 
 ```http
@@ -166,10 +173,83 @@ Trace responses are ordered records. Replay validates run scope and sequence con
   request/idempotency keys; ephemeral JTI digests are not part of that scope.
 - Missing endpoint scope fails closed.
 - Unsigned, expired, revoked, or incompatible work orders reject run create/resume.
-- `waiting_for_approval` progresses only through an exact receipt-bearing
-  `/actions` retry. Lifecycle resume with raw evidence, receipts, or no approval
-  material returns a stable `409` migration code before a tick runs.
+- `waiting_for_approval` progresses only through an exact receipt-bearing retry
+  at the endpoint class that created the challenge. Tick/direct challenges use
+  `/actions`; physical challenges use the original
+  `/devices/{node_id}/actions`. Lifecycle resume with raw evidence, receipts, or
+  no approval material returns a stable `409` migration code before a tick runs.
 - `/actions` rejects caller-supplied bypass states and always routes side effects through the gateway.
+- Treat every explicit `action_id` configured in static `policy_actions` as
+  reserved for scheduler ticks. Credential-free direct and physical requests
+  using a reserved ID receive non-retryable
+  `action_id_conflict` before audit, history lookup, device lookup, Gateway, or
+  adapter work. The request does not consume the reservation: the next tick may
+  execute the action, and later fully completed ticks may reuse the same exact
+  static ID/action. The exact direct continuation of a tick-origin pending
+  approval remains available and is still checked by Evidence and Authority.
+- Treat a caller-supplied `action_id` as consumed after a complete direct/physical
+  action episode. Any completed reuse—including the same body, changed metadata,
+  another endpoint source, or another physical node path—returns the uniform
+  non-retryable `action_id_conflict`; the daemon does not return the stored action
+  outcome. Only the exact pending-approval receipt-bearing continuation through
+  that challenge's original endpoint may advance the same ID. A direct/physical
+  endpoint mismatch conflicts before a new action episode or receipt claim;
+  cross-node physical continuation fails exact challenge binding. The original
+  endpoint can still claim the receipt once. Incomplete evidence returns
+  `tick_reconciliation_required`. Omit `action_id` only when a genuinely fresh
+  attempt is intended. Original-response replay and provider/global/distributed/
+  restart exactly-once execution are not implemented. Never convert
+  `action_id_conflict` into an automatic fresh-ID retry after a lost response;
+  inspect trace evidence and reconcile the provider/operator boundary first.
+  Kernel ticks are distinct: the same stable ID and exact action may be evaluated
+  again only on a strictly later, fully completed tick after any tick-origin
+  approval continuation closes. That does not make the ID reusable through a
+  direct or physical endpoint.
+- Raw-credential guards run before durable duplicate disposition. A
+  credential-bearing retry receives only the fixed denial and cannot retrieve a
+  prior successful output; the rejected body, causal reference, approval material,
+  and physical envelope are not persisted. While a run is
+  `waiting_for_approval`, paused, interrupted, resuming, or terminal, the fixed
+  denial is returned without durable-history reads or audit/action trace appends;
+  repeated rejected requests do not amplify the trace. A raw request using a
+  static-policy-reserved ID follows the same no-history/no-audit path and does not
+  consume the ID. Active `pending`/`running` requests with nonreserved IDs retain
+  the bounded fixed suppression episode behavior.
+- Direct and run-bound physical actions reserve one private per-run effect
+  admission before durable lookup and Gateway entry. A live competing action or
+  lifecycle request returns retryable `action_in_progress` without closing run
+  authority. Evidence owns strict action/outcome/source/effect-certainty history
+  interpretation; daemon handlers consume only its bounded disposition and live
+  pending-authority state. Durable history validation runs outside the run mutex and is bounded
+  by the runtime trace reader defaults (100,000 records / 64 MiB); cold lookup is
+  still O(n) within those bounds. If the trace grows during validation, the daemon
+  retries three fresh readers. `action_history_changed` after exhaustion and
+  `action_history_unavailable` on pre-start Store failure from either `/actions`
+  or `/devices/{node_id}/actions` are retryable and release
+  admission; neither means reconciliation. Clean pre-Gateway failures release admission. Every Gateway
+  outcome, including no-effect denial/approval/intervention, retains it until all
+  required terminal, outcome, approval/status, and physical offline records are
+  durable and status is updated. Approval-resume and physical offline records are
+  written before the final durable `OutcomeRecorded` completion barrier.
+- If any required outcome suffix append fails, treat the first `trace_error` as
+  fail-closed even when the adapter was not entered. Same-process direct/physical
+  attempts fail before the adapter with `tick_reconciliation_required` while the
+  run remains effect-capable. Lifecycle ticks consult the same private guard, and
+  the shared run authority closes so scheduler actions cannot bypass it. A durably
+  recorded reconciliation-required outcome (including credential-output
+  suppression) fails the run, and later attempts remain
+  `tick_reconciliation_required`. An ordinary fully durable denial releases admission
+  only when run status still permits later effects. A fully durable
+  `NeedsApproval` outcome leaves status `waiting_for_approval`; a fully durable
+  `NeedsIntervention` outcome leaves status `failed`.
+- Pause is linearized through the same effect-admission guard. Action-first means
+  pause returns retryable `action_in_progress`; pause-first publishes `paused`
+  and later direct/physical actions return `run_not_effect_capable` before
+  Gateway/adapter entry. Do not interpret pause as cancellation of an already
+  admitted action or as authority to overwrite its approval/intervention status.
+- Export `integrity_hash` describes only the selected returned redacted records:
+  `trace-chain:v1:<returned_count>:<returned_projection_tail>`. It is not a
+  trusted source-chain hash, including for ranged exports.
 - Trace reads require visibility and redaction policy.
 - Manager dispatch requires immutable work-order/placement/node/instance
   binding and exactly one healthy compatible resident. A post-send start reset,

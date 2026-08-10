@@ -413,6 +413,24 @@ def main() -> int:
         if marker not in import_block:
             failures.append(f"resident state import fail-closed contract missing marker: {marker}")
 
+    for op_id in ("submitAction", "submitPhysicalAction"):
+        block = blocks.get(op_id, "")
+        for marker in ("'503':", "#/components/responses/ActionHistoryUnavailable"):
+            if marker not in block:
+                failures.append(
+                    f"{op_id} action-history unavailability contract missing marker: {marker}"
+                )
+    action_history_response = schema_block(text, "ActionHistoryUnavailable")
+    for marker in (
+        "action_history_unavailable",
+        "details.retryable=true",
+        "does not enter the Gateway or adapter",
+    ):
+        if marker not in action_history_response:
+            failures.append(
+                f"ActionHistoryUnavailable response missing marker: {marker}"
+            )
+
     schema_failures: list[str] = []
     schema_failures.extend(
         require_schema_fields(

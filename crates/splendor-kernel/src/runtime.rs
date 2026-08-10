@@ -64,6 +64,9 @@ pub struct KernelRuntime {
     /// Base identity context embedded into each trace event.
     identity: TraceIdentityContext,
     /// Monotonic sequence and integrity state for successfully persisted events.
+    ///
+    /// When runtime locks must be combined, the order is this cursor, then the
+    /// writer lifecycle, then the writer-session operation lock.
     trace_cursor: Mutex<TraceCursor>,
     /// Trace sink used to emit serialized events.
     trace_sink: Arc<dyn TraceSink>,
@@ -271,6 +274,13 @@ impl KernelRuntime {
             .as_ref()
             .ok_or(splendor_evidence::TraceCompatibilityError::Store)?;
         let identity = (tenant_id.clone(), agent_id.clone());
+        // Keep the same cursor -> lifecycle order used by event append. Holding
+        // both guards makes the fresh distinct-agent check and lifecycle insert
+        // atomic with respect to the first tick append.
+        let cursor = self
+            .trace_cursor
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
         let mut lifecycle = self
             .writer_lifecycle
             .state
@@ -280,14 +290,9 @@ impl KernelRuntime {
             return Err(splendor_evidence::TraceCompatibilityError::WriterConflict.into());
         }
         if let Some(session) = lifecycle.session.clone() {
-            let cursor = self
-                .trace_cursor
-                .lock()
-                .map_err(|_| TraceError::IntegrityLock)?;
             if cursor.tick_activity_started || session.revoked.load(Ordering::Acquire) {
                 return Err(splendor_evidence::TraceCompatibilityError::WriterConflict.into());
             }
-            drop(cursor);
             lifecycle.engine_identities.insert(identity.clone());
             return Ok(RuntimeWriterLease {
                 lifecycle: Arc::clone(&self.writer_lifecycle),

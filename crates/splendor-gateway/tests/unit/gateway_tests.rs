@@ -79,6 +79,26 @@ fn sample_action() -> ActionRequest {
     }
 }
 
+fn utf32_bytes(text: &str, little_endian: bool, with_bom: bool) -> Vec<u8> {
+    let mut bytes = if with_bom {
+        if little_endian {
+            vec![0xff, 0xfe, 0x00, 0x00]
+        } else {
+            vec![0x00, 0x00, 0xfe, 0xff]
+        }
+    } else {
+        Vec::new()
+    };
+    bytes.extend(text.chars().flat_map(|character| {
+        if little_endian {
+            (character as u32).to_le_bytes()
+        } else {
+            (character as u32).to_be_bytes()
+        }
+    }));
+    bytes
+}
+
 #[test]
 fn unimplemented_gateway_denies_sync_and_async() {
     let gateway = UnimplementedGateway;
@@ -3722,12 +3742,38 @@ fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
             serde_json::json!(format!("password={CANARY}").into_bytes()),
         ),
         (
+            "numeric_root_utf16",
+            serde_json::json!("Bearer short"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()),
+        ),
+        (
+            "numeric_root_bom",
+            serde_json::json!([vec![0xef, 0xbb, 0xbf], b"Basic dTpw".to_vec()].concat()),
+        ),
+        (
+            "numeric_root_utf32le",
+            serde_json::json!(utf32_bytes("Bearer short", true, false)),
+        ),
+        (
+            "numeric_root_utf32be",
+            serde_json::json!(utf32_bytes("Bearer short", false, false)),
+        ),
+        (
+            "numeric_root_utf32le_bom",
+            serde_json::json!(utf32_bytes("Bearer short", true, true)),
+        ),
+        (
+            "numeric_root_utf32be_bom",
+            serde_json::json!(utf32_bytes("Bearer short", false, true)),
+        ),
+        (
             "numeric_body",
             serde_json::json!({
                 "body": format!("password={CANARY}").into_bytes()
             }),
         ),
-        ("numeric_root_malformed", serde_json::json!([1, 2, 300])),
         (
             "numeric_body_malformed",
             serde_json::json!({"body": [1, null]}),
@@ -3763,8 +3809,16 @@ fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
                 "body": "Bearer x"
                     .encode_utf16()
                     .flat_map(u16::to_le_bytes)
-                    .collect::<Vec<_>>()
+                .collect::<Vec<_>>()
             }),
+        ),
+        (
+            "strict_opaque_control_bytes",
+            serde_json::json!({"bytes": b"ordinary\0\x01bytes"}),
+        ),
+        (
+            "strict_opaque_json_like_bytes",
+            serde_json::json!({"bytes": b"{not-json"}),
         ),
         ("oversized_text", serde_json::json!({"body": oversized})),
     ];
@@ -3884,6 +3938,15 @@ fn benign_json_text_and_opaque_binary_adapter_outputs_remain_compatible() {
     }
 
     for (case, output) in [
+        ("ordinary_root_numeric_json", serde_json::json!([0, 65])),
+        (
+            "ordinary_root_out_of_byte_range_json",
+            serde_json::json!([1, 2, 300]),
+        ),
+        (
+            "ordinary_root_bom_numbers_json",
+            serde_json::json!([0xef, 0xbb, 0xbf, 65]),
+        ),
         (
             "ordinary_json",
             serde_json::json!({"status": "ready", "values": [1, 2, 3]}),
@@ -3926,6 +3989,350 @@ fn benign_json_text_and_opaque_binary_adapter_outputs_remain_compatible() {
         assert_eq!(outcome.status, ActionStatus::Executed, "{case}");
         assert_eq!(outcome.output, Some(output), "{case}");
     }
+}
+
+#[test]
+fn owner_profiled_opaque_filesystem_writes_preserve_ordinary_bytes() {
+    struct RoundTripFilesystemAdapter {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for RoundTripFilesystemAdapter {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl ActionAdapter for RoundTripFilesystemAdapter {
+        fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            match action.action.name.as_str() {
+                "write_file" => {
+                    let bytes = action.action.params["bytes"]
+                        .as_array()
+                        .expect("test write bytes")
+                        .iter()
+                        .map(|value| value.as_u64().expect("test byte") as u8)
+                        .collect::<Vec<_>>();
+                    std::fs::write(&self.path, &bytes)
+                        .map_err(|error| AdapterError::Failed(error.to_string()))?;
+                    Ok(AdapterResult {
+                        output: serde_json::json!({"bytes_written": bytes.len()}),
+                        satisfied_postconditions: Vec::new(),
+                    })
+                }
+                "read_file" => {
+                    let bytes = std::fs::read(&self.path)
+                        .map_err(|error| AdapterError::Failed(error.to_string()))?;
+                    Ok(AdapterResult {
+                        output: serde_json::json!({
+                            "path": self.path.to_string_lossy(),
+                            "bytes": bytes,
+                            "bytes_read": bytes.len(),
+                        }),
+                        satisfied_postconditions: Vec::new(),
+                    })
+                }
+                _ => unreachable!("closed test operation"),
+            }
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "splendor-gateway-opaque-round-trip-{}.bin",
+        ActionId::default()
+    ));
+    let adapter = Arc::new(RoundTripFilesystemAdapter { path: path.clone() });
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("write_file", "filesystem", adapter.clone());
+    gateway.register_adapter("read_file", "filesystem", adapter);
+    gateway
+        .set_trusted_action_profiles(vec![
+            TrustedActionProfile {
+                action_name: "write_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+            TrustedActionProfile {
+                action_name: "read_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+        ])
+        .expect("trusted filesystem profiles");
+
+    for (case, bytes) in [
+        ("empty", Vec::new()),
+        ("binary", vec![0, 65, 255]),
+        ("controls_only", vec![0, 1, 2, 3]),
+        ("utf8_controls", b"ordinary\0\x01bytes".to_vec()),
+        (
+            "utf8_bom_text",
+            [vec![0xef, 0xbb, 0xbf], b"ordinary file".to_vec()].concat(),
+        ),
+        (
+            "utf16le_text",
+            "ordinary file"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        ("utf32be_text", utf32_bytes("ordinary file", false, false)),
+        ("json_like", b"{not-json".to_vec()),
+    ] {
+        let mut write = base_request();
+        write.action.name = "write_file".to_string();
+        write.action.params = serde_json::json!({"path": "opaque.bin", "bytes": bytes.clone()});
+        write.action.side_effect_class = SideEffectClass::Filesystem;
+        write.adapter = Some("filesystem".to_string());
+        let write_outcome = gateway.submit(write).expect("write outcome");
+        assert_eq!(write_outcome.status, ActionStatus::Executed, "{case}");
+        assert_eq!(std::fs::read(&path).expect("written file"), bytes, "{case}");
+
+        if case == "binary" {
+            let mut read = base_request();
+            read.action.name = "read_file".to_string();
+            read.action.params = serde_json::json!({"path": "opaque.bin"});
+            read.action.side_effect_class = SideEffectClass::Filesystem;
+            read.adapter = Some("filesystem".to_string());
+            let read_outcome = gateway.submit(read).expect("read outcome");
+
+            assert_eq!(read_outcome.status, ActionStatus::Executed);
+            assert_eq!(
+                read_outcome.output.expect("read output")["bytes"],
+                serde_json::json!(bytes)
+            );
+        }
+    }
+}
+
+#[test]
+fn public_action_guards_never_infer_opaque_bytes_from_request_routing_metadata() {
+    for adapter in [None, Some("filesystem")] {
+        let mut request = base_request();
+        request.action.name = "write_file".to_string();
+        request.action.params = serde_json::json!({
+            "path": "opaque.bin",
+            "bytes": [0, 65, 255]
+        });
+        request.action.side_effect_class = SideEffectClass::Filesystem;
+        request.adapter = adapter.map(str::to_string);
+
+        assert_eq!(
+            guard_action_request(&request),
+            Err(RawCredentialInputDenied),
+            "caller adapter {adapter:?} must not select opaque scanning"
+        );
+
+        request.action.params = serde_json::json!({
+            "path": "opaque.bin",
+            "bytes": b"Bearer short"
+        });
+        assert_eq!(
+            guard_action_request(&request),
+            Err(RawCredentialInputDenied),
+            "credential bytes must remain denied for caller adapter {adapter:?}"
+        );
+    }
+}
+
+#[test]
+fn verified_gateway_requires_owner_profile_and_matching_registration_for_opaque_bytes() {
+    for (case, registered_adapter, trusted_adapter, requested_adapter) in [
+        ("missing_profile_omitted_route", "filesystem", None, None),
+        (
+            "missing_profile_explicit_route",
+            "filesystem",
+            None,
+            Some("filesystem"),
+        ),
+        (
+            "profile_registration_mismatch",
+            "filesystem",
+            Some("daemon.local"),
+            Some("filesystem"),
+        ),
+        (
+            "caller_spoofed_filesystem_route",
+            "daemon.local",
+            Some("daemon.local"),
+            Some("filesystem"),
+        ),
+    ] {
+        let adapter = Arc::new(CountingAdapter::default());
+        let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        }));
+        gateway.register_adapter("write_file", registered_adapter, adapter.clone());
+        if let Some(trusted_adapter) = trusted_adapter {
+            gateway
+                .set_trusted_action_profiles(vec![TrustedActionProfile {
+                    action_name: "write_file".to_string(),
+                    adapter: trusted_adapter.to_string(),
+                    required_permissions: Vec::new(),
+                }])
+                .expect("trusted profile");
+        }
+
+        let mut request = base_request();
+        request.action.name = "write_file".to_string();
+        request.action.params = serde_json::json!({
+            "path": "opaque.bin",
+            "bytes": [0, 65, 255]
+        });
+        request.action.side_effect_class = SideEffectClass::Filesystem;
+        request.adapter = requested_adapter.map(str::to_string);
+
+        let outcome = gateway.submit(request).expect("opaque denial");
+        assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_INPUT_DENIED),
+            "{case}"
+        );
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0, "{case}");
+    }
+}
+
+#[test]
+fn opaque_filesystem_profile_denies_encoded_credentials_and_ambiguity_before_effect() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("write_file", "filesystem", adapter.clone());
+    gateway
+        .set_trusted_action_profiles(vec![TrustedActionProfile {
+            action_name: "write_file".to_string(),
+            adapter: "filesystem".to_string(),
+            required_permissions: Vec::new(),
+        }])
+        .expect("trusted filesystem profile");
+
+    for (case, bytes) in [
+        ("utf8", b"Bearer short".to_vec()),
+        (
+            "utf16",
+            "Bearer short"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "invalid_utf8_span",
+            [vec![0xff], b"Basic dTpw".to_vec()].concat(),
+        ),
+        ("utf32le", utf32_bytes("Bearer short", true, false)),
+        ("utf32be", utf32_bytes("Bearer short", false, false)),
+        ("utf32le_bom", utf32_bytes("Bearer short", true, true)),
+        ("utf32be_bom", utf32_bytes("Bearer short", false, true)),
+        (
+            "embedded_utf32le_span",
+            [
+                vec![0xff],
+                utf32_bytes("Bearer short", true, false),
+                vec![0xfe],
+            ]
+            .concat(),
+        ),
+        ("ambiguous_zero_lanes", vec![0; 8]),
+        ("truncated_utf32le", {
+            let mut bytes = utf32_bytes("ordinary encoded text", true, false);
+            bytes.pop();
+            bytes
+        }),
+    ] {
+        let mut request = base_request();
+        request.action.name = "write_file".to_string();
+        request.action.params = serde_json::json!({"path": "opaque.bin", "bytes": bytes});
+        request.action.side_effect_class = SideEffectClass::Filesystem;
+        request.adapter = Some("filesystem".to_string());
+        let outcome = gateway.submit(request).expect("credential denial");
+
+        assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_INPUT_DENIED),
+            "{case}"
+        );
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0, "{case}");
+    }
+}
+
+#[test]
+fn opaque_filesystem_profile_does_not_widen_other_routes_or_shapes() {
+    let trusted_profile = TrustedActionProfile {
+        action_name: "write_file".to_string(),
+        adapter: "filesystem".to_string(),
+        required_permissions: Vec::new(),
+    };
+    for (case, action_name, adapter_id, side_effect_class, params) in [
+        (
+            "custom_action",
+            "custom_write",
+            "filesystem",
+            SideEffectClass::Filesystem,
+            serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+        ),
+        (
+            "custom_adapter",
+            "write_file",
+            "custom",
+            SideEffectClass::Filesystem,
+            serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+        ),
+        (
+            "wrong_effect_class",
+            "write_file",
+            "filesystem",
+            SideEffectClass::ReadOnly,
+            serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+        ),
+        (
+            "open_params_shape",
+            "write_file",
+            "filesystem",
+            SideEffectClass::Filesystem,
+            serde_json::json!({
+                "path": "opaque.bin",
+                "bytes": [0, 65, 255],
+                "mode": "ordinary"
+            }),
+        ),
+    ] {
+        let mut request = base_request();
+        request.action.name = action_name.to_string();
+        request.action.params = params;
+        request.action.side_effect_class = side_effect_class;
+        request.adapter = Some(adapter_id.to_string());
+        assert_eq!(
+            guard_action_request_with_trusted_profile(&request, &trusted_profile, "filesystem"),
+            Err(RawCredentialInputDenied),
+            "{case}"
+        );
+    }
+
+    let mut permission_mismatch = base_request();
+    permission_mismatch.action.name = "write_file".to_string();
+    permission_mismatch.action.params = serde_json::json!({
+        "path": "opaque.bin",
+        "bytes": [0, 65, 255]
+    });
+    permission_mismatch.action.side_effect_class = SideEffectClass::Filesystem;
+    permission_mismatch.action.required_permissions = vec!["filesystem.write".to_string()];
+    permission_mismatch.adapter = Some("filesystem".to_string());
+    assert_eq!(
+        guard_action_request_with_trusted_profile(
+            &permission_mismatch,
+            &trusted_profile,
+            "filesystem",
+        ),
+        Err(RawCredentialInputDenied),
+    );
 }
 
 #[test]

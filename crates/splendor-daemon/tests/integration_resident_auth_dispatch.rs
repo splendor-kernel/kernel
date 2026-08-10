@@ -46,7 +46,6 @@ use splendor_types::{
     APPROVAL_CHALLENGE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
     RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
 };
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -1686,20 +1685,15 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
             TraceEventKind::DaemonAudit { audit, .. } => audit.credential_id.clone(),
             _ => None,
         })
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
     assert_eq!(
         audit_credentials.len(),
         2,
-        "resident trace export must retain one bounded correlation digest per create/start caller"
+        "resident trace export must retain one bounded correlation marker per create/start caller"
     );
-    assert!(audit_credentials.iter().all(|credential_id| {
-        credential_id.strip_prefix("sha256:").is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        })
-    }));
+    assert!(audit_credentials
+        .iter()
+        .all(|credential_id| credential_id == "[REDACTED:credential-correlation]"));
     assert!(events.iter().any(|event| match &event.kind {
         TraceEventKind::DaemonAudit { audit, .. } => {
             audit.principal.app.app_principal_id == "central-manager"

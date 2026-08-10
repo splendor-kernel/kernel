@@ -4,12 +4,12 @@
 //! JSON secret reference as authority and cannot resolve, deliver, or authorize
 //! credential material.
 
-use crate::{ActionOutcome, ActionRequest, ActionStatus, AdapterResult};
+use crate::{ActionOutcome, ActionRequest, ActionStatus, AdapterResult, TrustedActionProfile};
 use splendor_types::{
     Action, ApprovalEvidence, AuthorityObligationReceipt, EffectCertainty, Percept, RetryClass,
     RevocationStatus, SideEffectClass, VerificationResult,
 };
-use std::{fmt, net::Ipv6Addr, str};
+use std::{collections::BTreeSet, fmt, net::Ipv6Addr, str};
 use time::OffsetDateTime;
 
 /// Stable, non-reflecting reason returned for every raw credential denial.
@@ -73,6 +73,22 @@ pub fn guard_action_routing_and_receipts(
     satisfied_preconditions: &[String],
     authority_obligation_receipts: &[AuthorityObligationReceipt],
 ) -> Result<(), RawCredentialInputDenied> {
+    guard_action_routing_and_receipts_with_numeric_profile(
+        action,
+        adapter,
+        satisfied_preconditions,
+        authority_obligation_receipts,
+        ActionNumericByteProfile::CredentialText,
+    )
+}
+
+fn guard_action_routing_and_receipts_with_numeric_profile(
+    action: &Action,
+    adapter: Option<&str>,
+    satisfied_preconditions: &[String],
+    authority_obligation_receipts: &[AuthorityObligationReceipt],
+    numeric_profile: ActionNumericByteProfile,
+) -> Result<(), RawCredentialInputDenied> {
     let mut scanner = CredentialIngressScanner::default();
     scan_action_routing_and_receipts(
         &mut scanner,
@@ -80,6 +96,7 @@ pub fn guard_action_routing_and_receipts(
         adapter,
         satisfied_preconditions,
         authority_obligation_receipts,
+        numeric_profile,
     )
 }
 
@@ -89,8 +106,9 @@ fn scan_action_routing_and_receipts(
     adapter: Option<&str>,
     satisfied_preconditions: &[String],
     authority_obligation_receipts: &[AuthorityObligationReceipt],
+    numeric_profile: ActionNumericByteProfile,
 ) -> Result<(), RawCredentialInputDenied> {
-    scanner.scan_action(action)?;
+    scanner.scan_action(action, numeric_profile)?;
     if let Some(adapter) = adapter {
         scanner.scan_string(adapter)?;
     }
@@ -178,6 +196,33 @@ pub(crate) fn guard_adapter_result(result: &AdapterResult) -> Result<(), RawCred
 /// content-screened before their owning validators run; screening does not make
 /// them valid or authorizing.
 pub fn guard_action_request(request: &ActionRequest) -> Result<(), RawCredentialInputDenied> {
+    guard_action_request_with_numeric_profile(request, ActionNumericByteProfile::CredentialText)
+}
+
+/// Screens an action request using owner-validated immutable routing metadata.
+///
+/// Callers must resolve `trusted_profile` and `resolved_adapter` from their own
+/// trusted registry before invoking this helper. Passing requester-selected
+/// values does not grant authority. Metadata mismatch falls back to the strict
+/// credential-text profile, and all other request coordinates are still scanned.
+pub fn guard_action_request_with_trusted_profile(
+    request: &ActionRequest,
+    trusted_profile: &TrustedActionProfile,
+    resolved_adapter: &str,
+) -> Result<(), RawCredentialInputDenied> {
+    let numeric_profile = trusted_action_numeric_byte_profile(
+        &request.action,
+        request.adapter.as_deref(),
+        trusted_profile,
+        resolved_adapter,
+    );
+    guard_action_request_with_numeric_profile(request, numeric_profile)
+}
+
+fn guard_action_request_with_numeric_profile(
+    request: &ActionRequest,
+    numeric_profile: ActionNumericByteProfile,
+) -> Result<(), RawCredentialInputDenied> {
     let mut scanner = CredentialIngressScanner::default();
     scan_action_routing_and_receipts(
         &mut scanner,
@@ -185,6 +230,7 @@ pub fn guard_action_request(request: &ActionRequest) -> Result<(), RawCredential
         request.adapter.as_deref(),
         &request.satisfied_preconditions,
         &request.authority_obligation_receipts,
+        numeric_profile,
     )?;
     if let Some(evidence) = request.approval_evidence.as_ref() {
         scanner.scan_approval_evidence(evidence)?;
@@ -257,10 +303,14 @@ struct CredentialIngressScanner {
 }
 
 impl CredentialIngressScanner {
-    fn scan_action(&mut self, action: &Action) -> Result<(), RawCredentialInputDenied> {
+    fn scan_action(
+        &mut self,
+        action: &Action,
+        numeric_profile: ActionNumericByteProfile,
+    ) -> Result<(), RawCredentialInputDenied> {
         self.charge_node()?;
         self.scan_string(&action.name)?;
-        self.scan_top_level_numeric_bytes(&action.params)?;
+        self.scan_top_level_numeric_bytes(action, numeric_profile)?;
         self.scan_value(&action.params, 0)?;
 
         if let SideEffectClass::Custom(value) = &action.side_effect_class {
@@ -284,9 +334,14 @@ impl CredentialIngressScanner {
 
     fn scan_top_level_numeric_bytes(
         &mut self,
-        params: &serde_json::Value,
+        action: &Action,
+        numeric_profile: ActionNumericByteProfile,
     ) -> Result<(), RawCredentialInputDenied> {
-        let Some(bytes) = params.as_object().and_then(|params| params.get("bytes")) else {
+        let Some(bytes) = action
+            .params
+            .as_object()
+            .and_then(|params| params.get("bytes"))
+        else {
             return Ok(());
         };
         let bytes = bytes.as_array().ok_or(RawCredentialInputDenied)?;
@@ -299,8 +354,23 @@ impl CredentialIngressScanner {
             let byte = u8::try_from(value).map_err(|_| RawCredentialInputDenied)?;
             reconstructed.push(byte);
         }
-        let textual = unambiguous_utf8_body(&reconstructed).ok_or(RawCredentialInputDenied)?;
-        self.scan_string(textual)
+        match numeric_profile {
+            ActionNumericByteProfile::CredentialText => {
+                let textual =
+                    unambiguous_utf8_body(&reconstructed).ok_or(RawCredentialInputDenied)?;
+                self.scan_string(textual)
+            }
+            ActionNumericByteProfile::OpaqueFilesystem
+                if exact_opaque_filesystem_write_shape(action) =>
+            {
+                self.scan_opaque_filesystem_bytes(&reconstructed)
+            }
+            ActionNumericByteProfile::OpaqueFilesystem => {
+                let textual =
+                    unambiguous_utf8_body(&reconstructed).ok_or(RawCredentialInputDenied)?;
+                self.scan_string(textual)
+            }
+        }
     }
 
     fn scan_authority_obligation_receipts(
@@ -393,8 +463,8 @@ impl CredentialIngressScanner {
     ) -> Result<(), RawCredentialInputDenied> {
         match value {
             serde_json::Value::Array(values) => {
-                if root && numeric_byte_profile(values) {
-                    self.scan_numeric_byte_array(values, None)?;
+                if root {
+                    self.scan_untyped_numeric_byte_candidate(values)?;
                 }
                 for value in values {
                     self.scan_persisted_byte_envelopes(value, false)?;
@@ -424,6 +494,103 @@ impl CredentialIngressScanner {
             | serde_json::Value::Bool(_)
             | serde_json::Value::Number(_)
             | serde_json::Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    fn scan_untyped_numeric_byte_candidate(
+        &mut self,
+        values: &[serde_json::Value],
+    ) -> Result<(), RawCredentialInputDenied> {
+        let Some(bytes) = complete_numeric_bytes(values) else {
+            return Ok(());
+        };
+        self.scan_credential_candidate_bytes(&bytes)
+    }
+
+    fn scan_credential_candidate_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), RawCredentialInputDenied> {
+        if bytes.len() > CREDENTIAL_INGRESS_MAX_TOTAL_BYTES {
+            return Err(RawCredentialInputDenied);
+        }
+
+        if let Some((encoding, body)) = leading_unicode_byte_order_mark(bytes) {
+            if contains_byte_order_mark(body) {
+                return Err(RawCredentialInputDenied);
+            }
+            let text = decode_unicode_bytes(body, encoding)?;
+            self.scan_textual_runs(&text)?;
+            return self.scan_zero_interleaved_text(body);
+        }
+
+        if contains_byte_order_mark(bytes) {
+            return Err(RawCredentialInputDenied);
+        }
+        self.scan_recognizable_textual_spans(bytes)?;
+        self.scan_zero_interleaved_text(bytes)
+    }
+
+    fn scan_opaque_filesystem_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), RawCredentialInputDenied> {
+        // This path is selected only by the exact owner-resolved filesystem
+        // profile. General persisted values retain `scan_persisted_bytes`.
+        self.scan_credential_candidate_bytes(bytes)
+    }
+
+    fn scan_zero_interleaved_text(&mut self, bytes: &[u8]) -> Result<(), RawCredentialInputDenied> {
+        let utf32_little = likely_utf32_text(bytes, true)?;
+        let utf32_big = likely_utf32_text(bytes, false)?;
+        match (utf32_little, utf32_big) {
+            (Some(_), Some(_)) => return Err(RawCredentialInputDenied),
+            (Some(text), None) | (None, Some(text)) => {
+                return self.scan_textual_runs(&text);
+            }
+            (None, None) => {}
+        }
+
+        let utf16_little = likely_utf16_text(bytes, true)?;
+        let utf16_big = likely_utf16_text(bytes, false)?;
+        match (utf16_little, utf16_big) {
+            (Some(_), Some(_)) => return Err(RawCredentialInputDenied),
+            (Some(text), None) | (None, Some(text)) => {
+                return self.scan_textual_runs(&text);
+            }
+            (None, None) => {}
+        }
+
+        for (width, little_endian) in [(4, true), (4, false), (2, true), (2, false)] {
+            self.scan_embedded_zero_interleaved_ascii_runs(bytes, width, little_endian)?;
+        }
+        Ok(())
+    }
+
+    fn scan_embedded_zero_interleaved_ascii_runs(
+        &mut self,
+        bytes: &[u8],
+        width: usize,
+        little_endian: bool,
+    ) -> Result<(), RawCredentialInputDenied> {
+        const MINIMUM_CREDENTIAL_RUN_BYTES: usize = 4;
+
+        for alignment in 0..width.min(bytes.len()) {
+            let mut run = String::new();
+            for chunk in bytes[alignment..].chunks_exact(width) {
+                if let Some(character) = zero_interleaved_ascii_character(chunk, little_endian) {
+                    run.push(character);
+                } else {
+                    if run.len() >= MINIMUM_CREDENTIAL_RUN_BYTES {
+                        self.scan_textual_runs(&run)?;
+                    }
+                    run.clear();
+                }
+            }
+            if run.len() >= MINIMUM_CREDENTIAL_RUN_BYTES {
+                self.scan_textual_runs(&run)?;
+            }
         }
         Ok(())
     }
@@ -467,7 +634,7 @@ impl CredentialIngressScanner {
                     {
                         return Err(RawCredentialInputDenied);
                     }
-                    return self.scan_recognizable_textual_spans(bytes);
+                    return self.scan_credential_candidate_bytes(bytes);
                 };
                 self.scan_string(text)?;
                 let trimmed = text.trim();
@@ -1834,6 +2001,49 @@ fn valid_ipv_future(value: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionNumericByteProfile {
+    CredentialText,
+    OpaqueFilesystem,
+}
+
+fn trusted_action_numeric_byte_profile(
+    action: &Action,
+    requested_adapter: Option<&str>,
+    trusted_profile: &TrustedActionProfile,
+    resolved_adapter: &str,
+) -> ActionNumericByteProfile {
+    let resolved_side_effect_class = super::trusted_adapter_side_effect_class(resolved_adapter);
+    let requested_permissions = action.required_permissions.iter().collect::<BTreeSet<_>>();
+    let trusted_permissions = trusted_profile
+        .required_permissions
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let exact_permissions = requested_permissions == trusted_permissions
+        && requested_permissions.len() == action.required_permissions.len()
+        && trusted_permissions.len() == trusted_profile.required_permissions.len();
+    if trusted_profile.action_name == action.name
+        && trusted_profile.adapter == resolved_adapter
+        && requested_adapter.is_none_or(|adapter| adapter == resolved_adapter)
+        && exact_permissions
+        && action.name == "write_file"
+        && resolved_side_effect_class == Some(SideEffectClass::Filesystem)
+        && matches!(&action.side_effect_class, SideEffectClass::Filesystem)
+    {
+        ActionNumericByteProfile::OpaqueFilesystem
+    } else {
+        ActionNumericByteProfile::CredentialText
+    }
+}
+
+fn exact_opaque_filesystem_write_shape(action: &Action) -> bool {
+    action.params.as_object().is_some_and(|params| {
+        params.len() == 2
+            && params.get("path").is_some_and(serde_json::Value::is_string)
+            && params.get("bytes").is_some_and(serde_json::Value::is_array)
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PersistedContentKind {
     Json,
     Text,
@@ -1904,19 +2114,191 @@ fn numeric_byte_profile(values: &[serde_json::Value]) -> bool {
     })
 }
 
-fn ambiguous_textual_bytes(bytes: &[u8]) -> bool {
-    const BYTE_ORDER_MARKS: &[&[u8]] = &[
+fn complete_numeric_bytes(values: &[serde_json::Value]) -> Option<Vec<u8>> {
+    values
+        .iter()
+        .map(|value| value.as_u64().and_then(|value| u8::try_from(value).ok()))
+        .collect()
+}
+
+fn likely_utf16_text(
+    bytes: &[u8],
+    little_endian: bool,
+) -> Result<Option<String>, RawCredentialInputDenied> {
+    if bytes.len() < 4 {
+        return Ok(None);
+    }
+    let pairs = bytes.chunks_exact(2);
+    let pair_count = pairs.len();
+    let high_byte_index = usize::from(little_endian);
+    let zero_high_bytes = pairs
+        .clone()
+        .filter(|pair| pair[high_byte_index] == 0)
+        .count();
+    if zero_high_bytes.saturating_mul(4) < pair_count.saturating_mul(3) {
+        return Ok(None);
+    }
+    if !bytes.len().is_multiple_of(2) || zero_high_bytes != pair_count {
+        return Err(RawCredentialInputDenied);
+    }
+    let units = pairs
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+        .map(Some)
+        .map_err(|_| RawCredentialInputDenied)
+}
+
+fn likely_utf32_text(
+    bytes: &[u8],
+    little_endian: bool,
+) -> Result<Option<String>, RawCredentialInputDenied> {
+    if bytes.len() < 8 {
+        return Ok(None);
+    }
+    let units = bytes.chunks_exact(4);
+    let unit_count = units.len();
+    let padded_units = units
+        .clone()
+        .filter(|unit| utf32_padding_is_zero(unit, little_endian))
+        .count();
+    if padded_units.saturating_mul(4) < unit_count.saturating_mul(3) {
+        return Ok(None);
+    }
+    if !bytes.len().is_multiple_of(4) || padded_units != unit_count {
+        return Err(RawCredentialInputDenied);
+    }
+
+    let mut text = String::with_capacity(unit_count);
+    for unit in units {
+        let value = if little_endian {
+            u32::from_le_bytes([unit[0], unit[1], unit[2], unit[3]])
+        } else {
+            u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]])
+        };
+        text.push(char::from_u32(value).ok_or(RawCredentialInputDenied)?);
+    }
+    Ok(Some(text))
+}
+
+fn utf32_padding_is_zero(unit: &[u8], little_endian: bool) -> bool {
+    if little_endian {
+        unit[1..].iter().all(|byte| *byte == 0)
+    } else {
+        unit[..3].iter().all(|byte| *byte == 0)
+    }
+}
+
+fn zero_interleaved_ascii_character(unit: &[u8], little_endian: bool) -> Option<char> {
+    let value_index = if little_endian {
+        0
+    } else {
+        unit.len().checked_sub(1)?
+    };
+    if unit
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| index != value_index && *byte != 0)
+    {
+        return None;
+    }
+    unit[value_index]
+        .is_ascii()
+        .then(|| char::from(unit[value_index]))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnicodeByteEncoding {
+    Utf8,
+    Utf16Little,
+    Utf16Big,
+    Utf32Little,
+    Utf32Big,
+}
+
+fn leading_unicode_byte_order_mark(bytes: &[u8]) -> Option<(UnicodeByteEncoding, &[u8])> {
+    [
+        (
+            &[0xff, 0xfe, 0x00, 0x00][..],
+            UnicodeByteEncoding::Utf32Little,
+        ),
+        (&[0x00, 0x00, 0xfe, 0xff][..], UnicodeByteEncoding::Utf32Big),
+        (&[0xef, 0xbb, 0xbf][..], UnicodeByteEncoding::Utf8),
+        (&[0xff, 0xfe][..], UnicodeByteEncoding::Utf16Little),
+        (&[0xfe, 0xff][..], UnicodeByteEncoding::Utf16Big),
+    ]
+    .into_iter()
+    .find_map(|(marker, encoding)| bytes.strip_prefix(marker).map(|body| (encoding, body)))
+}
+
+fn decode_unicode_bytes(
+    bytes: &[u8],
+    encoding: UnicodeByteEncoding,
+) -> Result<String, RawCredentialInputDenied> {
+    match encoding {
+        UnicodeByteEncoding::Utf8 => {
+            String::from_utf8(bytes.to_vec()).map_err(|_| RawCredentialInputDenied)
+        }
+        UnicodeByteEncoding::Utf16Little | UnicodeByteEncoding::Utf16Big => {
+            if !bytes.len().is_multiple_of(2) {
+                return Err(RawCredentialInputDenied);
+            }
+            let units = bytes.chunks_exact(2).map(|unit| match encoding {
+                UnicodeByteEncoding::Utf16Little => u16::from_le_bytes([unit[0], unit[1]]),
+                UnicodeByteEncoding::Utf16Big => u16::from_be_bytes([unit[0], unit[1]]),
+                _ => unreachable!("closed UTF-16 encoding"),
+            });
+            char::decode_utf16(units)
+                .map(|result| result.map_err(|_| RawCredentialInputDenied))
+                .collect()
+        }
+        UnicodeByteEncoding::Utf32Little | UnicodeByteEncoding::Utf32Big => {
+            if !bytes.len().is_multiple_of(4) {
+                return Err(RawCredentialInputDenied);
+            }
+            bytes
+                .chunks_exact(4)
+                .map(|unit| {
+                    let value = match encoding {
+                        UnicodeByteEncoding::Utf32Little => {
+                            u32::from_le_bytes([unit[0], unit[1], unit[2], unit[3]])
+                        }
+                        UnicodeByteEncoding::Utf32Big => {
+                            u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]])
+                        }
+                        _ => unreachable!("closed UTF-32 encoding"),
+                    };
+                    char::from_u32(value).ok_or(RawCredentialInputDenied)
+                })
+                .collect()
+        }
+    }
+}
+
+fn contains_byte_order_mark(bytes: &[u8]) -> bool {
+    [
+        &[0xff, 0xfe, 0x00, 0x00][..],
+        &[0x00, 0x00, 0xfe, 0xff],
         &[0xef, 0xbb, 0xbf],
         &[0xff, 0xfe],
         &[0xfe, 0xff],
-        &[0xff, 0xfe, 0x00, 0x00],
-        &[0x00, 0x00, 0xfe, 0xff],
-    ];
-    if BYTE_ORDER_MARKS.iter().any(|marker| {
+    ]
+    .iter()
+    .any(|marker| {
         bytes
             .windows(marker.len())
             .any(|candidate| candidate == *marker)
-    }) {
+    })
+}
+
+fn ambiguous_textual_bytes(bytes: &[u8]) -> bool {
+    if contains_byte_order_mark(bytes) {
         return true;
     }
     str::from_utf8(bytes).is_ok_and(|text| {
@@ -2155,6 +2537,26 @@ mod tests {
 
     fn synthetic_provider_token(prefix: &str, suffix_bytes: usize) -> String {
         format!("{prefix}{}", "A".repeat(suffix_bytes))
+    }
+
+    fn utf32_bytes(text: &str, little_endian: bool, with_bom: bool) -> Vec<u8> {
+        let mut bytes = if with_bom {
+            if little_endian {
+                vec![0xff, 0xfe, 0x00, 0x00]
+            } else {
+                vec![0x00, 0x00, 0xfe, 0xff]
+            }
+        } else {
+            Vec::new()
+        };
+        bytes.extend(text.chars().flat_map(|character| {
+            if little_endian {
+                (character as u32).to_le_bytes()
+            } else {
+                (character as u32).to_be_bytes()
+            }
+        }));
+        bytes
     }
 
     fn request(action: Action) -> ActionRequest {
@@ -2760,6 +3162,13 @@ mod tests {
             Ok(())
         );
         assert_eq!(guard_persisted_state(&[1], None, None), Ok(()));
+        for bytes in [b"ordinary\0\x01bytes".as_slice(), b"{not-json".as_slice()] {
+            assert_eq!(
+                guard_persisted_state(bytes, Some("application/octet-stream"), None),
+                Err(RawCredentialInputDenied),
+                "general persistence remains strict for ambiguous opaque bytes"
+            );
+        }
         assert_eq!(
             guard_persisted_state(
                 br#"{"status":"ready","values":[1,2,3]}"#,
@@ -2780,7 +3189,78 @@ mod tests {
     }
 
     #[test]
-    fn persisted_numeric_byte_profiles_reject_every_malformed_member() {
+    fn utf32_credentials_are_denied_across_persisted_byte_envelopes() {
+        for (little_endian, with_bom) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let bytes = utf32_bytes("Bearer short", little_endian, with_bom);
+            let encoded_root =
+                serde_json::to_vec(&serde_json::json!(bytes)).expect("root fixture serializes");
+            assert_eq!(
+                guard_persisted_state(&encoded_root, Some("application/json"), None),
+                Err(RawCredentialInputDenied),
+                "root numeric candidate must deny UTF-32"
+            );
+            assert_eq!(
+                guard_persisted_state(&bytes, Some("application/octet-stream"), None),
+                Err(RawCredentialInputDenied),
+                "opaque state candidate must deny UTF-32"
+            );
+
+            for coordinate in ["body", "bytes", "contents"] {
+                let percept = Percept {
+                    schema: "splendor.percept.fixture.v1".to_string(),
+                    payload: serde_json::json!({coordinate: bytes}),
+                    provenance: PerceptProvenance {
+                        source: "fixture-sensor".to_string(),
+                        detail: None,
+                    },
+                    timestamp: OffsetDateTime::now_utc(),
+                };
+                assert_eq!(
+                    guard_persisted_percept(&percept),
+                    Err(RawCredentialInputDenied),
+                    "selected {coordinate} envelope must deny UTF-32"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owner_opaque_compatibility_does_not_relax_persisted_envelopes() {
+        for coordinate in ["body", "bytes", "contents"] {
+            for bytes in [b"ordinary\0\x01bytes".as_slice(), b"{not-json".as_slice()] {
+                let percept = Percept {
+                    schema: "splendor.percept.fixture.v1".to_string(),
+                    payload: serde_json::json!({coordinate: bytes}),
+                    provenance: PerceptProvenance {
+                        source: "fixture-sensor".to_string(),
+                        detail: None,
+                    },
+                    timestamp: OffsetDateTime::now_utc(),
+                };
+                assert_eq!(
+                    guard_persisted_percept(&percept),
+                    Err(RawCredentialInputDenied),
+                    "persisted percept {coordinate} envelope remains strict"
+                );
+
+                let result = AdapterResult {
+                    output: serde_json::json!({coordinate: bytes}),
+                    satisfied_postconditions: Vec::new(),
+                };
+                assert_eq!(
+                    guard_adapter_result(&result),
+                    Err(RawCredentialInputDenied),
+                    "adapter-result {coordinate} envelope remains strict"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_typed_numeric_byte_profiles_reject_malformed_members_without_reclassifying_root_json(
+    ) {
         let malformed = [
             serde_json::json!([1, 256]),
             serde_json::json!([1, -1]),
@@ -2823,8 +3303,8 @@ mod tests {
             let encoded = serde_json::to_vec(&values).expect("fixture serializes");
             assert_eq!(
                 guard_persisted_state(&encoded, Some("application/json"), None),
-                Err(RawCredentialInputDenied),
-                "root numeric profile must deny {values}"
+                Ok(()),
+                "schema-free root arrays retain ordinary JSON semantics: {values}"
             );
         }
 

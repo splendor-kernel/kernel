@@ -5,8 +5,9 @@ use splendor_types::{
     AgentId, SnapshotId, StateHandoffAuthority, StateHandoffSnapshot, StateReference,
     StateReferenceMode, TenantId,
 };
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Mutex, TryLockError};
 use std::thread;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 fn activate_runtime_writer(
@@ -318,6 +319,122 @@ fn concurrent_record_event_calls_keep_contiguous_sequence_and_integrity_cursor()
         prev_hash = Some(event_hash);
     }
     assert_eq!(runtime_prev_event_hash(runtime.as_ref()), prev_hash);
+}
+
+#[test]
+fn fresh_distinct_agent_admission_and_event_append_follow_one_lock_order() {
+    let store = Arc::new(InMemoryTraceStore::default());
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(store, Some(RunId::new())).expect("trace runtime"),
+    );
+    let primary_tenant = TenantId::new();
+    let primary_agent = AgentId::new();
+    let primary_writer = activate_runtime_writer(&runtime, &primary_tenant, &primary_agent);
+    assert!(runtime
+        .admit_fresh_engine(&primary_tenant, &primary_agent)
+        .expect("primary fresh admission"));
+
+    // Hold the second lock in the documented hierarchy. Correct admission takes
+    // the trace cursor first and waits here; the old lifecycle-first path never
+    // takes the cursor and deterministically fails the observation below.
+    let (lifecycle_held_sender, lifecycle_held_receiver) = mpsc::channel();
+    let (release_lifecycle_sender, release_lifecycle_receiver) = mpsc::channel();
+    let lifecycle_runtime = Arc::clone(&runtime);
+    let lifecycle_thread = thread::spawn(move || {
+        let lifecycle = lifecycle_runtime
+            .writer_lifecycle
+            .state
+            .lock()
+            .expect("writer lifecycle lock");
+        lifecycle_held_sender
+            .send(())
+            .expect("announce held writer lifecycle");
+        release_lifecycle_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release writer lifecycle");
+        drop(lifecycle);
+    });
+    lifecycle_held_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer lifecycle held");
+    let admission_start = Arc::new(Barrier::new(2));
+    let (admission_sender, admission_receiver) = mpsc::channel();
+    let admission_runtime = Arc::clone(&runtime);
+    let admission_barrier = Arc::clone(&admission_start);
+    let admitted_tenant = TenantId::new();
+    let admitted_agent = AgentId::new();
+    let admitted_tenant_for_thread = admitted_tenant.clone();
+    let admitted_agent_for_thread = admitted_agent.clone();
+    let admission_thread = thread::spawn(move || {
+        admission_barrier.wait();
+        let result = (|| {
+            let writer = admission_runtime
+                .acquire_engine_writer(&admitted_tenant_for_thread, &admitted_agent_for_thread)?;
+            let admitted = admission_runtime
+                .admit_fresh_engine(&admitted_tenant_for_thread, &admitted_agent_for_thread)?;
+            Ok::<_, TraceError>((writer, admitted))
+        })();
+        admission_sender
+            .send(result)
+            .expect("send admission result");
+    });
+    admission_start.wait();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match runtime.trace_cursor.try_lock() {
+            Err(TryLockError::WouldBlock) => break,
+            Err(TryLockError::Poisoned(_)) => panic!("trace cursor lock poisoned"),
+            Ok(cursor) => drop(cursor),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh writer admission did not acquire the trace cursor before the writer lifecycle"
+        );
+        thread::yield_now();
+    }
+
+    let event_start = Arc::new(Barrier::new(2));
+    let (event_attempt_sender, event_attempt_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) = mpsc::channel();
+    let event_runtime = Arc::clone(&runtime);
+    let event_barrier = Arc::clone(&event_start);
+    let event_thread = thread::spawn(move || {
+        event_barrier.wait();
+        event_attempt_sender
+            .send(())
+            .expect("announce event append");
+        let result = event_runtime.record_event(TraceEventKind::PolicyInvoked {
+            policy: "concurrent-lock-order".to_string(),
+        });
+        event_sender.send(result).expect("send event result");
+    });
+    event_start.wait();
+    event_attempt_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("event append attempt");
+
+    release_lifecycle_sender
+        .send(())
+        .expect("release writer lifecycle");
+
+    let (admitted_writer, admitted) = admission_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fresh admission completed")
+        .expect("fresh admission succeeded");
+    let event = event_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("event append completed")
+        .expect("event append succeeded");
+    lifecycle_thread.join().expect("lifecycle thread");
+    admission_thread.join().expect("admission thread");
+    event_thread.join().expect("event thread");
+
+    assert!(admitted);
+    assert_eq!(event.sequence, 1);
+    assert_eq!(runtime.next_sequence(), 2);
+    drop(admitted_writer);
+    drop(primary_writer);
 }
 
 #[test]
