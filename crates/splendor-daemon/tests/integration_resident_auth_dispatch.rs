@@ -27,7 +27,12 @@ use splendor_daemon::{
     SubmitActionRequest, TickResponse, TracePageResponse,
 };
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
-use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
+use splendor_store::{
+    InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits, RuntimeTracePage,
+    RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle, RuntimeTraceStoreIdentity,
+    RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle, RuntimeTraceWriterRequest,
+    TraceRecord, TraceStore, TraceStoreError,
+};
 use splendor_types::{
     Action, ActionId, AgentId, AppPrincipal, ApprovalChallenge, ApprovalId, ApprovalPolicy,
     AuditAttribution, AuthorityDecisionId, AuthorityObligationId, CallerCredential,
@@ -41,7 +46,6 @@ use splendor_types::{
     APPROVAL_CHALLENGE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
     RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
 };
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -95,8 +99,8 @@ struct BarrierHarness {
 #[derive(Default)]
 struct ArmableTraceStore {
     inner: InMemoryTraceStore,
-    fail_appends: AtomicBool,
-    failed_append_attempts: AtomicUsize,
+    fail_appends: Arc<AtomicBool>,
+    failed_append_attempts: Arc<AtomicUsize>,
 }
 
 impl ArmableTraceStore {
@@ -133,6 +137,79 @@ impl TraceStore for ArmableTraceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(ArmableRuntimeWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            fail_appends: Arc::clone(&self.fail_appends),
+            failed_append_attempts: Arc::clone(&self.failed_append_attempts),
+        }))
+    }
+}
+
+struct ArmableRuntimeWriter {
+    inner: RuntimeTraceWriterHandle,
+    fail_appends: Arc<AtomicBool>,
+    failed_append_attempts: Arc<AtomicUsize>,
+}
+
+impl RuntimeTraceReader for ArmableRuntimeWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for ArmableRuntimeWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        if self.fail_appends.load(Ordering::SeqCst) {
+            self.failed_append_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(RuntimeTracePortError::Unavailable);
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 
@@ -1608,20 +1685,15 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
             TraceEventKind::DaemonAudit { audit, .. } => audit.credential_id.clone(),
             _ => None,
         })
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
     assert_eq!(
         audit_credentials.len(),
         2,
-        "resident trace export must retain one bounded correlation digest per create/start caller"
+        "resident trace export must retain one bounded correlation marker per create/start caller"
     );
-    assert!(audit_credentials.iter().all(|credential_id| {
-        credential_id.strip_prefix("sha256:").is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        })
-    }));
+    assert!(audit_credentials
+        .iter()
+        .all(|credential_id| credential_id == "[REDACTED:credential-correlation]"));
     assert!(events.iter().any(|event| match &event.kind {
         TraceEventKind::DaemonAudit { audit, .. } => {
             audit.principal.app.app_principal_id == "central-manager"

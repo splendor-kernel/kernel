@@ -35,11 +35,16 @@ EXPECTED_WORKSPACE_PACKAGE_MANIFESTS: dict[str, str] = {
     "splendor-kernel": "crates/splendor-kernel/Cargo.toml",
     "splendor-gateway": "crates/splendor-gateway/Cargo.toml",
     "splendor-store": "crates/splendor-store/Cargo.toml",
+    "splendor-evidence": "crates/splendor-evidence/Cargo.toml",
     "splendor-daemon": "crates/splendor-daemon/Cargo.toml",
     "splendorctl": "crates/splendorctl/Cargo.toml",
     "splendor-adapter-filesystem": "adapters/filesystem/Cargo.toml",
     "splendor-adapter-http": "adapters/http/Cargo.toml",
     "splendor-adapter-robotics": "adapters/robotics/Cargo.toml",
+    "splendor-adapter-secrets-local-file": (
+        "adapters/secrets-local-file/Cargo.toml"
+    ),
+    "splendor-adapter-secrets-memory": "adapters/secrets-memory/Cargo.toml",
     "splendor-acceptance-action-host": (
         "tests/e2e/use-cases/acceptance-host/Cargo.toml"
     ),
@@ -51,12 +56,13 @@ EXPECTED_PACKAGE_BY_MANIFEST = {
 
 
 # Direct non-dev workspace package dependencies allowed for the current 0.1
-# compatibility baseline.  These entries deliberately cover existing packages
-# only; proposed v2 plane crates are RFC-gated and are not required by this
+# compatibility baseline plus explicitly accepted compatibility-owner packages.
+# Other proposed v2 plane crates remain RFC-gated and are not required by this
 # guard.
 ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
     "splendor-types": set(),
     "splendor-store": {"splendor-types"},
+    "splendor-evidence": {"splendor-types", "splendor-store"},
     "splendor-authority": {"splendor-types", "splendor-store"},
     "splendor-gateway": {"splendor-types", "splendor-authority"},
     "splendor-kernel": {
@@ -64,18 +70,21 @@ ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
         "splendor-store",
         "splendor-gateway",
         "splendor-authority",
+        "splendor-evidence",
     },
     "splendor-daemon": {
         "splendor-types",
         "splendor-store",
         "splendor-gateway",
         "splendor-kernel",
+        "splendor-evidence",
     },
     "splendorctl": {
         "splendor-types",
         "splendor-store",
         "splendor-gateway",
         "splendor-kernel",
+        "splendor-evidence",
         "splendor-adapter-filesystem",
         "splendor-adapter-http",
     },
@@ -88,6 +97,21 @@ ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
 }
 
 ADAPTER_ALLOWED_INTERNAL_DEPS = {"splendor-types", "splendor-gateway"}
+SECRET_PROVIDER_ALLOWED_INTERNAL_DEPS = {"splendor-types", "splendor-authority"}
+LOCAL_FILE_SECRET_PROVIDER_PACKAGE = "splendor-adapter-secrets-local-file"
+LOCAL_FILE_SECRET_PROVIDER_FEATURE = "local-file-secret-provider"
+SECRET_PROVIDER_TEST_SUPPORT_FEATURE = "secret-provider-test-support"
+LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES = {
+    "default": [],
+    LOCAL_FILE_SECRET_PROVIDER_FEATURE: [],
+}
+LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS = {
+    "blake3",
+    "libc",
+    "splendor-authority",
+    "splendor-types",
+    "zeroize",
+}
 CHECKED_DEP_KINDS = {None, "build"}
 CARGO_METADATA_COMMAND = (
     "cargo",
@@ -191,6 +215,7 @@ DAEMON_EXPECTED_PRODUCTION_DEPENDENCIES = {
         daemon_registry_dependency("ring", "^0.17"),
         daemon_registry_dependency("serde", "^1.0", features=("derive",)),
         daemon_registry_dependency("serde_json", "^1.0"),
+        daemon_path_dependency("splendor-evidence", "crates/splendor-evidence"),
         daemon_path_dependency("splendor-gateway", "crates/splendor-gateway"),
         daemon_path_dependency("splendor-kernel", "crates/splendor-kernel"),
         daemon_path_dependency("splendor-store", "crates/splendor-store"),
@@ -211,14 +236,16 @@ DAEMON_EXPECTED_PRODUCTION_DEPENDENCIES = {
 RULE_NOTES: dict[str, str] = {
     "splendor-types": "splendor-types is behavior-free canonical IDs/schemas; it must not depend on other internal packages.",
     "splendor-store": "splendor-store is persistence-only; current baseline allows only splendor-types directly.",
+    "splendor-evidence": "RFC 0015 permits the bounded compatibility owner to depend only on behavior-free splendor-types and persistence-only splendor-store.",
     "splendor-authority": "RFC 0009 / IDR-001 allows splendor-authority to own identity lifecycle decisions over types and storage-only registry persistence.",
     "splendor-gateway": "splendor-gateway is the action/driver boundary; AUTH-004b allows the narrow splendor-authority edge to validate obligation receipts before adapter invocation.",
-    "splendor-kernel": "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local delegation authority bridge in addition to types/store/gateway.",
-    "splendor-daemon": "MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> kernel/store/gateway/types composition seam only.",
-    "splendorctl": "MIG-137-CLI-EMBEDDED-LOCAL allows existing embedded-local CLI edges to kernel/store/gateway/types and filesystem/http adapters only.",
+    "splendor-kernel": "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local delegation authority bridge and RFC 0015 allows delegation to evidence semantics.",
+    "splendor-daemon": "MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition seam to kernel/store/gateway/types/evidence only.",
+    "splendorctl": "MIG-137-CLI-EMBEDDED-LOCAL and RFC 0015 allow embedded-local CLI edges to kernel/store/gateway/types/evidence and filesystem/http adapters only.",
     "splendor-bindings": "Python bindings may bind the kernel facade directly; transitive core deps must remain Cargo transitive, not direct.",
     "splendor-acceptance-action-host": "CORR-001 permits this exact unpublished non-production outer host to compose the daemon with its controlled acceptance adapter; it must not become a production dependency.",
     "adapter": "Adapter crates may directly depend only on splendor-types and splendor-gateway; no adapter -> kernel/store/daemon/adapter core edge.",
+    "secret_provider": "RFC 0012 permits only adapters/secrets-* -> splendor-authority + splendor-types; secret providers may not import gateway/kernel/store/daemon/node or another adapter.",
 }
 
 
@@ -327,6 +354,9 @@ def check_metadata(metadata: dict[str, Any]) -> tuple[list[Violation], dict[str,
 
     violations = workspace_identity_violations(metadata, workspace_packages)
     violations.extend(governed_package_record_violations(metadata))
+    violations.extend(
+        development_secret_provider_surface_violations(policy_packages)
+    )
     checked_edges: dict[str, list[tuple[str, str]]] = {
         name: [] for name in known_internal_names
     }
@@ -915,6 +945,132 @@ def daemon_closure_violations(
     return violations
 
 
+def development_secret_provider_surface_violations(
+    packages: list[dict[str, Any]],
+) -> list[Violation]:
+    """Keep test/dev provider capabilities out of normal release graphs."""
+
+    violations: list[Violation] = []
+    packages_by_name = {str(package.get("name")): package for package in packages}
+
+    authority = packages_by_name.get("splendor-authority")
+    if authority is not None:
+        authority_features = authority.get("features")
+        if not isinstance(authority_features, dict):
+            violations.append(
+                Violation(
+                    "splendor-authority package feature map is unavailable; the default-off secret provider test-support boundary cannot be verified."
+                )
+            )
+        else:
+            if authority_features.get("default") != []:
+                violations.append(
+                    Violation(
+                        "splendor-authority default features must remain empty; secret provider test support may never be enabled by default."
+                    )
+                )
+            if authority_features.get(SECRET_PROVIDER_TEST_SUPPORT_FEATURE) != []:
+                violations.append(
+                    Violation(
+                        "splendor-authority secret-provider-test-support must remain an empty, explicit feature with no feature forwarding."
+                    )
+                )
+
+    provider = packages_by_name.get(LOCAL_FILE_SECRET_PROVIDER_PACKAGE)
+    if provider is not None:
+        if provider.get("publish") != []:
+            violations.append(
+                Violation(
+                    "splendor-adapter-secrets-local-file must remain publish=false (Cargo metadata publish=[])."
+                )
+            )
+        actual_features = provider.get("features")
+        if actual_features != LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES:
+            violations.append(
+                Violation(
+                    "splendor-adapter-secrets-local-file feature map changed; expected only empty default and explicit local-file-secret-provider features: "
+                    f"expected={LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES!r} actual={actual_features!r}."
+                )
+            )
+
+        production_dependencies = [
+            dependency
+            for dependency in provider.get("dependencies", [])
+            if dependency.get("kind") != "dev"
+        ]
+        production_names = [
+            str(dependency.get("name")) for dependency in production_dependencies
+        ]
+        actual_name_set = set(production_names)
+        if (
+            actual_name_set != LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS
+            or len(production_names) != len(actual_name_set)
+        ):
+            violations.append(
+                Violation(
+                    "splendor-adapter-secrets-local-file production dependency closure changed; "
+                    f"expected={sorted(LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS)!r} "
+                    f"actual={sorted(production_names)!r}."
+                )
+            )
+        for dependency in production_dependencies:
+            if dependency.get("name") == "splendor-authority" and (
+                dependency.get("features") or []
+            ):
+                violations.append(
+                    Violation(
+                        "splendor-adapter-secrets-local-file normal splendor-authority dependency must enable no features; secret provider test support is dev-only."
+                    )
+                )
+
+    for package in packages:
+        authority_dependency_aliases = {
+            str(dependency.get("rename") or dependency.get("name"))
+            for dependency in package.get("dependencies", [])
+            if dependency.get("name") == "splendor-authority"
+        }
+        for feature_name, activations in (package.get("features") or {}).items():
+            for alias in authority_dependency_aliases:
+                forbidden_activations = {
+                    f"{alias}/{SECRET_PROVIDER_TEST_SUPPORT_FEATURE}",
+                    f"{alias}?/{SECRET_PROVIDER_TEST_SUPPORT_FEATURE}",
+                }
+                if forbidden_activations.intersection(activations):
+                    violations.append(
+                        Violation(
+                            f"{package.get('name')} feature {feature_name!r} may not forward "
+                            "splendor-authority secret-provider-test-support; provider test support is dev-only."
+                        )
+                    )
+        for dependency in package.get("dependencies", []):
+            if (
+                dependency.get("name") == "splendor-authority"
+                and dependency.get("kind") != "dev"
+                and SECRET_PROVIDER_TEST_SUPPORT_FEATURE
+                in (dependency.get("features") or [])
+            ):
+                violations.append(
+                    Violation(
+                        f"{package.get('name')} -> splendor-authority "
+                        f"({dependency_kind_label(dependency)} dependency) may not enable "
+                        "secret-provider-test-support; provider test support is dev-only."
+                    )
+            )
+            if (
+                package.get("name") != LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+                and dependency.get("name") == LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+                and dependency.get("kind") != "dev"
+            ):
+                violations.append(
+                    Violation(
+                        f"{package.get('name')} -> {LOCAL_FILE_SECRET_PROVIDER_PACKAGE} "
+                        f"({dependency_kind_label(dependency)} dependency) is forbidden: the local-file Secret Provider is development-only and absent from normal release graphs."
+                    )
+                )
+
+    return violations
+
+
 def count_names(names: Iterable[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for name in names:
@@ -923,6 +1079,8 @@ def count_names(names: Iterable[str]) -> dict[str, int]:
 
 
 def allowed_deps_for(package: dict[str, Any]) -> set[str] | None:
+    if is_secret_provider_package(package):
+        return set(SECRET_PROVIDER_ALLOWED_INTERNAL_DEPS)
     if is_adapter_package(package):
         return set(ADAPTER_ALLOWED_INTERNAL_DEPS)
     allowed = ALLOWED_INTERNAL_DEPS.get(package["name"])
@@ -938,6 +1096,16 @@ def is_adapter_package(package: dict[str, Any]) -> bool:
     return "adapters" in Path(manifest_path).parts
 
 
+def is_secret_provider_package(package: dict[str, Any]) -> bool:
+    manifest_path = package.get("manifest_path") or ""
+    manifest_dir = Path(manifest_path).parent
+    return (
+        package["name"].startswith("splendor-adapter-secrets-")
+        and manifest_dir.parent.name == "adapters"
+        and manifest_dir.name.startswith("secrets-")
+    )
+
+
 def dependency_kind_label(dependency: dict[str, Any]) -> str:
     return dependency.get("kind") or "normal"
 
@@ -946,7 +1114,12 @@ def forbidden_edge_violation(
     package: dict[str, Any], dep_name: str, dependency: dict[str, Any]
 ) -> Violation:
     source = package["name"]
-    rule_key = "adapter" if is_adapter_package(package) else source
+    if is_secret_provider_package(package):
+        rule_key = "secret_provider"
+    elif is_adapter_package(package):
+        rule_key = "adapter"
+    else:
+        rule_key = source
     note = RULE_NOTES.get(rule_key, "No rule note found; update dependency guard policy.")
     allowed = sorted(allowed_deps_for(package) or [])
     allowed_text = ", ".join(allowed) if allowed else "no internal packages"
@@ -1022,7 +1195,7 @@ def print_result(violations: list[Violation], stats: dict[str, int]) -> None:
         print(
             "Note: this guard enforces exact current 0.1 Cargo workspace/dependency identities, governed package-record uniqueness, "
             "repository-local path membership, non-dev Rust package allowlists, and internal cycle checks; "
-            "it does not inspect Rust source, enforce the proposed v2 JSON dependency policy, require RFC-gated plane crates, "
+            "it does not inspect Rust source, enforce the proposed v2 JSON dependency policy, require other RFC-gated plane crates, "
             "or detect universal duplicate semantic ownership."
         )
         return
@@ -1043,7 +1216,7 @@ def print_result(violations: list[Violation], stats: dict[str, int]) -> None:
     print(
         "Scope: current 0.1 Cargo package/provider metadata only; governed Cargo package-record duplicates are rejected, but "
         "source-wide effect scanning and universal duplicate semantic-owner detection remain out of scope; "
-        "proposed v2 plane crates and dependency_policy.proposed.json are not implemented by this guard."
+        "other proposed v2 plane crates and dependency_policy.proposed.json are not implemented by this guard."
     )
 
 
@@ -1071,6 +1244,133 @@ def run_self_test() -> int:
     current_violations, _stats = check_metadata(current_fixture)
     failures += report_exact_self_test(
         "governed_workspace_current_shape", current_violations, []
+    )
+
+    local_provider_default = accepted_metadata_fixture()
+    package_named(local_provider_default, LOCAL_FILE_SECRET_PROVIDER_PACKAGE)[
+        "features"
+    ]["default"] = [LOCAL_FILE_SECRET_PROVIDER_FEATURE]
+    failures += report_exact_self_test(
+        "local_file_secret_provider_default_feature_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_default)
+        ),
+        [
+            "splendor-adapter-secrets-local-file feature map changed; expected only empty default and explicit "
+            "local-file-secret-provider features: expected={'default': [], 'local-file-secret-provider': []} "
+            "actual={'default': ['local-file-secret-provider'], 'local-file-secret-provider': []}."
+        ],
+    )
+
+    local_provider_publish = accepted_metadata_fixture()
+    package_named(local_provider_publish, LOCAL_FILE_SECRET_PROVIDER_PACKAGE)[
+        "publish"
+    ] = None
+    failures += report_exact_self_test(
+        "local_file_secret_provider_publish_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_publish)
+        ),
+        [
+            "splendor-adapter-secrets-local-file must remain publish=false (Cargo metadata publish=[])."
+        ],
+    )
+
+    authority_test_support_default = accepted_metadata_fixture()
+    package_named(authority_test_support_default, "splendor-authority")["features"][
+        "default"
+    ] = [SECRET_PROVIDER_TEST_SUPPORT_FEATURE]
+    failures += report_exact_self_test(
+        "authority_provider_test_support_default_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(authority_test_support_default)
+        ),
+        [
+            "splendor-authority default features must remain empty; secret provider test support may never be enabled by default."
+        ],
+    )
+
+    local_provider_normal_test_support = accepted_metadata_fixture()
+    dependency_named(
+        package_named(
+            local_provider_normal_test_support, LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+        ),
+        "splendor-authority",
+    )["features"] = [SECRET_PROVIDER_TEST_SUPPORT_FEATURE]
+    failures += report_exact_self_test(
+        "local_file_normal_authority_test_support_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_normal_test_support)
+        ),
+        [
+            "splendor-adapter-secrets-local-file normal splendor-authority dependency must enable no features; secret provider test support is dev-only.",
+            "splendor-adapter-secrets-local-file -> splendor-authority (normal dependency) may not enable secret-provider-test-support; provider test support is dev-only."
+        ],
+    )
+
+    authority_test_support_release_consumer = accepted_metadata_fixture()
+    dependency_named(
+        package_named(authority_test_support_release_consumer, "splendor-gateway"),
+        "splendor-authority",
+    )["features"] = [SECRET_PROVIDER_TEST_SUPPORT_FEATURE]
+    failures += report_exact_self_test(
+        "authority_provider_test_support_release_consumer_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(authority_test_support_release_consumer)
+        ),
+        [
+            "splendor-gateway -> splendor-authority (normal dependency) may not enable secret-provider-test-support; provider test support is dev-only."
+        ],
+    )
+
+    authority_test_support_forwarding = accepted_metadata_fixture()
+    package_named(authority_test_support_forwarding, "splendor-gateway")["features"] = {
+        "default": [],
+        "unsafe-test-support": [
+            "splendor-authority/secret-provider-test-support"
+        ],
+    }
+    failures += report_exact_self_test(
+        "authority_provider_test_support_forwarding_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(authority_test_support_forwarding)
+        ),
+        [
+            "splendor-gateway feature 'unsafe-test-support' may not forward splendor-authority secret-provider-test-support; provider test support is dev-only."
+        ],
+    )
+
+    local_provider_dependency_widening = accepted_metadata_fixture()
+    package_named(
+        local_provider_dependency_widening, LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+    )["dependencies"].append(
+        dependency_fixture("reqwest", repository_local=False)
+    )
+    failures += report_exact_self_test(
+        "local_file_secret_provider_dependency_widening_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_dependency_widening)
+        ),
+        [
+            "splendor-adapter-secrets-local-file production dependency closure changed; expected=['blake3', "
+            "'libc', 'splendor-authority', 'splendor-types', 'zeroize'] actual=['blake3', 'libc', "
+            "'reqwest', 'splendor-authority', 'splendor-types', 'zeroize']."
+        ],
+    )
+
+    local_provider_release_consumer = accepted_metadata_fixture()
+    package_named(local_provider_release_consumer, "splendor-daemon")[
+        "dependencies"
+    ].append(dependency_fixture(LOCAL_FILE_SECRET_PROVIDER_PACKAGE))
+    failures += report_exact_self_test(
+        "local_file_secret_provider_release_consumer_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_release_consumer)
+        ),
+        [
+            "splendor-daemon -> splendor-adapter-secrets-local-file (normal dependency) is forbidden: the "
+            "local-file Secret Provider is development-only and absent from normal release graphs."
+        ],
     )
 
     missing_outer_host = accepted_metadata_fixture()
@@ -1332,9 +1632,9 @@ def run_self_test() -> int:
         check_metadata(forbidden_alias)[0],
         [
             "splendor-kernel -> splendor-adapter-http (normal dependency) is forbidden. Allowed direct internal "
-            "deps: splendor-authority, splendor-gateway, splendor-store, splendor-types. Rule/exception note: "
+            "deps: splendor-authority, splendor-evidence, splendor-gateway, splendor-store, splendor-types. Rule/exception note: "
             "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local "
-            "delegation authority bridge in addition to types/store/gateway."
+            "delegation authority bridge and RFC 0015 allows delegation to evidence semantics."
         ],
     )
 
@@ -1394,6 +1694,19 @@ def run_self_test() -> int:
             }
         ),
         cycle_order_expected,
+    )
+
+    evidence_reverse_edge = fixture_with_dependency(
+        "splendor-evidence", "splendor-gateway"
+    )
+    failures += report_exact_self_test(
+        "evidence_reverse_edge_to_gateway_rejected",
+        check_metadata(evidence_reverse_edge)[0],
+        [
+            "splendor-evidence -> splendor-gateway (normal dependency) is forbidden. Allowed direct internal "
+            "deps: splendor-store, splendor-types. Rule/exception note: RFC 0015 permits the bounded "
+            "compatibility owner to depend only on behavior-free splendor-types and persistence-only splendor-store."
+        ],
     )
 
     metadata_order_a = fixture_with_dependency(
@@ -1507,6 +1820,28 @@ def run_self_test() -> int:
         excluded_http_adapter_expected_messages(include_cycle=True),
     )
 
+    relocated_secret_provider = accepted_metadata_fixture()
+    package_named(
+        relocated_secret_provider, "splendor-adapter-secrets-memory"
+    )["manifest_path"] = "adapters/experimental/secrets-memory/Cargo.toml"
+    secret_provider_with_node = accepted_metadata_fixture()
+    append_workspace_package(
+        secret_provider_with_node,
+        "splendor-node",
+        "binaries/splendor-node/Cargo.toml",
+    )
+    package_named(
+        secret_provider_with_node, "splendor-adapter-secrets-memory"
+    )["dependencies"].append(
+        dependency_fixture("splendor-node", repository_local=False)
+    )
+
+    secret_provider_rule = (
+        "Allowed direct internal deps: splendor-authority, splendor-types. "
+        "Rule/exception note: RFC 0012 permits only adapters/secrets-* -> "
+        "splendor-authority + splendor-types; secret providers may not import "
+        "gateway/kernel/store/daemon/node or another adapter."
+    )
     edge_cases = [
         (
             "adapter_reverse_edge_to_kernel",
@@ -1530,9 +1865,103 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-kernel -> splendor-adapter-http (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-authority, splendor-gateway, splendor-store, splendor-types. "
+                "Allowed direct internal deps: splendor-authority, splendor-evidence, splendor-gateway, splendor-store, splendor-types. "
                 "Rule/exception note: splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b "
-                "allows the bounded local delegation authority bridge in addition to types/store/gateway."
+                "allows the bounded local delegation authority bridge and RFC 0015 allows delegation to evidence semantics."
+            ],
+        ),
+        (
+            "ordinary_adapter_depends_on_authority",
+            fixture_with_dependency(
+                "splendor-adapter-http", "splendor-authority"
+            ),
+            [
+                "splendor-adapter-http -> splendor-authority (normal dependency) is forbidden. "
+                "Allowed direct internal deps: splendor-gateway, splendor-types. Rule/exception note: "
+                "Adapter crates may directly depend only on splendor-types and splendor-gateway; "
+                "no adapter -> kernel/store/daemon/adapter core edge."
+            ],
+        ),
+        (
+            "secret_provider_depends_on_gateway",
+            fixture_with_dependency(
+                "splendor-adapter-secrets-memory", "splendor-gateway"
+            ),
+            [
+                "splendor-adapter-secrets-memory -> splendor-gateway (normal dependency) is forbidden. "
+                + secret_provider_rule
+            ],
+        ),
+        (
+            "secret_provider_exact_dependencies_allowed",
+            accepted_metadata_fixture(),
+            [],
+        ),
+        (
+            "secret_provider_depends_on_kernel",
+            fixture_with_dependency(
+                "splendor-adapter-secrets-memory", "splendor-kernel"
+            ),
+            [
+                "splendor-adapter-secrets-memory -> splendor-kernel (normal dependency) is forbidden. "
+                + secret_provider_rule
+            ],
+        ),
+        (
+            "secret_provider_depends_on_store",
+            fixture_with_dependency(
+                "splendor-adapter-secrets-memory", "splendor-store"
+            ),
+            [
+                "splendor-adapter-secrets-memory -> splendor-store (normal dependency) is forbidden. "
+                + secret_provider_rule
+            ],
+        ),
+        (
+            "secret_provider_depends_on_daemon",
+            fixture_with_dependency(
+                "splendor-adapter-secrets-memory", "splendor-daemon"
+            ),
+            [
+                "splendor-adapter-secrets-memory -> splendor-daemon (normal dependency) is forbidden. "
+                + secret_provider_rule
+            ],
+        ),
+        (
+            "secret_provider_depends_on_http_adapter",
+            fixture_with_dependency(
+                "splendor-adapter-secrets-memory", "splendor-adapter-http"
+            ),
+            [
+                "splendor-adapter-secrets-memory -> splendor-adapter-http (normal dependency) is forbidden. "
+                + secret_provider_rule
+            ],
+        ),
+        (
+            "secret_provider_depends_on_node",
+            secret_provider_with_node,
+            [
+                "splendor-adapter-secrets-memory -> splendor-node (normal dependency) is forbidden. "
+                + secret_provider_rule,
+                "splendor-node: no current-baseline dependency policy is defined for this workspace package. "
+                "This FND-002 guard covers existing 0.1 crates/adapters only; add an accepted policy/RFC "
+                "or update this guard deliberately.",
+                "unexpected workspace package identity 'splendor-node' at "
+                "'binaries/splendor-node/Cargo.toml' appears 1 time(s); current-baseline governance "
+                "requires every workspace member to have an explicit expected package name and manifest path.",
+            ],
+        ),
+        (
+            "nested_secret_provider_does_not_receive_exception",
+            relocated_secret_provider,
+            [
+                "splendor-adapter-secrets-memory -> splendor-authority (normal dependency) is forbidden. "
+                "Allowed direct internal deps: splendor-gateway, splendor-types. Rule/exception note: "
+                "Adapter crates may directly depend only on splendor-types and splendor-gateway; "
+                "no adapter -> kernel/store/daemon/adapter core edge.",
+                "workspace package 'splendor-adapter-secrets-memory' has unexpected manifest identity "
+                "'adapters/experimental/secrets-memory/Cargo.toml'; expected "
+                "'adapters/secrets-memory/Cargo.toml'.",
             ],
         ),
         (
@@ -1542,9 +1971,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-daemon -> splendor-authority (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
-                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> "
-                "kernel/store/gateway/types composition seam only.",
+                "Allowed direct internal deps: splendor-evidence, splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
+                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition "
+                "seam to kernel/store/gateway/types/evidence only.",
                 "splendor-daemon -> splendor-authority (normal dependency) is forbidden by the exact "
                 "production dependency closure.",
             ],
@@ -1556,9 +1985,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-daemon -> splendor-adapter-http (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
-                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> "
-                "kernel/store/gateway/types composition seam only.",
+                "Allowed direct internal deps: splendor-evidence, splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
+                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition "
+                "seam to kernel/store/gateway/types/evidence only.",
                 "splendor-daemon -> splendor-adapter-http (normal dependency) is forbidden by the exact "
                 "production dependency closure.",
             ],
@@ -1570,9 +1999,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-daemon -> splendor-acceptance-action-host (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
-                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> "
-                "kernel/store/gateway/types composition seam only.",
+                "Allowed direct internal deps: splendor-evidence, splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
+                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition "
+                "seam to kernel/store/gateway/types/evidence only.",
                 "splendor-daemon -> splendor-acceptance-action-host (normal dependency) is forbidden by the exact "
                 "production dependency closure.",
                 "Dependency cycle detected among internal workspace packages: "
@@ -1857,6 +2286,10 @@ def accepted_metadata_fixture() -> dict[str, Any]:
     internal_dependencies: dict[str, list[tuple[str, str | None]]] = {
         "splendor-types": [],
         "splendor-store": [("splendor-types", None)],
+        "splendor-evidence": [
+            ("splendor-store", None),
+            ("splendor-types", None),
+        ],
         "splendor-authority": [
             ("splendor-store", None),
             ("splendor-types", None),
@@ -1867,6 +2300,7 @@ def accepted_metadata_fixture() -> dict[str, Any]:
         ],
         "splendor-kernel": [
             ("splendor-authority", None),
+            ("splendor-evidence", None),
             ("splendor-gateway", None),
             ("splendor-store", None),
             ("splendor-types", None),
@@ -1878,6 +2312,7 @@ def accepted_metadata_fixture() -> dict[str, Any]:
         "splendorctl": [
             ("splendor-adapter-filesystem", None),
             ("splendor-adapter-http", None),
+            ("splendor-evidence", None),
             ("splendor-gateway", None),
             ("splendor-kernel", None),
             ("splendor-store", None),
@@ -1901,6 +2336,14 @@ def accepted_metadata_fixture() -> dict[str, Any]:
             ("splendor-gateway", None),
             ("splendor-types", None),
         ],
+        "splendor-adapter-secrets-local-file": [
+            ("splendor-authority", None),
+            ("splendor-types", None),
+        ],
+        "splendor-adapter-secrets-memory": [
+            ("splendor-authority", None),
+            ("splendor-types", None),
+        ],
     }
 
     packages: list[dict[str, Any]] = []
@@ -1920,6 +2363,29 @@ def accepted_metadata_fixture() -> dict[str, Any]:
             dependency_fixture(dependency, kind)
             for dependency, kind in internal_dependencies[name]
         )
+        if name == "splendor-authority":
+            package["features"] = {
+                "default": [],
+                SECRET_PROVIDER_TEST_SUPPORT_FEATURE: [],
+            }
+        if name == LOCAL_FILE_SECRET_PROVIDER_PACKAGE:
+            package["publish"] = []
+            package["features"] = copy.deepcopy(
+                LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES
+            )
+            package["dependencies"].extend(
+                [
+                    dependency_fixture("blake3", repository_local=False),
+                    dependency_fixture("libc", repository_local=False),
+                    dependency_fixture("zeroize", repository_local=False),
+                    {
+                        **dependency_fixture("splendor-authority", "dev"),
+                        "features": [SECRET_PROVIDER_TEST_SUPPORT_FEATURE],
+                    },
+                    dependency_fixture("tempfile", "dev", repository_local=False),
+                    dependency_fixture("uuid", "dev", repository_local=False),
+                ]
+            )
         if name in {"splendor-adapter-http", "splendor-acceptance-action-host"}:
             package["dependencies"].append(
                 dependency_fixture("ureq", repository_local=False)
@@ -2082,10 +2548,10 @@ def excluded_http_adapter_expected_messages(
                 "'splendor-adapter-http' at 'adapters/http/Cargo.toml'. All repository-local Rust path "
                 "dependencies must remain governed workspace members.",
                 "splendor-kernel -> splendor-adapter-http (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-authority, splendor-gateway, splendor-store, "
+                "Allowed direct internal deps: splendor-authority, splendor-evidence, splendor-gateway, splendor-store, "
                 "splendor-types. Rule/exception note: splendor-kernel is the compatibility composition root; "
-                "RFC 0010 AUTH-003b allows the bounded local delegation authority bridge in addition to "
-                "types/store/gateway.",
+                "RFC 0010 AUTH-003b allows the bounded local delegation authority bridge and RFC 0015 allows "
+                "delegation to evidence semantics.",
             ]
         )
     if include_cycle:

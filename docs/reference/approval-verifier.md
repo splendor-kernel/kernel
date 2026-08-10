@@ -217,10 +217,16 @@ with `approval_receipt_resume_not_supported`, and a receipt-free resume is
 rejected with `approval_exact_action_retry_required`. None runs a scheduler tick
 or advances state.
 
-The caller instead submits `POST /actions` with the challenge's exact `action_id`,
-tenant/agent/run, action payload, effective adapter, quota, preconditions,
-`requested_at`, causal trace link, and the manager-issued
-`authority_obligation_receipts`. Any mismatch returns
+The caller instead retries the challenge through the same endpoint class that
+created it: tick/direct challenges use `POST /actions`, while physical challenges
+use `POST /devices/{original_node_id}/actions`. The retry carries the challenge's
+exact `action_id`, tenant/agent/run, action payload, effective adapter, quota,
+preconditions, `requested_at`, causal trace link, and the manager-issued
+`authority_obligation_receipts`. A direct/physical endpoint substitution returns
+`action_id_conflict` before another action episode or receipt claim. A different
+physical node fails the pending challenge's server-derived resource binding.
+Both leave `waiting_for_approval`, execute no adapter, and leave the receipt usable
+once at the original endpoint. Any other challenge mismatch returns
 `approval_challenge_retry_mismatch`. A successful exact retry executes once,
 records `RunResumed`, clears the pending challenge, and changes the run to
 `running` without starting another scheduler tick. The process-local receipt

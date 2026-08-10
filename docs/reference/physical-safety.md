@@ -45,6 +45,14 @@ policy facts fail closed. A caller cannot report a higher battery, clear an
 emergency stop/privacy/proximity condition, expand a geofence or altitude limit,
 unexpire policy, or turn cloud-helper authority into a direct actuator grant.
 
+Before a caller-supplied `DeviceRuntimeProfile` becomes that trusted process
+input, the daemon authenticates tenant/node scope and sends the complete serialized
+profile through the Gateway-owned bounded credential guard. Every nested string
+and object key is screened before audit or profile mutation. A denied profile
+cannot be read back, contribute zone refs or status to safety evidence, or reach a
+physical Gateway/simulator. The daemon retains profile validation and ownership;
+this screening does not turn profile metadata into Authority.
+
 Approval-gated physical actions use the same exact-challenge receipt contract as
 digital actions. Raw granted `ApprovalEvidence`, altered action/safety bindings,
 or a reused receipt cannot authorize a physical adapter call. The trusted receipt

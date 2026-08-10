@@ -126,7 +126,7 @@ The final journey must export a causal graph containing:
 | K-E2E-011 | Remote helper proposal without direct authority | `cargo test -p splendor-kernel --test integration_kernel_e2e_011_remote_helper_proposal` | `target/splendor-e2e/K-E2E-011-*` |
 | K-E2E-012 | Placement fallback under stale/capability mismatch | `cargo test -p splendor-kernel --test integration_kernel_e2e_012_placement_fallback` | `target/splendor-e2e/K-E2E-012-*` |
 | K-E2E-013 | Read-only state reference collaboration | `cargo test -p splendor-kernel --test integration_kernel_e2e_013_read_only_state_reference` | `target/splendor-e2e/K-E2E-013-*` |
-| K-E2E-014 | Adapter failure and safe retry boundaries | `cargo test -p splendor-kernel --test integration_kernel_e2e_014_adapter_failure_retry` | `target/splendor-e2e/K-E2E-014-*` |
+| K-E2E-014 | Adapter failure and fail-closed retry boundaries | `cargo test -p splendor-daemon --test integration_kernel_e2e_014_adapter_failure_retry` | `target/splendor-e2e/K-E2E-014-*` |
 | K-E2E-015 | OpenAPI daemon API contract and client workflow | `cargo test -p splendor-daemon --test integration_kernel_e2e_015_openapi_contract` and `npm test` | `target/splendor-e2e/K-E2E-015-*` |
 
 The aggregate script must collect all artifacts into:

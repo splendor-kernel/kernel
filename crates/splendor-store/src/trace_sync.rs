@@ -190,7 +190,8 @@ impl<S: TraceStore> LocalTraceBuffer<S> {
     ) -> Result<u64, LocalTraceBufferError> {
         let run_id = event.run_id.to_string();
         let payload = serde_json::to_value(event).map_err(LocalTraceBufferError::Serialization)?;
-        let sequence = self.append(&run_id, payload, mode)?;
+        self.ensure_capacity(&run_id, mode)?;
+        let sequence = self.store.append(&run_id, payload)?;
         if sequence != event.sequence {
             return Err(LocalTraceBufferError::SequenceMismatch {
                 expected: event.sequence,
@@ -805,6 +806,13 @@ fn validate_chain_link(
         )
     };
 
+    if record.run_id != run_id {
+        return Err(TraceSyncError::RunIdentityMismatch {
+            scope_run_id: run_id.to_string(),
+            record_run_id: record.run_id.clone(),
+            sequence: record.sequence,
+        });
+    }
     if record.prev_event_hash != expected_prev {
         return Err(TraceSyncError::ChainMismatch {
             run_id: run_id.to_string(),
@@ -813,7 +821,6 @@ fn validate_chain_link(
             actual_prev: record.prev_event_hash.clone(),
         });
     }
-
     let expected_hash =
         crate::trace::compute_event_hash(record.prev_event_hash.as_ref(), &record.payload)?;
     if record.event_hash != expected_hash {
@@ -824,7 +831,6 @@ fn validate_chain_link(
             actual_hash: record.event_hash.clone(),
         });
     }
-
     Ok(())
 }
 

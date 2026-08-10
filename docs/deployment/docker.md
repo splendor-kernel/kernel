@@ -123,6 +123,24 @@ Release image manifests are published for both `linux/amd64` and `linux/arm64` s
 Docker can select the native image on supported Intel/AMD and Apple Silicon/Linux
 ARM64 machines.
 
+Every branch, tag, and manual publication builds each platform candidate once,
+without registry authority, and uploads the resulting Docker archive plus its
+checksum. The `release-closure` job downloads that exact archive, verifies its
+checksum and OCI `org.opencontainers.image.revision` label against the same
+`GITHUB_SHA`, extracts its `splendorctl`, `splendor-daemon`, and
+`splendor-manager` binaries, and rejects development Secret Provider/test-support
+markers before smoke testing the same loaded image. It then publishes a checksum
+receipt for that archive. Only later publication jobs receive `packages: write`;
+they recheck the archive against the release-closure receipt and push the loaded
+candidate without rebuilding it. Platform digest and manifest publication cannot
+run when exact-artifact validation fails. Candidate, receipt, and digest artifact
+names are scoped to the workflow run attempt so a partial rerun cannot mix prior
+attempt bytes into a manifest; the manifest job also requires exactly two valid
+platform digest filenames before registry login. Rerun all publication jobs to
+produce a new attempt. The executable workflow guard rejects conditional or
+failure-ignored release verification and any changed or additional one-time image
+build input/build argument.
+
 ## GHCR package visibility
 
 The publish workflow builds and pushes with GitHub's default `GITHUB_TOKEN`, but

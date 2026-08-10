@@ -10,15 +10,21 @@ use splendor_daemon::caller_auth::{
 use splendor_daemon::{
     router, ApiErrorBody, ConfiguredActionAdapters, CreateRunRequest, CreateRunResponse,
     DaemonActionCandidate, DaemonConfig, DaemonState, DevicePolicyCacheStatus,
-    DeviceRuntimeProfile, DeviceTraceBufferStatus, LifecycleRequest, RegisterDeviceProfileRequest,
-    RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus, SafetyContext,
-    SubmitActionRequest, SubmitPhysicalActionRequest, TickResponse, TracePageResponse,
+    DeviceRuntimeProfile, DeviceTraceBufferStatus, LifecycleRequest, OperatorInterventionEvidence,
+    RegisterDeviceProfileRequest, RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus,
+    SafetyContext, SubmitActionRequest, SubmitPhysicalActionRequest, TickResponse,
+    TracePageResponse,
 };
 use splendor_gateway::{
     ActionAdapter, ActionOutcome, ActionRequest, ActionStatus, AdapterError, AdapterResult,
 };
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
-use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
+use splendor_store::{
+    InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits, RuntimeTracePage,
+    RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle, RuntimeTraceStoreIdentity,
+    RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle, RuntimeTraceWriterRequest,
+    TraceRecord, TraceStore, TraceStoreError,
+};
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
     AuditAttribution, AuthorityDecisionStatus, CallerCredential, ClientPrincipal,
@@ -97,7 +103,7 @@ fn blocking_action_adapters(
 #[derive(Default)]
 struct FailingAuthorityEvidenceStore {
     inner: InMemoryTraceStore,
-    fail_next_authority_allow: AtomicBool,
+    fail_next_authority_allow: Arc<AtomicBool>,
 }
 
 impl FailingAuthorityEvidenceStore {
@@ -142,6 +148,78 @@ impl TraceStore for FailingAuthorityEvidenceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(FailingAuthorityRuntimeWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            fail_next_authority_allow: Arc::clone(&self.fail_next_authority_allow),
+        }))
+    }
+}
+
+struct FailingAuthorityRuntimeWriter {
+    inner: RuntimeTraceWriterHandle,
+    fail_next_authority_allow: Arc<AtomicBool>,
+}
+
+impl RuntimeTraceReader for FailingAuthorityRuntimeWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for FailingAuthorityRuntimeWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        if is_authority_allow(&payload)
+            && self.fail_next_authority_allow.swap(false, Ordering::SeqCst)
+        {
+            return Err(RuntimeTracePortError::Unavailable);
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 
@@ -1458,6 +1536,317 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
 }
 
 #[tokio::test]
+async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator() {
+    const CANARY: &str = "C03_PHYSICAL_RAW_CREDENTIAL_CANARY";
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let (adapters, provider_entered, provider_release) = blocking_action_adapters("device-sim");
+    let state = DaemonState::with_trace_store_and_action_adapters(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+        adapters,
+    );
+    let app = router(state.clone());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let node_id = NodeId::new();
+    let create = physical_create_request(
+        "wo_c02_physical_raw_credential",
+        tenant_id.clone(),
+        agent_id.clone(),
+    );
+    let (status, created): (StatusCode, CreateRunResponse) =
+        call_json(app.clone(), Method::POST, "/runs", create).await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .map(|event| event.trace_event_id)
+        .next()
+        .expect("physical causal trace");
+    let profile_canary = "C03_DEVICE_PROFILE_SAFETY_EVIDENCE_CANARY";
+    let mut rejected_profile = device_profile(node_id.clone(), tenant_id.clone());
+    rejected_profile.safety_constraints["allowed_zones"] =
+        json!(["zone_a", format!("\u{feff}Basic dTpw {profile_canary}")]);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: rejected_profile,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED);
+    assert!(error.details.is_null());
+    assert!(!serde_json::to_string(&error)
+        .expect("profile denial serializes")
+        .contains(profile_canary));
+    let (status, missing): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::GET,
+        &format!("/devices/{node_id}/status"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "device_not_registered");
+
+    let profile_denial_trace_count = traces(app.clone(), &created.run_id).await.records.len();
+    let profile_denial_evaluations = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("pre-profile-denial authority evaluation count");
+    let uri = format!("/devices/{node_id}/actions");
+    let (status, missing): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &uri,
+        physical_submit_request(
+            &created,
+            tenant_id.clone(),
+            agent_id.clone(),
+            causal_trace_id.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "device_not_registered");
+    assert_eq!(
+        traces(app.clone(), &created.run_id).await.records.len(),
+        profile_denial_trace_count
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-profile-denial authority evaluation count"),
+        profile_denial_evaluations
+    );
+    assert!(matches!(
+        provider_entered.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    let (status, _registered): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: device_profile(node_id.clone(), tenant_id.clone()),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw = physical_submit_request(
+        &created,
+        tenant_id.clone(),
+        agent_id.clone(),
+        causal_trace_id.clone(),
+    );
+    let action_id = ActionId::new();
+    raw.action_request.action_id = Some(action_id.clone());
+    raw.action_request.action.params = json!({
+        "zone_ref": "zone_a",
+        "headers": {"X-Auth-Token": CANARY}
+    });
+    let evaluations_before = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("authority evaluation count");
+    let (status, denied): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, raw).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(denied.action_id, action_id);
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    );
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-denial authority evaluation count"),
+        evaluations_before
+    );
+    assert!(matches!(
+        provider_entered.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    let mut denied_action_ids = vec![action_id.clone()];
+    for field in [
+        "allowed_zone_ref",
+        "zone_ref",
+        "cloud_helper_proposal_id",
+        "intervention_id",
+        "intervention_action_name",
+        "intervention_decision",
+        "intervention_expires_at",
+    ] {
+        let canary = format!("C03_PHYSICAL_{}_CANARY", field.to_ascii_uppercase());
+        let credential_value =
+            format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
+        let mut request = physical_submit_request(
+            &created,
+            tenant_id.clone(),
+            agent_id.clone(),
+            causal_trace_id.clone(),
+        );
+        let envelope_action_id = ActionId::new();
+        request.action_request.action_id = Some(envelope_action_id.clone());
+        match field {
+            "allowed_zone_ref" => {
+                request.safety_context.allowed_zone_refs = vec![credential_value.clone()]
+            }
+            "zone_ref" => request.safety_context.zone_ref = Some(credential_value.clone()),
+            "cloud_helper_proposal_id" => {
+                request.safety_context.cloud_helper_proposal_id = Some(credential_value.clone())
+            }
+            intervention_field => {
+                let mut evidence = OperatorInterventionEvidence {
+                    intervention_id: "intervention-fixture".to_string(),
+                    tenant_id: tenant_id.clone(),
+                    run_id: created.run_id.clone(),
+                    action_name: "move_to_waypoint".to_string(),
+                    decision: "granted".to_string(),
+                    expires_at: "2030-01-01T00:00:00Z".to_string(),
+                };
+                match intervention_field {
+                    "intervention_id" => evidence.intervention_id = credential_value.clone(),
+                    "intervention_action_name" => evidence.action_name = credential_value.clone(),
+                    "intervention_decision" => evidence.decision = credential_value.clone(),
+                    "intervention_expires_at" => evidence.expires_at = credential_value.clone(),
+                    _ => unreachable!("closed physical envelope matrix"),
+                }
+                request.operator_intervention_evidence = Some(evidence);
+            }
+        }
+
+        let (status, denied): (StatusCode, ActionOutcome) =
+            call_json(app.clone(), Method::POST, &uri, request).await;
+        assert_eq!(status, StatusCode::OK, "{field}");
+        assert_eq!(denied.action_id, envelope_action_id, "{field}");
+        assert_eq!(denied.status, ActionStatus::Denied, "{field}");
+        assert_eq!(
+            denied.verification.reasons,
+            vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED],
+            "{field}"
+        );
+        assert!(!serde_json::to_string(&denied)
+            .expect("denial serializes")
+            .contains(&canary));
+        denied_action_ids.push(envelope_action_id);
+        assert!(matches!(
+            provider_entered.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-envelope-denial authority evaluation count"),
+        evaluations_before
+    );
+
+    let raw_records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw physical traces");
+    let encoded = serde_json::to_string(&raw_records).expect("raw traces serialize");
+    assert!(!encoded.contains(CANARY));
+    assert!(!encoded.contains(profile_canary));
+    assert!(!encoded.contains("C03_PHYSICAL_"));
+    let raw_events = raw_records
+        .iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .collect::<Vec<_>>();
+    for denied_action_id in &denied_action_ids {
+        let action_events = raw_events
+            .iter()
+            .filter(|event| event.identity.action_id.as_ref() == Some(denied_action_id))
+            .collect::<Vec<_>>();
+        assert_eq!(action_events.len(), 4);
+        assert!(action_events.iter().all(|event| match &event.kind {
+            TraceEventKind::ActionVerificationStarted { action }
+            | TraceEventKind::ActionVerificationCompleted { action, .. }
+            | TraceEventKind::ActionDenied { action, .. } => {
+                action == &splendor_gateway::raw_credential_denied_action()
+            }
+            TraceEventKind::OutcomeRecorded { .. } => true,
+            _ => false,
+        }));
+    }
+
+    let replay_caller = replay_credential(tenant_id.clone());
+    let executions_before_replay = inspect(app.clone(), &created.run_id)
+        .await
+        .adapter_executions;
+    let evaluations_before_replay = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("pre-replay authority evaluations");
+    let (status, replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({
+            "mode": "inspect_only",
+            "side_effects_allowed": false,
+            "audit_attribution": credential_audit(&replay_caller),
+            "credential": replay_caller,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay.mode, "inspect_only");
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        executions_before_replay
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-replay authority evaluations"),
+        evaluations_before_replay
+    );
+
+    provider_release
+        .send(())
+        .expect("release credential-free provider call");
+    let safe = physical_submit_request(&created, tenant_id, agent_id, causal_trace_id);
+    let (status, executed): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, safe).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(executed.status, ActionStatus::Executed);
+    provider_entered
+        .try_recv()
+        .expect("credential-free action reaches configured provider");
+    assert!(matches!(
+        provider_entered.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
+}
+
+#[tokio::test]
 async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     let app = router(support::local_state(&["device-sim"]));
     let tenant_id = TenantId::new();
@@ -1549,7 +1938,7 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     )
     .with_action_name("move_to_waypoint")
     .with_adapter("device-sim");
-    legacy.action_id = Some(action_id);
+    legacy.action_id = Some(action_id.clone());
     let mut forged_legacy = submit.clone();
     forged_legacy.action_request.approval_evidence = Some(legacy);
     let trace_count_before_raw_grant = traces(app.clone(), &created.run_id).await.records.len();
@@ -1569,6 +1958,69 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     let receipt = local_approval_receipt_config()
         .issue_approval_receipt(&challenge, TraceEventId::new(), OffsetDateTime::now_utc())
         .expect("physical approval receipt");
+    let mut wrong_endpoint = submit.action_request.clone();
+    wrong_endpoint.authority_obligation_receipts = vec![receipt.clone()];
+    let action_starts_before_mismatch = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .filter(|event| {
+            event.identity.action_id.as_ref() == Some(&action_id)
+                && matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+        })
+        .count();
+    assert_eq!(action_starts_before_mismatch, 1);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, "/actions", wrong_endpoint).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "action_id_conflict");
+    let after_wrong_endpoint = inspect(app.clone(), &created.run_id).await;
+    assert_eq!(after_wrong_endpoint.status, RunStatus::WaitingForApproval);
+    assert_eq!(after_wrong_endpoint.adapter_executions, 0);
+
+    let other_node_id = NodeId::new();
+    let (status, _registered): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: device_profile(other_node_id.clone(), challenge.tenant_id.clone()),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut wrong_node = submit.clone();
+    wrong_node.action_request.authority_obligation_receipts = vec![receipt.clone()];
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/devices/{other_node_id}/actions"),
+        wrong_node,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "approval_challenge_retry_mismatch");
+    let after_wrong_node = inspect(app.clone(), &created.run_id).await;
+    assert_eq!(after_wrong_node.status, RunStatus::WaitingForApproval);
+    assert_eq!(after_wrong_node.adapter_executions, 0);
+    assert_eq!(
+        traces(app.clone(), &created.run_id)
+            .await
+            .records
+            .into_iter()
+            .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+            .filter(|event| {
+                event.identity.action_id.as_ref() == Some(&action_id)
+                    && matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+            })
+            .count(),
+        action_starts_before_mismatch,
+        "endpoint/node mismatch must not open another action episode"
+    );
+
     let mut altered = submit.clone();
     altered.action_request.action.params = json!({"zone_ref": "zone_b"});
     altered.action_request.authority_obligation_receipts = vec![receipt.clone()];
@@ -1592,14 +2044,11 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     assert_eq!(inspected.status, RunStatus::Running);
     assert_eq!(inspected.adapter_executions, 1);
 
-    let (status, replayed): (StatusCode, ActionOutcome) =
+    let (status, conflict): (StatusCode, ApiErrorBody) =
         call_json(app.clone(), Method::POST, &uri, submit).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(replayed.status, ActionStatus::Denied);
-    assert!(replayed
-        .verification
-        .reasons
-        .contains(&"authority_obligation_receipt_replayed".to_string()));
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict.code, "action_id_conflict");
+    assert_eq!(conflict.details["retryable"], false);
     assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
 }
 
@@ -1760,7 +2209,8 @@ async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: 
     let (status, error): (StatusCode, ApiErrorBody) =
         call_json(app.clone(), Method::POST, &action_uri, post_close_body).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(error.code, "run_not_effect_capable");
+    assert_eq!(error.code, "action_in_progress");
+    assert_eq!(error.details["retryable"], true);
 
     release.send(()).expect("release blocking adapter");
     let (status, outcome) = action_task.await.expect("action task");

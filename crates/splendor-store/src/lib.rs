@@ -15,6 +15,7 @@
 //! ```
 
 mod identity;
+mod runtime_trace;
 mod state;
 mod trace;
 mod trace_sync;
@@ -22,6 +23,14 @@ mod trace_sync;
 pub use identity::{
     IdentityHistoryRecord, InMemoryPrincipalRegistryStore, PrincipalRegistryStore,
     PrincipalRegistryStoreError,
+};
+pub use runtime_trace::{
+    compute_trace_envelope_hash, RuntimeTraceAppend, RuntimeTraceFence, RuntimeTraceLimits,
+    RuntimeTracePage, RuntimeTracePortError, RuntimeTraceProfile, RuntimeTraceReader,
+    RuntimeTraceReaderHandle, RuntimeTraceScope, RuntimeTraceStoreIdentity, RuntimeTraceTail,
+    RuntimeTraceWriter, RuntimeTraceWriterHandle, RuntimeTraceWriterRequest,
+    DEFAULT_RUNTIME_TRACE_MAX_BYTES, DEFAULT_RUNTIME_TRACE_MAX_PAYLOAD_BYTES,
+    DEFAULT_RUNTIME_TRACE_MAX_RECORDS, MAX_RUNTIME_TRACE_PAGE_RECORDS, RUNTIME_TRACE_LOCK_SHARDS,
 };
 pub use splendor_types::{SnapshotId, StateNodeId};
 pub use state::{

@@ -743,6 +743,12 @@ def main() -> int:
     provider_failure_artifacts = provider_failure.get("verification", {}).get(
         "artifacts", {}
     )
+    provider_failure_post = provider_failure.get("post_verification")
+    provider_failure_post_artifacts = (
+        provider_failure_post.get("artifacts", {})
+        if isinstance(provider_failure_post, dict)
+        else {}
+    )
     provider_failure_entries = [
         entry
         for entry in provider_after_failure.get("actions", [])
@@ -752,11 +758,17 @@ def main() -> int:
         provider_failure.get("status") == "Failed"
         and provider_failure.get("error") == "adapter failed"
         and provider_failure.get("output") is None
-        and provider_failure.get("post_verification") is None
+        and isinstance(provider_failure_post, dict)
+        and provider_failure_post.get("allowed") is False
+        and "adapter failed" in provider_failure_post.get("reasons", [])
+        and provider_failure_post_artifacts.get("adapter_entered") is True
+        and provider_failure_post_artifacts.get("effect_certainty") == "uncertain"
+        and provider_failure_post_artifacts.get("reconciliation_required") is True
+        and provider_failure_post_artifacts.get("retry_class") == "not_retryable"
         and isinstance(provider_failure_artifacts, dict)
         and "adapter_failure" not in provider_failure_artifacts
         and "splendor.adapter_failure.v1" not in json.dumps(provider_failure)
-        and failure_inspect.get("adapter_executions") == 0
+        and failure_inspect.get("adapter_executions") == 1
         and provider_after_failure.get("by_action", {}).get(PROVIDER_FAILURE_ACTION, 0)
         - provider_before_failure.get("by_action", {}).get(PROVIDER_FAILURE_ACTION, 0)
         == 1

@@ -54,6 +54,7 @@ mod placement;
 mod policy_distribution;
 mod primitives;
 mod schema_extensions;
+mod secret_lease;
 mod secret_ref;
 mod secret_use_requirement;
 mod secrets;
@@ -234,6 +235,22 @@ pub use schema_extensions::{
     validate_extension_map_with_reserved_keys, validate_extension_value,
     validate_extension_value_with_reserved_keys, ExtensionValidationError,
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
+};
+pub use secret_lease::{
+    ProcessLocalSecretBrokerCommandId,
+    SecretAccessDenialCode as ProcessLocalSecretAccessDenialCode,
+    SecretAccessEvidence as ProcessLocalSecretAccessEvidence,
+    SecretAccessEvidenceKind as ProcessLocalSecretAccessEvidenceKind,
+    SecretAccessEvidenceOutcome as ProcessLocalSecretAccessEvidenceOutcome,
+    SecretLeaseContractError as ProcessLocalSecretLeaseContractError,
+    SecretLeaseRequest as ProcessLocalSecretLeaseRequest,
+    SecretLeaseSnapshot as ProcessLocalSecretLeaseSnapshot,
+    SecretLeaseStatus as ProcessLocalSecretLeaseStatus,
+    SecretLeaseUseBinding as ProcessLocalSecretLeaseUseBinding,
+    SECRET_ACCESS_EVIDENCE_SCHEMA_V1 as PROCESS_LOCAL_SECRET_ACCESS_EVIDENCE_SCHEMA_V1,
+    SECRET_LEASE_REQUEST_SCHEMA_V1 as PROCESS_LOCAL_SECRET_LEASE_REQUEST_SCHEMA_V1,
+    SECRET_LEASE_SNAPSHOT_SCHEMA_V1 as PROCESS_LOCAL_SECRET_LEASE_SNAPSHOT_SCHEMA_V1,
+    SECRET_LEASE_USE_BINDING_SCHEMA_V1 as PROCESS_LOCAL_SECRET_LEASE_USE_BINDING_SCHEMA_V1,
 };
 pub use secret_ref::{
     compare_secret_credential_authorization_v2, HistoricalSecretCredentialAuthorizationV1,

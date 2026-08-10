@@ -9,6 +9,14 @@
 //! replace daemon authentication, durable evidence/replay services, gateway
 //! verification, revocation-watch services, production lease renewal, or adapter
 //! execution.
+//!
+//! The incomplete process-local Secret Broker lifecycle is intentionally not a
+//! crate-root API. Only its outbound provider port is public for explicit
+//! adapter implementations:
+//!
+//! ```compile_fail
+//! use splendor_authority::ProcessLocalSecretBroker;
+//! ```
 
 mod capability;
 mod delegation;
@@ -20,6 +28,8 @@ mod obligations;
 mod renewal;
 mod revocation;
 mod run_authority;
+#[cfg_attr(not(test), allow(dead_code))]
+mod secrets;
 
 pub use capability::{
     compatibility_permission_operation, ensure_child_grant_narrows, evaluate_capability_request,
@@ -109,6 +119,23 @@ pub use revocation::{
 pub use run_authority::{
     LocalRunAuthorityAdmissionError, LocalRunAuthorityEffectPermit,
     LocalRunAuthorityPermitEvaluation, LocalSignedWorkOrderRunAuthority,
+};
+#[cfg(feature = "secret-provider-test-support")]
+#[doc(hidden)]
+pub use secrets::secret_provider_test_support;
+pub use secrets::{
+    SecretProvider as ProcessLocalSecretProvider,
+    SecretProviderAuditEvidence as ProcessLocalSecretProviderAuditEvidence,
+    SecretProviderControlRequest as ProcessLocalSecretProviderControlRequest,
+    SecretProviderError as ProcessLocalSecretProviderError,
+    SecretProviderErrorCode as ProcessLocalSecretProviderErrorCode,
+    SecretProviderFetchRequest as ProcessLocalSecretProviderFetchRequest,
+    SecretProviderFetchResult as ProcessLocalSecretProviderFetchResult,
+    SecretProviderHealthEvidence as ProcessLocalSecretProviderHealthEvidence,
+    SecretProviderOperation as ProcessLocalSecretProviderOperation,
+    SecretProviderOutcome as ProcessLocalSecretProviderOutcome,
+    SECRET_PROVIDER_AUDIT_EVIDENCE_SCHEMA_LOCAL_V1 as PROCESS_LOCAL_SECRET_PROVIDER_AUDIT_EVIDENCE_SCHEMA_V1,
+    SECRET_PROVIDER_HEALTH_EVIDENCE_SCHEMA_LOCAL_V1 as PROCESS_LOCAL_SECRET_PROVIDER_HEALTH_EVIDENCE_SCHEMA_V1,
 };
 
 #[cfg(test)]

@@ -1,20 +1,344 @@
 use super::*;
 use crate::SnapshotPolicy;
 use splendor_store::{
-    InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
-    StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceStoreError,
+    InMemoryStateStore, InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits,
+    RuntimeTracePage, RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle,
+    RuntimeTraceStoreIdentity, RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle,
+    RuntimeTraceWriterRequest, SqliteTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
+    StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceRecord, TraceStoreError,
 };
 use splendor_types::{
     validate_policy_bundle, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId,
     ApprovalTraceContext, ConstraintKind, ConstraintScope, DelegatedAuthority, PerceptProvenance,
     PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring,
     PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyDegradedMode, QuotaUsage,
-    RevocationStatus, RunId, StateHandoffAuthority, TenantId, TraceEvent, TraceId, WorkOrder,
-    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    WORK_ORDER_SCHEMA_VERSION,
+    RevocationStatus, RunId, StateHandoffAuthority, TenantId, TickId, TraceEvent, TraceEventId,
+    TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement,
+    WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Barrier, Mutex};
+
+fn activate_test_runtime_writer(
+    runtime: &KernelRuntime,
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+) -> RuntimeWriterLease {
+    let writer = runtime
+        .acquire_engine_writer(tenant_id, agent_id)
+        .expect("runtime writer");
+    let inspected = inspect_trace(writer.reader(), runtime.run_id()).expect("validated trace");
+    runtime
+        .activate_engine_writer(&writer, inspected.tail)
+        .expect("activate runtime writer");
+    writer
+}
+
+#[derive(Clone)]
+struct CountingRuntimeTraceStore {
+    inner: InMemoryTraceStore,
+    history_reads: Arc<AtomicUsize>,
+    writer_acquisitions: Arc<AtomicUsize>,
+}
+
+impl CountingRuntimeTraceStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryTraceStore::default(),
+            history_reads: Arc::new(AtomicUsize::new(0)),
+            writer_acquisitions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl TraceStore for CountingRuntimeTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        TraceStore::append(&self.inner, run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read(&self.inner, run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read_range(&self.inner, run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        self.writer_acquisitions.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire_runtime_writer(request)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPausePhase {
+    InitialTail,
+    HistoryPage,
+    ValidationTailConfirmation,
+    StateRestore,
+    RestoredTailConfirmation,
+    CursorActivation,
+}
+
+struct RecoveryPauseGate {
+    phase: RecoveryPausePhase,
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+    paused: AtomicBool,
+}
+
+impl RecoveryPauseGate {
+    fn new(phase: RecoveryPausePhase) -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
+        let (entered_sender, entered_receiver) = sync_channel(0);
+        let (release_sender, release_receiver) = sync_channel(0);
+        (
+            Arc::new(Self {
+                phase,
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                paused: AtomicBool::new(false),
+            }),
+            entered_receiver,
+            release_sender,
+        )
+    }
+
+    fn pause(&self, phase: RecoveryPausePhase) {
+        if self.phase != phase || self.paused.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.entered.send(()).expect("announce recovery phase");
+        self.release
+            .lock()
+            .expect("recovery release lock")
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("release recovery phase");
+    }
+}
+
+#[derive(Clone)]
+struct RecoveryControlledTraceStore {
+    inner: Arc<SqliteTraceStore>,
+    gate: Option<Arc<RecoveryPauseGate>>,
+    history_calls: Arc<AtomicUsize>,
+    writer_acquisitions: Arc<AtomicUsize>,
+}
+
+impl RecoveryControlledTraceStore {
+    fn new(inner: Arc<SqliteTraceStore>, gate: Option<Arc<RecoveryPauseGate>>) -> Self {
+        Self {
+            inner,
+            gate,
+            history_calls: Arc::new(AtomicUsize::new(0)),
+            writer_acquisitions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl TraceStore for RecoveryControlledTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        TraceStore::append(self.inner.as_ref(), run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read(self.inner.as_ref(), run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read_range(self.inner.as_ref(), run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        self.writer_acquisitions.fetch_add(1, Ordering::SeqCst);
+        let writer = self.inner.acquire_runtime_writer(request)?;
+        Ok(Arc::new(RecoveryControlledWriter {
+            inner: writer,
+            gate: self.gate.clone(),
+            history_calls: Arc::clone(&self.history_calls),
+            confirm_calls: AtomicUsize::new(0),
+            identity_calls: AtomicUsize::new(0),
+        }))
+    }
+}
+
+struct RecoveryControlledWriter {
+    inner: RuntimeTraceWriterHandle,
+    gate: Option<Arc<RecoveryPauseGate>>,
+    history_calls: Arc<AtomicUsize>,
+    confirm_calls: AtomicUsize,
+    identity_calls: AtomicUsize,
+}
+
+impl RecoveryControlledWriter {
+    fn pause(&self, phase: RecoveryPausePhase) {
+        if let Some(gate) = self.gate.as_ref() {
+            gate.pause(phase);
+        }
+    }
+}
+
+impl RuntimeTraceReader for RecoveryControlledWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        let call = self.identity_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 2 {
+            self.pause(RecoveryPausePhase::CursorActivation);
+        }
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        self.pause(RecoveryPausePhase::InitialTail);
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        self.pause(RecoveryPausePhase::HistoryPage);
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.confirm_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            self.pause(RecoveryPausePhase::ValidationTailConfirmation);
+        } else if call == 2 {
+            self.pause(RecoveryPausePhase::RestoredTailConfirmation);
+        }
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for RecoveryControlledWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
+    }
+}
+
+struct RecoveryControlledStateStore {
+    inner: Arc<InMemoryStateStore>,
+    gate: Option<Arc<RecoveryPauseGate>>,
+    snapshot_loads: Arc<AtomicUsize>,
+}
+
+impl StateStore for RecoveryControlledStateStore {
+    fn put_state(&self, state: StateData) -> Result<StateDataRef, StateStoreError> {
+        self.inner.put_state(state)
+    }
+
+    fn get_state(&self, data_ref: &StateDataRef) -> Result<StateData, StateStoreError> {
+        self.inner.get_state(data_ref)
+    }
+
+    fn commit_node(
+        &self,
+        parent_ids: Vec<StateNodeId>,
+        data_ref: StateDataRef,
+        metadata: StateMetadata,
+    ) -> Result<StateNodeId, StateStoreError> {
+        self.inner.commit_node(parent_ids, data_ref, metadata)
+    }
+
+    fn get_node(&self, node_id: &StateNodeId) -> Result<StateNode, StateStoreError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn snapshot(&self, node_id: &StateNodeId) -> Result<SnapshotId, StateStoreError> {
+        self.inner.snapshot(node_id)
+    }
+
+    fn load_snapshot(&self, snapshot_id: &SnapshotId) -> Result<StateSnapshot, StateStoreError> {
+        self.snapshot_loads.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.gate.as_ref() {
+            gate.pause(RecoveryPausePhase::StateRestore);
+        }
+        self.inner.load_snapshot(snapshot_id)
+    }
+}
+
+struct RecoveryCountingPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Policy for RecoveryCountingPolicy {
+    fn name(&self) -> &str {
+        "recovery-counting"
+    }
+
+    fn decide(
+        &self,
+        state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyDecision::new(Vec::new(), state.clone(), None))
+    }
+}
 
 struct LoopPolicyTraceRecorder;
 
@@ -71,6 +395,30 @@ impl crate::TraceSink for FailingStateHandoffImportedTraceSink {
         if matches!(event.kind, TraceEventKind::StateHandoffImported { .. }) {
             return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ArmableStateCommittedTraceSink {
+    events: Arc<Mutex<Vec<TraceEvent>>>,
+    armed: Arc<AtomicBool>,
+}
+
+impl ArmableStateCommittedTraceSink {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl crate::TraceSink for ArmableStateCommittedTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        if matches!(event.kind, TraceEventKind::StateCommitted { .. })
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
+        }
+        self.events.lock().expect("events lock").push(event.clone());
         Ok(())
     }
 }
@@ -502,6 +850,11 @@ impl OutcomeEvaluator for RecordingOutcomeEvaluator {
 
 struct FailingStateStore;
 
+struct RestoreCountingStateStore {
+    inner: Arc<InMemoryStateStore>,
+    snapshot_loads: Arc<AtomicUsize>,
+}
+
 impl StateStore for FailingStateStore {
     fn put_state(&self, _state: StateData) -> Result<StateDataRef, StateStoreError> {
         Err(StateStoreError::MissingState)
@@ -536,6 +889,38 @@ impl StateStore for FailingStateStore {
         _snapshot_id: &splendor_types::SnapshotId,
     ) -> Result<StateSnapshot, StateStoreError> {
         Err(StateStoreError::MissingSnapshot)
+    }
+}
+
+impl StateStore for RestoreCountingStateStore {
+    fn put_state(&self, state: StateData) -> Result<StateDataRef, StateStoreError> {
+        self.inner.put_state(state)
+    }
+
+    fn get_state(&self, data_ref: &StateDataRef) -> Result<StateData, StateStoreError> {
+        self.inner.get_state(data_ref)
+    }
+
+    fn commit_node(
+        &self,
+        parent_ids: Vec<StateNodeId>,
+        data_ref: StateDataRef,
+        metadata: StateMetadata,
+    ) -> Result<StateNodeId, StateStoreError> {
+        self.inner.commit_node(parent_ids, data_ref, metadata)
+    }
+
+    fn get_node(&self, node_id: &StateNodeId) -> Result<StateNode, StateStoreError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn snapshot(&self, node_id: &StateNodeId) -> Result<SnapshotId, StateStoreError> {
+        self.inner.snapshot(node_id)
+    }
+
+    fn load_snapshot(&self, snapshot_id: &SnapshotId) -> Result<StateSnapshot, StateStoreError> {
+        self.snapshot_loads.fetch_add(1, Ordering::SeqCst);
+        self.inner.load_snapshot(snapshot_id)
     }
 }
 
@@ -868,9 +1253,11 @@ fn loop_engine_trace_failure_before_action_dispatch_stops_gateway_and_state_adva
         bytes: initial_bytes.clone(),
         content_type: None,
     };
+    let agent_id = splendor_types::AgentId::new();
+    let tenant_id = splendor_types::TenantId::new();
     let agent = AgentContext::new(
-        splendor_types::AgentId::new(),
-        splendor_types::TenantId::new(),
+        agent_id.clone(),
+        tenant_id.clone(),
         crate::AgentRuntimeConfig::default(),
     );
     let calls = Arc::new(Mutex::new(0));
@@ -912,6 +1299,133 @@ fn loop_engine_trace_failure_before_action_dispatch_stops_gateway_and_state_adva
             | TraceEventKind::StateCommitted { .. }
             | TraceEventKind::LoopTickCompleted { .. }
     )));
+}
+
+#[test]
+fn state_committed_append_failure_restores_visible_state_and_latches_next_tick() {
+    struct IncrementStateWithoutActions {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Policy for IncrementStateWithoutActions {
+        fn name(&self) -> &str {
+            "increment-state-without-actions"
+        }
+
+        fn decide(
+            &self,
+            state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, LoopError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = state.bytes.first().copied().unwrap_or_default() + 1;
+            Ok(PolicyDecision::new(
+                Vec::new(),
+                StateData {
+                    bytes: vec![next],
+                    content_type: state.content_type.clone(),
+                },
+                Some("state-only".to_string()),
+            ))
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = ArmableStateCommittedTraceSink {
+        events: Arc::clone(&events),
+        armed: Arc::new(AtomicBool::new(false)),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink.clone()),
+        ..KernelRuntimeConfig::default()
+    });
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let gateway_calls = Arc::new(Mutex::new(0));
+    let initial_state = StateData {
+        bytes: vec![0],
+        content_type: Some("application/octet-stream".to_string()),
+    };
+    let mut engine = LoopEngine::with_runtime(
+        AgentContext::new(
+            AgentId::new(),
+            TenantId::new(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        initial_state,
+        Box::new(IncrementStateWithoutActions {
+            calls: Arc::clone(&policy_calls),
+        }),
+        Arc::new(CountingGateway {
+            calls: Arc::clone(&gateway_calls),
+        }),
+        runtime,
+    );
+
+    let first = engine.tick(1).expect("first state-only tick");
+    let prior_head = first.state_commit.node_id;
+    assert_eq!(engine.state.bytes, vec![1]);
+    assert_eq!(engine.state_graph.tick(), 1);
+    assert_eq!(engine.state_graph.head(), Some(&prior_head));
+    assert_eq!(engine.agent.state_head.as_ref(), Some(&prior_head));
+
+    sink.arm();
+    let error = engine
+        .tick(2)
+        .expect_err("StateCommitted append must fail the tick");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(crate::TraceError::Store(TraceStoreError::Poisoned))
+    ));
+    assert!(engine.requires_reconciliation());
+    assert!(matches!(
+        engine.reconciliation_block,
+        Some(TickReconciliationBlock::PersistenceDenied)
+    ));
+    assert_eq!(engine.state.bytes, vec![1]);
+    assert_eq!(engine.state_graph.tick(), 1);
+    assert_eq!(engine.state_graph.head(), Some(&prior_head));
+    assert_eq!(engine.agent.state_head.as_ref(), Some(&prior_head));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*gateway_calls.lock().expect("gateway calls"), 0);
+
+    let event_count = events.lock().expect("events lock").len();
+    let second_error = engine
+        .tick(3)
+        .expect_err("failed commit trace must block another tick");
+    assert!(matches!(
+        second_error,
+        LoopError::Policy(ref reason) if reason == TICK_RECONCILIATION_REQUIRED
+    ));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*gateway_calls.lock().expect("gateway calls"), 0);
+    let recorded = events.lock().expect("events lock");
+    assert_eq!(recorded.len(), event_count);
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::StateCommitted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::LoopTickStarted { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::LoopTickCompleted { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -998,8 +1512,21 @@ fn loop_engine_state_commit_failure_does_not_complete_tick() {
 
     let error = engine.tick(1).expect_err("state commit failure");
     assert!(matches!(error, LoopError::StateGraph(_)));
+    assert!(engine.requires_reconciliation());
+    assert!(matches!(
+        engine.reconciliation_block,
+        Some(TickReconciliationBlock::PersistenceDenied)
+    ));
     assert_eq!(engine.state_graph.tick(), 0);
     assert!(engine.agent.state_head.is_none());
+
+    let second_error = engine
+        .tick(2)
+        .expect_err("state commit failure must block another tick");
+    assert!(matches!(
+        second_error,
+        LoopError::Policy(ref reason) if reason == TICK_RECONCILIATION_REQUIRED
+    ));
 
     let recorded = events.lock().expect("events lock");
     assert!(recorded
@@ -1382,9 +1909,11 @@ fn loop_engine_resumes_from_trace_store() {
         bytes: vec![1],
         content_type: None,
     };
+    let agent_id = splendor_types::AgentId::new();
+    let tenant_id = splendor_types::TenantId::new();
     let agent = AgentContext::new(
-        splendor_types::AgentId::new(),
-        splendor_types::TenantId::new(),
+        agent_id.clone(),
+        tenant_id.clone(),
         crate::AgentRuntimeConfig::default(),
     );
     let gateway = Arc::new(StubGateway);
@@ -1402,13 +1931,10 @@ fn loop_engine_resumes_from_trace_store() {
     .expect("engine");
     engine.add_perceptor(StaticPerceptor);
     engine.tick(1).expect("tick");
+    drop(engine);
 
     let graph = StateGraph::new(state_store, snapshot_policy);
-    let agent = AgentContext::new(
-        splendor_types::AgentId::new(),
-        splendor_types::TenantId::new(),
-        crate::AgentRuntimeConfig::default(),
-    );
+    let agent = AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default());
     let gateway = Arc::new(StubGateway);
     let engine = LoopEngine::resume_from_trace_store(
         agent,
@@ -1424,6 +1950,1407 @@ fn loop_engine_resumes_from_trace_store() {
     assert_eq!(engine.state_graph.tick(), 1);
     assert!(engine.agent.state_head.is_some());
     assert_eq!(engine.runtime.run_id(), &run_id);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PersistedTraceCorruption {
+    Payload,
+    CompletionIntegrity,
+    EventHash,
+    PriorHash,
+    Delete,
+    Reorder,
+    Insert,
+}
+
+fn corrupt_persisted_trace(
+    path: &std::path::Path,
+    run_id: &RunId,
+    corruption: PersistedTraceCorruption,
+) {
+    let connection = rusqlite::Connection::open(path).expect("corruption connection");
+    connection
+        .execute_batch(
+            "DROP TRIGGER trace_anchored_insert_guard;\
+             DROP TRIGGER trace_anchored_update_guard;\
+             DROP TRIGGER trace_anchored_delete_guard;",
+        )
+        .expect("disable mutation guards for corruption fixture");
+    let run_id = run_id.to_string();
+    match corruption {
+        PersistedTraceCorruption::Payload => {
+            let payload: Vec<u8> = connection
+                .query_row(
+                    "SELECT payload FROM trace_events WHERE run_id = ?1 AND sequence = 2",
+                    rusqlite::params![run_id],
+                    |row| row.get(0),
+                )
+                .expect("payload to corrupt");
+            let mut event: TraceEvent =
+                serde_json::from_slice(&payload).expect("persisted trace event");
+            event.kind = TraceEventKind::PolicyCompleted {
+                policy: "attacker-rewritten".to_string(),
+            };
+            let payload = serde_json::to_vec(&event).expect("corrupt payload bytes");
+            connection
+                .execute(
+                    "UPDATE trace_events SET payload = ?1 WHERE run_id = ?2 AND sequence = 2",
+                    rusqlite::params![payload, run_id],
+                )
+                .expect("mutate payload");
+        }
+        PersistedTraceCorruption::CompletionIntegrity => {
+            let (sequence, payload): (i64, Vec<u8>) = connection
+                .query_row(
+                    "SELECT sequence, payload FROM trace_events WHERE run_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                    rusqlite::params![run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("completion payload to corrupt");
+            let mut event: TraceEvent =
+                serde_json::from_slice(&payload).expect("persisted completion event");
+            let TraceEventKind::LoopTickCompleted {
+                integrity: Some(integrity),
+                ..
+            } = &mut event.kind
+            else {
+                panic!("latest event must be a completed tick");
+            };
+            integrity.event_hash = ContentHash::blake3(b"attacker-completion-integrity");
+            let payload = serde_json::to_vec(&event).expect("corrupt completion payload bytes");
+            connection
+                .execute(
+                    "UPDATE trace_events SET payload = ?1 WHERE run_id = ?2 AND sequence = ?3",
+                    rusqlite::params![payload, run_id, sequence],
+                )
+                .expect("mutate completion integrity");
+        }
+        PersistedTraceCorruption::EventHash => {
+            connection
+                .execute(
+                    "UPDATE trace_events SET event_hash_value = 'attacker-event-hash' WHERE run_id = ?1 AND sequence = 2",
+                    rusqlite::params![run_id],
+                )
+                .expect("mutate event hash");
+        }
+        PersistedTraceCorruption::PriorHash => {
+            connection
+                .execute(
+                    "UPDATE trace_events SET prev_hash_value = 'attacker-prior-hash' WHERE run_id = ?1 AND sequence = 2",
+                    rusqlite::params![run_id],
+                )
+                .expect("mutate prior hash");
+        }
+        PersistedTraceCorruption::Delete => {
+            connection
+                .execute(
+                    "DELETE FROM trace_events WHERE run_id = ?1 AND sequence = 2",
+                    rusqlite::params![run_id],
+                )
+                .expect("delete trace event");
+        }
+        PersistedTraceCorruption::Reorder => {
+            connection
+                .execute(
+                    "UPDATE trace_events SET sequence = -1 WHERE run_id = ?1 AND sequence = 2",
+                    rusqlite::params![run_id],
+                )
+                .expect("move first event");
+            connection
+                .execute(
+                    "UPDATE trace_events SET sequence = 2 WHERE run_id = ?1 AND sequence = 3",
+                    rusqlite::params![run_id],
+                )
+                .expect("move second event");
+            connection
+                .execute(
+                    "UPDATE trace_events SET sequence = 3 WHERE run_id = ?1 AND sequence = -1",
+                    rusqlite::params![run_id],
+                )
+                .expect("finish reorder");
+        }
+        PersistedTraceCorruption::Insert => {
+            connection
+                .execute(
+                    "INSERT INTO trace_events (run_id, sequence, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value) SELECT run_id, 999, payload, recorded_at, event_hash_algo, event_hash_value, prev_hash_algo, prev_hash_value FROM trace_events WHERE run_id = ?1 AND sequence = 2",
+                    rusqlite::params![run_id],
+                )
+                .expect("insert trace event");
+        }
+    }
+}
+
+#[test]
+fn resume_rejects_every_persisted_trace_corruption_before_state_restore() {
+    for corruption in [
+        PersistedTraceCorruption::Payload,
+        PersistedTraceCorruption::CompletionIntegrity,
+        PersistedTraceCorruption::EventHash,
+        PersistedTraceCorruption::PriorHash,
+        PersistedTraceCorruption::Delete,
+        PersistedTraceCorruption::Reorder,
+        PersistedTraceCorruption::Insert,
+    ] {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let path = directory.path().join("trace.sqlite3");
+        let trace_store = Arc::new(SqliteTraceStore::open(&path).expect("trace store"));
+        let state_store = Arc::new(InMemoryStateStore::default());
+        let run_id = RunId::new();
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+        let snapshot_policy = SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        };
+        let mut engine = LoopEngine::with_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            Box::new(StaticPolicy),
+            Arc::new(StubGateway),
+            trace_store,
+            Some(run_id.clone()),
+        )
+        .expect("seed engine");
+        engine.tick(1).expect("seed tick");
+        drop(engine);
+
+        corrupt_persisted_trace(&path, &run_id, corruption);
+        let snapshot_loads = Arc::new(AtomicUsize::new(0));
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let gateway_calls = Arc::new(Mutex::new(0));
+        let result = LoopEngine::resume_from_trace_store(
+            AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+            StateGraph::new(
+                Arc::new(RestoreCountingStateStore {
+                    inner: state_store,
+                    snapshot_loads: Arc::clone(&snapshot_loads),
+                }),
+                snapshot_policy,
+            ),
+            Box::new(NeverInvokedResumePolicy {
+                calls: Arc::clone(&policy_calls),
+            }),
+            Arc::new(CountingGateway {
+                calls: Arc::clone(&gateway_calls),
+            }),
+            Arc::new(SqliteTraceStore::open(&path).expect("resume trace store")),
+            run_id,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(LoopError::Trace(TraceError::Compatibility(
+                    TraceCompatibilityError::Integrity
+                        | TraceCompatibilityError::Envelope
+                        | TraceCompatibilityError::CompletionIntegrity
+                )))
+            ),
+            "{corruption:?} did not return a structured integrity error"
+        );
+        assert_eq!(snapshot_loads.load(Ordering::SeqCst), 0, "{corruption:?}");
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 0, "{corruption:?}");
+        assert_eq!(*gateway_calls.lock().expect("gateway calls"), 0);
+    }
+}
+
+struct NeverInvokedResumePolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Policy for NeverInvokedResumePolicy {
+    fn name(&self) -> &str {
+        "never-invoked-resume"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyDecision::new(
+            Vec::new(),
+            StateData {
+                bytes: Vec::new(),
+                content_type: None,
+            },
+            None,
+        ))
+    }
+}
+
+#[test]
+fn shared_run_resume_restores_only_exact_tenant_agent_state_and_parent() {
+    struct FixedStatePolicy {
+        next_state: Vec<u8>,
+        observed: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+    }
+
+    impl Policy for FixedStatePolicy {
+        fn name(&self) -> &str {
+            "fixed-state"
+        }
+
+        fn decide(
+            &self,
+            state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, LoopError> {
+            if let Some(observed) = self.observed.as_ref() {
+                observed
+                    .lock()
+                    .expect("observed state")
+                    .push(state.bytes.clone());
+            }
+            Ok(PolicyDecision::new(
+                Vec::new(),
+                StateData {
+                    bytes: self.next_state.clone(),
+                    content_type: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_a = TenantId::new();
+    let tenant_b = TenantId::new();
+    let agent_a = AgentId::new();
+    let agent_b = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("shared runtime"),
+    );
+
+    let mut engine_a = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            agent_a.clone(),
+            tenant_a.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: b"A-initial".to_vec(),
+            content_type: None,
+        },
+        Box::new(FixedStatePolicy {
+            next_state: b"A-private-state".to_vec(),
+            observed: None,
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("agent A");
+    let mut engine_b = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            agent_b.clone(),
+            tenant_b.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: b"B-initial".to_vec(),
+            content_type: None,
+        },
+        Box::new(FixedStatePolicy {
+            next_state: b"B-private-state".to_vec(),
+            observed: None,
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        runtime,
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("agent B");
+
+    let committed_a = engine_a.tick(1).expect("agent A tick").state_commit;
+    let committed_b = engine_b.tick(2).expect("agent B tick").state_commit;
+    drop((engine_a, engine_b));
+
+    let observed_a = Arc::new(Mutex::new(Vec::new()));
+    let mut resumed_a = LoopEngine::resume_from_trace_store(
+        AgentContext::new(
+            agent_a.clone(),
+            tenant_a.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        Box::new(FixedStatePolicy {
+            next_state: b"A-next-state".to_vec(),
+            observed: Some(observed_a.clone()),
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store.clone(),
+        run_id.clone(),
+    )
+    .expect("resume agent A");
+    assert_eq!(resumed_a.state.bytes, b"A-private-state");
+    assert_eq!(resumed_a.state_graph.tick(), 1);
+
+    let next_a = resumed_a.tick(3).expect("agent A resumed tick");
+    assert_eq!(
+        *observed_a.lock().expect("observed A"),
+        vec![b"A-private-state".to_vec()]
+    );
+    let next_a_node = state_store
+        .get_node(&next_a.state_commit.node_id)
+        .expect("next A node");
+    assert_eq!(next_a_node.parent_ids, vec![committed_a.node_id.clone()]);
+    assert_ne!(next_a_node.parent_ids, vec![committed_b.node_id.clone()]);
+    drop(resumed_a);
+
+    let mut resumed_b = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_b, tenant_b, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(state_store.clone(), snapshot_policy),
+        Box::new(FixedStatePolicy {
+            next_state: b"B-next-state".to_vec(),
+            observed: None,
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store,
+        run_id,
+    )
+    .expect("resume agent B");
+    assert_eq!(resumed_b.state.bytes, b"B-private-state");
+    assert_eq!(resumed_b.state_graph.tick(), 2);
+    let next_b = resumed_b.tick(4).expect("agent B resumed tick");
+    let next_b_node = state_store
+        .get_node(&next_b.state_commit.node_id)
+        .expect("next B node");
+    assert_eq!(next_b_node.parent_ids, vec![committed_b.node_id]);
+    assert_ne!(next_b_node.parent_ids, vec![next_a.state_commit.node_id]);
+}
+
+#[test]
+fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_policy() {
+    #[derive(Clone, Copy)]
+    enum SnapshotMismatch {
+        MissingTenantAgent,
+        Tenant,
+        Agent,
+        Run,
+        TraceEvent,
+        StateHash,
+    }
+
+    struct NeverInvokedPolicy {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Policy for NeverInvokedPolicy {
+        fn name(&self) -> &str {
+            "never-invoked"
+        }
+
+        fn decide(
+            &self,
+            _state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, LoopError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PolicyDecision::new(
+                Vec::new(),
+                StateData {
+                    bytes: Vec::new(),
+                    content_type: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    for mismatch in [
+        SnapshotMismatch::MissingTenantAgent,
+        SnapshotMismatch::Tenant,
+        SnapshotMismatch::Agent,
+        SnapshotMismatch::Run,
+        SnapshotMismatch::TraceEvent,
+        SnapshotMismatch::StateHash,
+    ] {
+        let trace_store = Arc::new(InMemoryTraceStore::default());
+        let state_store = Arc::new(InMemoryStateStore::default());
+        let run_id = RunId::new();
+        let target_tenant = TenantId::new();
+        let target_agent = AgentId::new();
+        let runtime = KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("runtime");
+        let runtime_writer = activate_test_runtime_writer(&runtime, &target_tenant, &target_agent);
+        assert!(runtime
+            .admit_fresh_engine(&target_tenant, &target_agent)
+            .expect("fresh admission"));
+        let state_event_id = TraceEventId::from_run_sequence(&run_id, 3);
+        let data_ref = state_store
+            .put_state(StateData {
+                bytes: b"other-private-state".to_vec(),
+                content_type: None,
+            })
+            .expect("state data");
+        let mut metadata = StateMetadata::new(OffsetDateTime::now_utc(), None);
+        metadata.tenant_id = Some(target_tenant.clone());
+        metadata.agent_id = Some(target_agent.clone());
+        metadata.run_id = Some(run_id.clone());
+        metadata.trace_event_id = Some(state_event_id.clone());
+        match mismatch {
+            SnapshotMismatch::MissingTenantAgent => {
+                metadata.tenant_id = None;
+                metadata.agent_id = None;
+            }
+            SnapshotMismatch::Tenant => metadata.tenant_id = Some(TenantId::new()),
+            SnapshotMismatch::Agent => metadata.agent_id = Some(AgentId::new()),
+            SnapshotMismatch::Run => metadata.run_id = Some(RunId::new()),
+            SnapshotMismatch::TraceEvent => {
+                metadata.trace_event_id = Some(TraceEventId::from_run_sequence(&run_id, 99));
+            }
+            SnapshotMismatch::StateHash => {}
+        }
+        let node_id = state_store
+            .commit_node(Vec::new(), data_ref, metadata)
+            .expect("state node");
+        let snapshot_id = state_store.snapshot(&node_id).expect("snapshot");
+        let tick_identity = runtime
+            .trace_identity()
+            .with_tenant_agent(target_tenant.clone(), target_agent.clone())
+            .with_tick_id(TickId::from(1));
+        runtime
+            .record_event_with_identity(
+                tick_identity.clone(),
+                TraceEventKind::LoopTickStarted { tick_id: 1 },
+            )
+            .expect("tick start");
+        runtime
+            .record_event_with_identity(
+                tick_identity.clone(),
+                TraceEventKind::OutcomeRecorded {
+                    outcome: serde_json::json!({
+                        "tick_id": 1,
+                        "duration_ms": 1,
+                        "needs_intervention": false,
+                        "needs_approval": false,
+                        "escalations": [],
+                        "actions": [],
+                    }),
+                    feedback: None,
+                    reward: None,
+                },
+            )
+            .expect("tick outcome");
+        runtime
+            .record_event_with_identity(
+                tick_identity.clone().with_state_node_id(node_id.clone()),
+                TraceEventKind::StateCommitted {
+                    state_hash: if matches!(mismatch, SnapshotMismatch::StateHash) {
+                        ContentHash::blake3(b"mismatched-state-hash")
+                    } else {
+                        node_id.hash().clone()
+                    },
+                    snapshot_id: Some(snapshot_id),
+                },
+            )
+            .expect("state event");
+        runtime
+            .record_event_with_identity(
+                tick_identity,
+                TraceEventKind::LoopTickCompleted {
+                    tick_id: 1,
+                    integrity: None,
+                },
+            )
+            .expect("tick completion");
+        drop(runtime_writer);
+        let before = trace_store.read(&run_id.to_string()).expect("trace before");
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+
+        let resumed = LoopEngine::resume_from_trace_store(
+            AgentContext::new(
+                target_agent,
+                target_tenant,
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(
+                state_store,
+                SnapshotPolicy {
+                    interval: Some(1),
+                    important_labels: Vec::new(),
+                },
+            ),
+            Box::new(NeverInvokedPolicy {
+                calls: policy_calls.clone(),
+            }),
+            Arc::new(splendor_gateway::UnimplementedGateway),
+            trace_store.clone(),
+            run_id.clone(),
+        );
+
+        assert!(matches!(
+            resumed,
+            Err(LoopError::Resume(reason)) if reason == "resume_state_identity_mismatch"
+        ));
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            trace_store.read(&run_id.to_string()).expect("trace after"),
+            before
+        );
+    }
+}
+
+#[test]
+fn concurrent_fresh_sqlite_constructors_have_one_atomic_owner_and_one_no_append_rejection() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("trace.sqlite3");
+    let stores = [
+        Arc::new(SqliteTraceStore::open(&path).expect("left trace store")),
+        Arc::new(SqliteTraceStore::open(&path).expect("right trace store")),
+    ];
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let start = Arc::new(Barrier::new(3));
+    let threads = stores
+        .into_iter()
+        .map(|trace_store| {
+            let state_store = state_store.clone();
+            let run_id = run_id.clone();
+            let tenant_id = tenant_id.clone();
+            let agent_id = agent_id.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                LoopEngine::with_trace_store(
+                    AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+                    StateGraph::new(state_store, SnapshotPolicy::default()),
+                    StateData {
+                        bytes: vec![1],
+                        content_type: None,
+                    },
+                    Box::new(StaticPolicy),
+                    Arc::new(StubGateway),
+                    trace_store,
+                    Some(run_id),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("constructor thread"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "one constructor must own the identity"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(LoopError::Resume(reason)) if reason == "run_already_exists"
+                )
+            })
+            .count(),
+        1,
+        "one constructor must receive a stable admission conflict"
+    );
+    let records = SqliteTraceStore::open(&path)
+        .expect("inspection trace store")
+        .read(&run_id.to_string())
+        .expect("single run start");
+    assert_eq!(records.len(), 1);
+    let event: TraceEvent =
+        serde_json::from_value(records[0].payload.clone()).expect("run start event");
+    assert!(matches!(event.kind, TraceEventKind::RunStarted));
+}
+
+#[test]
+fn concurrent_shared_fresh_constructors_admit_one_engine_per_exact_identity() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("shared runtime"),
+    );
+    let start = Arc::new(Barrier::new(3));
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let trace_store = trace_store.clone();
+        let state_store = state_store.clone();
+        let run_id = run_id.clone();
+        let tenant_id = tenant_id.clone();
+        let agent_id = agent_id.clone();
+        let runtime = runtime.clone();
+        let start = start.clone();
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            let result = LoopEngine::with_shared_trace_runtime_and_work_order(
+                AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+                StateGraph::new(state_store, SnapshotPolicy::default()),
+                StateData {
+                    bytes: vec![1],
+                    content_type: None,
+                },
+                Box::new(StaticPolicy),
+                Arc::new(StubGateway),
+                runtime,
+                RunTraceContext::new(Some(run_id)),
+            );
+            drop(trace_store);
+            result
+                .map(|_| "owner".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        }));
+    }
+    start.wait();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("constructor thread"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_str() == "owner")
+            .count(),
+        1,
+        "results={results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_str() == "resume error: run_already_exists")
+            .count(),
+        1,
+        "results={results:?}"
+    );
+    let records = trace_store
+        .read(&run_id.to_string())
+        .expect("single run start");
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn persisted_shared_constructor_requires_a_store_backed_ownership_boundary() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let run_id = RunId::new();
+    let runtime = Arc::new(KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(CapturingTraceSink {
+            events: Arc::clone(&events),
+        }),
+        run_id: Some(run_id.clone()),
+        ..KernelRuntimeConfig::default()
+    }));
+
+    let result = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            TenantId::new(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![1],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        runtime,
+        RunTraceContext::new(Some(run_id)),
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Trace(TraceError::Compatibility(
+            TraceCompatibilityError::Store
+        )))
+    ));
+    assert!(events.lock().expect("events lock").is_empty());
+}
+
+#[test]
+fn concurrent_resumed_sqlite_constructors_admit_one_exact_live_owner() {
+    const RACE_COUNT: usize = 8;
+
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("trace.sqlite3");
+    let seed_trace_store = Arc::new(SqliteTraceStore::open(&path).expect("seed trace store"));
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let mut seed = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        seed_trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("seed engine");
+    seed.tick(1).expect("seed tick");
+    drop(seed);
+    let records_before = seed_trace_store
+        .read(&run_id.to_string())
+        .expect("seed records");
+
+    for race in 0..RACE_COUNT {
+        let start = Arc::new(Barrier::new(3));
+        let stores = [
+            Arc::new(SqliteTraceStore::open(&path).expect("left trace store")),
+            Arc::new(SqliteTraceStore::open(&path).expect("right trace store")),
+        ];
+        let handles = stores
+            .into_iter()
+            .map(|trace_store| {
+                let start = Arc::clone(&start);
+                let state_store = Arc::clone(&state_store);
+                let run_id = run_id.clone();
+                let tenant_id = tenant_id.clone();
+                let agent_id = agent_id.clone();
+                let snapshot_policy = snapshot_policy.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    LoopEngine::resume_from_trace_store(
+                        AgentContext::new(
+                            agent_id,
+                            tenant_id,
+                            crate::AgentRuntimeConfig::default(),
+                        ),
+                        StateGraph::new(state_store, snapshot_policy),
+                        Box::new(StaticPolicy),
+                        Arc::new(StubGateway),
+                        trace_store,
+                        run_id,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("resume thread"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "race {race} admitted multiple owners"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(LoopError::Trace(TraceError::Compatibility(
+                            TraceCompatibilityError::WriterConflict
+                        )))
+                    )
+                })
+                .count(),
+            1,
+            "race {race} did not return one admission conflict"
+        );
+        assert_eq!(
+            seed_trace_store
+                .read(&run_id.to_string())
+                .expect("records after race"),
+            records_before,
+            "race {race} appended a competing owner event"
+        );
+        drop(results);
+    }
+}
+
+#[test]
+fn resume_acquires_live_writer_before_snapshot_access_and_reloads_after_owner_exit() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("trace.sqlite3");
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let mut seed = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("seed trace store")),
+        Some(run_id.clone()),
+    )
+    .expect("seed engine");
+    seed.tick(1).expect("seed tick");
+    drop(seed);
+
+    let owner = LoopEngine::resume_from_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("owner trace store")),
+        run_id.clone(),
+    )
+    .expect("live owner");
+    let snapshot_loads = Arc::new(AtomicUsize::new(0));
+    let contender_state: Arc<dyn StateStore> = Arc::new(RestoreCountingStateStore {
+        inner: state_store,
+        snapshot_loads: Arc::clone(&snapshot_loads),
+    });
+
+    let contender = LoopEngine::resume_from_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(contender_state.clone(), snapshot_policy.clone()),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("contender trace store")),
+        run_id.clone(),
+    );
+    assert!(matches!(
+        contender,
+        Err(LoopError::Trace(TraceError::Compatibility(
+            TraceCompatibilityError::WriterConflict
+        )))
+    ));
+    assert_eq!(snapshot_loads.load(Ordering::SeqCst), 0);
+
+    drop(owner);
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(contender_state, snapshot_policy),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("reclaimed trace store")),
+        run_id,
+    )
+    .expect("recovery after owner exit");
+    assert_eq!(snapshot_loads.load(Ordering::SeqCst), 1);
+    assert_eq!(resumed.last_tick_id(), Some(1));
+}
+
+#[test]
+fn recovery_writer_excludes_contenders_through_every_recovery_phase() {
+    for phase in [
+        RecoveryPausePhase::InitialTail,
+        RecoveryPausePhase::HistoryPage,
+        RecoveryPausePhase::ValidationTailConfirmation,
+        RecoveryPausePhase::StateRestore,
+        RecoveryPausePhase::RestoredTailConfirmation,
+        RecoveryPausePhase::CursorActivation,
+    ] {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let path = directory.path().join("trace.sqlite3");
+        let state_store = Arc::new(InMemoryStateStore::default());
+        let run_id = RunId::new();
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+        let snapshot_policy = SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        };
+        let mut seed = LoopEngine::with_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            Box::new(StaticPolicy),
+            Arc::new(StubGateway),
+            Arc::new(SqliteTraceStore::open(&path).expect("seed trace store")),
+            Some(run_id.clone()),
+        )
+        .expect("seed engine");
+        seed.tick(1).expect("seed tick");
+        drop(seed);
+
+        let (gate, entered, release) = RecoveryPauseGate::new(phase);
+        let owner_store = Arc::new(RecoveryControlledTraceStore::new(
+            Arc::new(SqliteTraceStore::open(&path).expect("owner trace store")),
+            Some(Arc::clone(&gate)),
+        ));
+        let owner_snapshot_loads = Arc::new(AtomicUsize::new(0));
+        let owner_state: Arc<dyn StateStore> = Arc::new(RecoveryControlledStateStore {
+            inner: state_store.clone(),
+            gate: Some(gate),
+            snapshot_loads: Arc::clone(&owner_snapshot_loads),
+        });
+        let owner_policy_calls = Arc::new(AtomicUsize::new(0));
+        let owner_gateway = Arc::new(CountingGateway::default());
+        let owner_gateway_calls = Arc::clone(&owner_gateway.calls);
+        let owner_run_id = run_id.clone();
+        let owner_tenant_id = tenant_id.clone();
+        let owner_agent_id = agent_id.clone();
+        let owner_snapshot_policy = snapshot_policy.clone();
+        let owner_policy_counter = Arc::clone(&owner_policy_calls);
+        let owner = std::thread::spawn(move || {
+            LoopEngine::resume_from_trace_store(
+                AgentContext::new(
+                    owner_agent_id,
+                    owner_tenant_id,
+                    crate::AgentRuntimeConfig::default(),
+                ),
+                StateGraph::new(owner_state, owner_snapshot_policy),
+                Box::new(RecoveryCountingPolicy {
+                    calls: owner_policy_counter,
+                }),
+                owner_gateway,
+                owner_store,
+                owner_run_id,
+            )
+        });
+
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("owner did not reach {phase:?}"));
+
+        let expected_owner_snapshot_loads = match phase {
+            RecoveryPausePhase::InitialTail
+            | RecoveryPausePhase::HistoryPage
+            | RecoveryPausePhase::ValidationTailConfirmation => 0,
+            RecoveryPausePhase::StateRestore
+            | RecoveryPausePhase::RestoredTailConfirmation
+            | RecoveryPausePhase::CursorActivation => 1,
+        };
+        assert_eq!(
+            owner_snapshot_loads.load(Ordering::SeqCst),
+            expected_owner_snapshot_loads,
+            "unexpected state access at {phase:?}"
+        );
+        assert_eq!(owner_policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*owner_gateway_calls.lock().expect("owner gateway calls"), 0);
+
+        let contender_store = Arc::new(RecoveryControlledTraceStore::new(
+            Arc::new(SqliteTraceStore::open(&path).expect("contender trace store")),
+            None,
+        ));
+        let contender_snapshot_loads = Arc::new(AtomicUsize::new(0));
+        let contender_policy_calls = Arc::new(AtomicUsize::new(0));
+        let contender_gateway = Arc::new(CountingGateway::default());
+        let contender_gateway_calls = Arc::clone(&contender_gateway.calls);
+        let contender = LoopEngine::resume_from_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(
+                Arc::new(RecoveryControlledStateStore {
+                    inner: state_store.clone(),
+                    gate: None,
+                    snapshot_loads: Arc::clone(&contender_snapshot_loads),
+                }),
+                snapshot_policy.clone(),
+            ),
+            Box::new(RecoveryCountingPolicy {
+                calls: Arc::clone(&contender_policy_calls),
+            }),
+            contender_gateway,
+            contender_store.clone(),
+            run_id.clone(),
+        );
+        assert!(matches!(
+            contender,
+            Err(LoopError::Trace(TraceError::Compatibility(
+                TraceCompatibilityError::WriterConflict
+            )))
+        ));
+        assert_eq!(contender_store.history_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            contender_store.writer_acquisitions.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(contender_snapshot_loads.load(Ordering::SeqCst), 0);
+        assert_eq!(contender_policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *contender_gateway_calls
+                .lock()
+                .expect("contender gateway calls"),
+            0
+        );
+
+        release.send(()).expect("release owner recovery");
+        let owner = owner
+            .join()
+            .expect("owner recovery thread")
+            .unwrap_or_else(|error| panic!("owner failed at {phase:?}: {error}"));
+        assert_eq!(owner.last_tick_id(), Some(1));
+        assert_eq!(owner_policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*owner_gateway_calls.lock().expect("owner gateway calls"), 0);
+        drop(owner);
+
+        let reclaimed = LoopEngine::resume_from_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(state_store, snapshot_policy),
+            Box::new(StaticPolicy),
+            Arc::new(StubGateway),
+            Arc::new(SqliteTraceStore::open(&path).expect("reclaimed trace store")),
+            run_id,
+        )
+        .unwrap_or_else(|error| panic!("owner was not reclaimable after {phase:?}: {error}"));
+        assert_eq!(reclaimed.last_tick_id(), Some(1));
+    }
+}
+
+#[test]
+fn resume_rejects_an_incomplete_persisted_no_action_tick() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let mut seed = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("seed engine");
+    seed.tick(1).expect("completed seed tick");
+    drop(seed);
+
+    let partial_runtime =
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("partial tick runtime");
+    let partial_writer = activate_test_runtime_writer(&partial_runtime, &tenant_id, &agent_id);
+    partial_runtime
+        .record_event_with_identity(
+            partial_runtime
+                .trace_identity()
+                .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+                .with_tick_id(TickId::from(2)),
+            TraceEventKind::LoopTickStarted { tick_id: 2 },
+        )
+        .expect("persist partial tick identity");
+    drop(partial_writer);
+    drop(partial_runtime);
+    let before = trace_store
+        .read(&run_id.to_string())
+        .expect("trace before rejected resume");
+
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(state_store, snapshot_policy),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store.clone(),
+        run_id.clone(),
+    );
+    assert!(matches!(
+        resumed,
+        Err(LoopError::Resume(reason)) if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("trace after rejected resume"),
+        before
+    );
+}
+
+#[test]
+fn resume_rejects_an_older_snapshot_for_a_newer_completed_tick() {
+    struct IncrementingStatePolicy {
+        calls: AtomicUsize,
+    }
+
+    impl Policy for IncrementingStatePolicy {
+        fn name(&self) -> &str {
+            "incrementing-state"
+        }
+
+        fn decide(
+            &self,
+            _state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, LoopError> {
+            let next = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(PolicyDecision::new(
+                Vec::new(),
+                StateData {
+                    bytes: vec![u8::try_from(next).expect("small test state")],
+                    content_type: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(2),
+        important_labels: Vec::new(),
+    };
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(IncrementingStatePolicy {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.tick(1).expect("first tick without snapshot");
+    engine.tick(2).expect("second tick with snapshot");
+    engine.tick(3).expect("third tick without snapshot");
+    drop(engine);
+    let before = trace_store.read(&run_id.to_string()).expect("trace before");
+
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(state_store, snapshot_policy),
+        Box::new(StaticPolicy),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store.clone(),
+        run_id.clone(),
+    );
+
+    assert!(matches!(
+        resumed,
+        Err(LoopError::Resume(reason)) if reason == "resume_latest_completed_snapshot_unavailable"
+    ));
+    assert_eq!(
+        trace_store.read(&run_id.to_string()).expect("trace after"),
+        before
+    );
+}
+
+#[test]
+fn fresh_persisted_constructor_rejects_existing_run_without_appending_trace() {
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let first_graph = StateGraph::new(state_store.clone(), SnapshotPolicy::default());
+    let first_agent = AgentContext::new(
+        AgentId::new(),
+        TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+
+    let _first = LoopEngine::with_trace_store(
+        first_agent,
+        first_graph,
+        StateData {
+            bytes: vec![1],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("first fresh engine");
+    let before = trace_store
+        .read(&run_id.to_string())
+        .expect("first run trace");
+    assert_eq!(before.len(), 1);
+
+    let second_graph = StateGraph::new(state_store, SnapshotPolicy::default());
+    let second_agent = AgentContext::new(
+        AgentId::new(),
+        TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let result = LoopEngine::with_trace_store(
+        second_agent,
+        second_graph,
+        StateData {
+            bytes: vec![2],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Resume(message)) if message == "run_already_exists"
+    ));
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("unchanged run trace"),
+        before
+    );
+}
+
+#[test]
+fn shared_fresh_runtime_allows_initial_assembly_but_rejects_construction_after_tick_start() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("shared runtime"),
+    );
+    let tenant_id = TenantId::new();
+    let gateway = Arc::new(StubGateway);
+
+    let mut first = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![1],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        gateway.clone(),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("first agent assembly");
+    let _second = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![2],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        gateway.clone(),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("second agent initial assembly");
+
+    first.tick(1).expect("first tick");
+    let before = trace_store.read(&run_id.to_string()).expect("tick trace");
+    let third = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            tenant_id,
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![3],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        gateway,
+        runtime,
+        RunTraceContext::new(Some(run_id.clone())),
+    );
+
+    assert!(matches!(
+        third,
+        Err(LoopError::Resume(message)) if message == "run_already_exists"
+    ));
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("unchanged trace"),
+        before
+    );
 }
 
 #[test]
@@ -1461,6 +3388,101 @@ fn shared_trace_runtime_resume_rejects_mismatched_run() {
         Err(LoopError::Resume(message))
             if message == "shared trace runtime run_id does not match resumed run"
     ));
+}
+
+#[test]
+fn shared_resume_rejects_split_trace_stores_before_history_or_writer_access() {
+    let supplied_store = Arc::new(CountingRuntimeTraceStore::new());
+    let runtime_store = Arc::new(CountingRuntimeTraceStore::new());
+    let run_id = RunId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(runtime_store.clone(), Some(run_id.clone()))
+            .expect("runtime"),
+    );
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+
+    let result = LoopEngine::resume_from_shared_trace_runtime_and_work_order(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        supplied_store.clone(),
+        runtime,
+        run_id,
+        None,
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Trace(TraceError::Compatibility(
+            TraceCompatibilityError::Integrity
+        )))
+    ));
+    assert_eq!(supplied_store.history_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime_store.history_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(supplied_store.writer_acquisitions.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime_store.writer_acquisitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn retained_runtime_cannot_append_after_last_engine_drop_and_store_lock_is_released() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("runtime"),
+    );
+    let engine = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("engine");
+    let before = TraceStore::read(trace_store.as_ref(), &run_id.to_string()).expect("run start");
+    drop(engine);
+
+    assert!(matches!(
+        runtime.record_event(TraceEventKind::RunPaused {
+            reason: Some("retained-runtime".to_string()),
+        }),
+        Err(TraceError::Compatibility(TraceCompatibilityError::Store))
+    ));
+    assert_eq!(
+        TraceStore::read(trace_store.as_ref(), &run_id.to_string()).expect("unchanged trace"),
+        before
+    );
+
+    let reclaimed = trace_store
+        .acquire_runtime_writer(RuntimeTraceWriterRequest::current(
+            splendor_store::RuntimeTraceScope::new(
+                run_id.to_string(),
+                tenant_id.to_string(),
+                agent_id.to_string(),
+            ),
+            RuntimeTraceLimits::default(),
+        ))
+        .expect("store ownership released synchronously");
+    reclaimed.close().expect("close reclaimed writer");
 }
 
 #[test]

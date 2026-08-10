@@ -1,8 +1,9 @@
 use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig};
 use splendor_gateway::{
-    ActionAdapter, ActionGateway, ActionId, ActionRequest, ActionStatus, AdapterError,
-    AdapterResult, VerifiedActionGateway,
+    raw_credential_denied_action, ActionAdapter, ActionGateway, ActionId, ActionRequest,
+    ActionStatus, AdapterError, AdapterResult, TrustedActionProfile, VerifiedActionGateway,
+    RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentId, AgentRuntimeConfig, LoopEngine, LoopError, Perceptor,
@@ -10,14 +11,17 @@ use splendor_kernel::{
     TenantPolicy, TenantRegistry, TraceEvent, TraceEventKind,
 };
 use splendor_store::{
-    InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceRecord, TraceStore,
-    TraceStoreError,
+    InMemoryStateStore, InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits,
+    RuntimeTracePage, RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle,
+    RuntimeTraceStoreIdentity, RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle,
+    RuntimeTraceWriterRequest, StateData, StateStore, TraceRecord, TraceStore, TraceStoreError,
 };
 use splendor_types::{Action, Percept, PerceptProvenance, QuotaUsage, SideEffectClass, TenantId};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 
 const TICK_ID: u64 = 1;
@@ -73,8 +77,37 @@ impl TestServer {
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set request read timeout");
+                let mut request = Vec::new();
                 let mut buffer = [0u8; 1024];
-                let _ = stream.read(&mut buffer);
+                loop {
+                    let bytes_read = stream.read(&mut buffer).expect("read request");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes_read]);
+
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = std::str::from_utf8(&request[..header_end])
+                        .expect("request headers are UTF-8")
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
                     body.len(),
@@ -131,14 +164,14 @@ impl ActionAdapter for FaultyAdapter {
 
 struct FailingActionVerificationTraceStore {
     inner: InMemoryTraceStore,
-    failed: AtomicBool,
+    failed: Arc<AtomicBool>,
 }
 
 impl Default for FailingActionVerificationTraceStore {
     fn default() -> Self {
         Self {
             inner: InMemoryTraceStore::default(),
-            failed: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -165,6 +198,80 @@ impl TraceStore for FailingActionVerificationTraceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(FailingActionVerificationRuntimeWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            failed: Arc::clone(&self.failed),
+        }))
+    }
+}
+
+struct FailingActionVerificationRuntimeWriter {
+    inner: RuntimeTraceWriterHandle,
+    failed: Arc<AtomicBool>,
+}
+
+impl RuntimeTraceReader for FailingActionVerificationRuntimeWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for FailingActionVerificationRuntimeWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        let event: TraceEvent = serde_json::from_value(payload.clone())
+            .map_err(|_| RuntimeTracePortError::BackendContract)?;
+        if matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+            && !self.failed.swap(true, Ordering::SeqCst)
+        {
+            return Err(RuntimeTracePortError::Unavailable);
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 
@@ -193,6 +300,7 @@ struct AdapterHarnessCase {
     registrations: Vec<HarnessRegistration>,
     actions: Vec<ActionCandidate>,
     next_state: StateData,
+    tenant_id: Option<TenantId>,
 }
 
 impl AdapterHarnessCase {
@@ -209,7 +317,13 @@ impl AdapterHarnessCase {
                 bytes: vec![1],
                 content_type: None,
             },
+            tenant_id: None,
         }
+    }
+
+    fn with_tenant_id(mut self, tenant_id: TenantId) -> Self {
+        self.tenant_id = Some(tenant_id);
+        self
     }
 }
 
@@ -259,7 +373,7 @@ fn read_events(trace_store: &dyn TraceStore, run_id: &RunId) -> Vec<TraceEvent> 
 }
 
 fn run_adapter_case(case: AdapterHarnessCase) -> AdapterHarnessRun {
-    let tenant_id = TenantId::new();
+    let tenant_id = case.tenant_id.unwrap_or_default();
     let allowed_actions = case
         .registrations
         .iter()
@@ -532,7 +646,7 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
 
     let write_action = action(
         "write_file",
-        serde_json::json!({"path": "hello.txt", "contents": "hi"}),
+        serde_json::json!({"path": "hello.txt", "bytes": [104, 105]}),
         SideEffectClass::Filesystem,
     );
     let read_action = action(
@@ -563,6 +677,637 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
         .expect("read output");
     assert_eq!(read_output["bytes_read"], 2);
     assert_eq!(read_output["bytes"], serde_json::json!([104, 105]));
+    assert_current_runtime_commits_state_after_action_results(&run);
+}
+
+#[test]
+fn filesystem_adapter_harness_preserves_opaque_binary_read_output() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let tenant_id = TenantId::new();
+    let tenant_root = temp.path().join(tenant_id.to_string());
+    std::fs::create_dir_all(&tenant_root).expect("tenant fixture directory");
+    std::fs::write(tenant_root.join("opaque.bin"), [0, 1, 255]).expect("binary fixture");
+    let filesystem = FilesystemAdapter::new(FilesystemAdapterConfig {
+        base_dir: temp.path().to_path_buf(),
+        ..FilesystemAdapterConfig::default()
+    });
+    let counting = Arc::new(CountingAdapter::new(filesystem));
+    let run = run_adapter_case(
+        AdapterHarnessCase::new(
+            "filesystem-opaque-binary",
+            vec![HarnessRegistration::new(
+                "read_file",
+                "filesystem",
+                counting.clone(),
+            )],
+            vec![action_candidate(
+                action(
+                    "read_file",
+                    serde_json::json!({"path": "opaque.bin"}),
+                    SideEffectClass::Filesystem,
+                ),
+                "filesystem",
+            )],
+        )
+        .with_tenant_id(tenant_id),
+    );
+
+    assert_eq!(
+        run.outcome.action_outcomes[0].status,
+        ActionStatus::Executed,
+        "{:?}",
+        run.outcome.action_outcomes[0]
+    );
+    assert_eq!(counting.executions(), 1);
+    assert_eq!(
+        run.outcome.action_outcomes[0]
+            .output
+            .as_ref()
+            .expect("binary output")["bytes"],
+        serde_json::json!([0, 1, 255])
+    );
+    assert_action_executed_trace(&run, 0, "read_file");
+}
+
+#[test]
+fn verified_gateway_owner_profile_round_trips_real_opaque_filesystem_bytes() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let registry = build_registry(
+        &tenant_id,
+        &["write_file".to_string(), "read_file".to_string()],
+        &["filesystem".to_string()],
+    );
+    registry.begin_tick(TICK_ID, OffsetDateTime::now_utc());
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry));
+    gateway.register_adapter("write_file", "filesystem", filesystem.clone());
+    gateway.register_adapter("read_file", "filesystem", filesystem.clone());
+    gateway
+        .set_trusted_action_profiles(vec![
+            TrustedActionProfile {
+                action_name: "write_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+            TrustedActionProfile {
+                action_name: "read_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+        ])
+        .expect("trusted filesystem profiles");
+
+    let request = |action: Action| ActionRequest {
+        action_id: ActionId::new(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        tick_id: Some(TICK_ID.into()),
+        action,
+        adapter: None,
+        quota_usage: QuotaUsage::single_action(),
+        satisfied_preconditions: Vec::new(),
+        requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
+        approval_evidence: None,
+        authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let bytes = vec![0, 65, 255];
+    let write = gateway
+        .submit(request(action(
+            "write_file",
+            serde_json::json!({"path": "opaque.bin", "bytes": bytes}),
+            SideEffectClass::Filesystem,
+        )))
+        .expect("write outcome");
+    assert_eq!(write.status, ActionStatus::Executed, "{write:?}");
+
+    let read = gateway
+        .submit(request(action(
+            "read_file",
+            serde_json::json!({"path": "opaque.bin"}),
+            SideEffectClass::Filesystem,
+        )))
+        .expect("read outcome");
+    assert_eq!(read.status, ActionStatus::Executed, "{read:?}");
+    assert_eq!(
+        read.output.as_ref().expect("read output")["bytes"],
+        serde_json::json!([0, 65, 255])
+    );
+    assert_eq!(filesystem.executions(), 2);
+}
+
+#[test]
+fn loop_engine_without_owner_profile_keeps_opaque_filesystem_bytes_strict() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = FilesystemAdapter::new(FilesystemAdapterConfig {
+        base_dir: temp.path().to_path_buf(),
+        ..FilesystemAdapterConfig::default()
+    });
+    let counting = Arc::new(CountingAdapter::new(filesystem));
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "filesystem-opaque-strict",
+        vec![HarnessRegistration::new(
+            "write_file",
+            "filesystem",
+            counting.clone(),
+        )],
+        vec![action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        )],
+    ));
+
+    assert_action_status(&run, 0, ActionStatus::Denied);
+    assert_eq!(
+        run.outcome.action_outcomes[0].error.as_deref(),
+        Some(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(counting.executions(), 0);
+}
+
+#[test]
+fn real_filesystem_credential_output_stops_later_http_adapter_without_persistence() {
+    const CANARY: &str = "C03_REAL_ADAPTER_OUTPUT_CANARY";
+    const BODY: &str = "password=C03_REAL_ADAPTER_OUTPUT_CANARY";
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let tenant_id = TenantId::new();
+    let tenant_root = temp.path().join(tenant_id.to_string());
+    std::fs::create_dir_all(&tenant_root).expect("tenant fixture directory");
+    std::fs::write(tenant_root.join("credential.txt"), BODY).expect("credential-like fixture");
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    })));
+    let run = run_adapter_case(
+        AdapterHarnessCase::new(
+            "real-adapter-output-screen",
+            vec![
+                HarnessRegistration::new("read_file", "filesystem", filesystem.clone()),
+                HarnessRegistration::new("http_get", "http", http.clone()),
+            ],
+            vec![
+                action_candidate(
+                    action(
+                        "read_file",
+                        serde_json::json!({"path": "credential.txt"}),
+                        SideEffectClass::Filesystem,
+                    ),
+                    "filesystem",
+                ),
+                action_candidate(
+                    action(
+                        "http_get",
+                        serde_json::json!({"url": "http://127.0.0.1:1/"}),
+                        SideEffectClass::Network,
+                    ),
+                    "http",
+                )
+                .with_usage(QuotaUsage {
+                    http_requests: 1,
+                    ..QuotaUsage::default()
+                }),
+            ],
+        )
+        .with_tenant_id(tenant_id),
+    );
+
+    assert_eq!(filesystem.executions(), 1);
+    assert_eq!(http.executions(), 0);
+    assert_eq!(run.outcome.action_outcomes.len(), 1);
+    for outcome in &run.outcome.action_outcomes {
+        assert_eq!(outcome.status, ActionStatus::Failed);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED),
+            "{outcome:?}"
+        );
+        assert!(outcome.output.is_none());
+        assert_eq!(
+            outcome
+                .post_verification
+                .as_ref()
+                .map(|result| &result.reasons),
+            Some(&vec![RAW_CREDENTIAL_OUTPUT_SUPPRESSED.to_string()])
+        );
+    }
+    let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
+    assert!(!encoded_events.contains(CANARY));
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::ActionFailed { .. }))
+            .count(),
+        1
+    );
+    assert!(!run
+        .events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ActionExecuted { .. })));
+    let snapshot = run
+        .state_store
+        .load_snapshot(
+            run.outcome
+                .state_commit
+                .snapshot_id
+                .as_ref()
+                .expect("snapshot id"),
+        )
+        .expect("state snapshot");
+    assert!(!serde_json::to_string(&snapshot)
+        .expect("state serializes")
+        .contains(CANARY));
+    assert_current_runtime_commits_state_after_action_results(&run);
+}
+
+#[test]
+fn real_http_credential_output_stops_later_filesystem_adapter_without_persistence() {
+    const CANARY: &str = "C03_REAL_HTTP_OUTPUT_CANARY";
+    const BODY: &str = "password=C03_REAL_HTTP_OUTPUT_CANARY";
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let server = TestServer::start(BODY);
+    let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    })));
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "real-http-output-screen",
+        vec![
+            HarnessRegistration::new("http_get", "http", http.clone()),
+            HarnessRegistration::new("read_file", "filesystem", filesystem.clone()),
+        ],
+        vec![
+            action_candidate(
+                action(
+                    "http_get",
+                    serde_json::json!({"url": server.url}),
+                    SideEffectClass::Network,
+                ),
+                "http",
+            )
+            .with_usage(QuotaUsage {
+                http_requests: 1,
+                ..QuotaUsage::default()
+            }),
+            action_candidate(
+                action(
+                    "read_file",
+                    serde_json::json!({"path": "must-not-be-read.txt"}),
+                    SideEffectClass::Filesystem,
+                ),
+                "filesystem",
+            ),
+        ],
+    ));
+    server.join();
+
+    assert_eq!(http.executions(), 1);
+    assert_eq!(filesystem.executions(), 0);
+    assert_eq!(run.outcome.action_outcomes.len(), 1);
+    let outcome = &run.outcome.action_outcomes[0];
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert!(outcome.output.is_none());
+    let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
+    assert!(!encoded_events.contains(CANARY));
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::ActionFailed { .. }))
+            .count(),
+        1
+    );
+    assert_current_runtime_commits_state_after_action_results(&run);
+}
+
+#[test]
+fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    })));
+    let provider_canary = format!("ghp_{}", "A".repeat(36));
+    let utf16le = "Bearer x"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let utf16be = "Bearer x"
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    let mut utf8_bom = vec![0xef, 0xbb, 0xbf];
+    utf8_bom.extend_from_slice(b"ordinary body");
+    let bodies = [
+        b"Basic dTpw".to_vec(),
+        provider_canary.as_bytes().to_vec(),
+        utf16le,
+        utf16be,
+        utf8_bom,
+        vec![0xff, 0xfe, b'x'],
+        vec![b'o', b'k', 0, b'x'],
+        b"safe=1&value=Basic+dTpw".to_vec(),
+    ];
+    let encoded_string_bodies = vec![
+        "name=VAULT_TOKEN&value=C03_FORM_CANARY".to_string(),
+        "header=X-Auth-Token&value=C03_HEADER_CANARY".to_string(),
+        "Bearer%20x,https://example.invalid/docs".to_string(),
+        "vault%3Ateam%2Fservice,https://example.invalid/docs".to_string(),
+        "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs".to_string(),
+        "value=%EF%BB%BFBasic%20dTpw".to_string(),
+        "value=B%00e%00a%00r%00e%00r%00%20x".to_string(),
+        "safe/Bearer x".to_string(),
+        "safe|Bearer x".to_string(),
+        "safe`Bearer x`".to_string(),
+        "safe—Bearer x—".to_string(),
+        "safe|token=synthetic".to_string(),
+        "safe`token=synthetic".to_string(),
+        format!("safe|ghp_{}", "A".repeat(36)),
+        format!("safe`ghp_{}`", "A".repeat(36)),
+        "https://example.invalid/Bearer%20x".to_string(),
+        "https://example.invalid/safe.Bearer%20x".to_string(),
+        "https://example.invalid/?%42earer%20x".to_string(),
+        "https://example.invalid/?safe%60%42earer%20x%60".to_string(),
+        "https://example.invalid/?%76ault%3Aprod%2Fdb".to_string(),
+        "Basic dTpw/next".to_string(),
+        "Basic dTpw+next".to_string(),
+        "Basic dTpw=next".to_string(),
+        "https://example.invalid password:1234".to_string(),
+        "https://example.invalid vault:8200/path".to_string(),
+        "https://example.invalid,token:8443".to_string(),
+        "https://example.invalid|password:1234".to_string(),
+        "https://example.invalid—auth:8443".to_string(),
+        "https://example.invalid'token:8443".to_string(),
+        "https://example.invalid)token:8443".to_string(),
+        "https://example.invalid]token:8443".to_string(),
+        format!("github_pat_{}-tail", "A".repeat(256)),
+        format!("xoxb-{}-tail", "A".repeat(128)),
+        format!("SG.{}.tail", "A".repeat(256)),
+        format!("AIza{}-tail", "A".repeat(35)),
+        format!("vault:{}/next", "A".repeat(2_048)),
+    ];
+    let encoded_authority_urls = vec![
+        format!("http://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
+        format!("http://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+        "http://example.invalid/Basic%20dTpw/next".to_string(),
+        "http://example.invalid/#Basic%20dTpw/next".to_string(),
+        "http://example.invalid/?q=Basic+dTpw%2Fnext".to_string(),
+        "http://example.invalid%20password:1234/path".to_string(),
+        "http://example.invalid%2Ctoken:8443/path".to_string(),
+        "http://example.invalid%20vault:8200/path".to_string(),
+        "http://example.invalid%27token:8443/path".to_string(),
+        "http://example.invalid%29token:8443/path".to_string(),
+        "http://example.invalid%5Dtoken:8443/path".to_string(),
+        "http://[vault]:8200/path".to_string(),
+        "http://[password]:1234/path".to_string(),
+        "http://[gggg]:8443/path".to_string(),
+        "http://[v1.]:8443/path".to_string(),
+        "http://[é]:8443/path".to_string(),
+        "http://:8443/path".to_string(),
+        "http://2001:db8::1/path".to_string(),
+        "http://example.invalid:99999/path".to_string(),
+        "http://example.invalid$password:1234/path".to_string(),
+        "http://example.invalid&vault:8200/path".to_string(),
+        "http://password%3A1234/path".to_string(),
+        "http://vault%3A8200/path".to_string(),
+        "http://%70assword%3A1234/path".to_string(),
+        "http://[::1]%3A8443/path".to_string(),
+        "http://%5B::1%5D%3A8443/path".to_string(),
+    ];
+    let mut candidates = Vec::new();
+    let mut serialized_bodies = Vec::new();
+    for (index, body) in bodies.iter().enumerate() {
+        serialized_bodies.push(serde_json::to_string(body).expect("numeric body serializes"));
+        candidates.push(action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({
+                    "path": format!("credential-{index}.txt"),
+                    "bytes": body,
+                }),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        ));
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "bytes": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "custom_write",
+            serde_json::json!({
+                "path": "credential-alias.txt",
+                "bytes": b"Basic dTpw".to_vec(),
+            }),
+            SideEffectClass::ReadOnly,
+        ),
+        "filesystem",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "custom_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "bytes": b"Basic dTpw".to_vec(),
+            }),
+            SideEffectClass::ReadOnly,
+        ),
+        "http",
+    ));
+    for body in &encoded_string_bodies {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "body": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    for (index, url) in encoded_authority_urls.iter().enumerate() {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": url,
+                    "body": "ordinary body",
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+        candidates.push(action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({
+                    "path": format!("credential-url-{index}.txt"),
+                    "contents": url,
+                }),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "write_file",
+            serde_json::json!({
+                "path": "credential-contents.txt",
+                "contents": "B\0e\0a\0r\0e\0r\0 \0x\0",
+            }),
+            SideEffectClass::Filesystem,
+        ),
+        "filesystem",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "http_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "body": "safe=1&value=Basic+dTpw",
+            }),
+            SideEffectClass::Network,
+        ),
+        "http",
+    ));
+    for json_body in [
+        serde_json::json!({"key": "password", "value": "C03_PASSWORD_CANARY"}),
+        serde_json::json!({"header": "Authorization", "value": "C03_HEADER_VALUE_CANARY"}),
+    ] {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "json": json_body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "http_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "json": {"name": "VAULT_TOKEN", "value": "C03_STRUCTURED_CANARY"},
+            }),
+            SideEffectClass::Network,
+        ),
+        "http",
+    ));
+    let expected_denials = candidates.len();
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "credential-encoding-denial",
+        vec![
+            HarnessRegistration::new("write_file", "filesystem", filesystem.clone()),
+            HarnessRegistration::new("http_post", "http", http.clone()),
+            HarnessRegistration::new("custom_write", "filesystem", filesystem.clone()),
+            HarnessRegistration::new("custom_post", "http", http.clone()),
+        ],
+        candidates,
+    ));
+
+    for outcome in &run.outcome.action_outcomes {
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert_eq!(
+            outcome.verification.reasons,
+            vec![RAW_CREDENTIAL_INPUT_DENIED.to_string()]
+        );
+    }
+    assert_eq!(filesystem.executions(), 0);
+    assert_eq!(http.executions(), 0);
+    for index in 0..bodies.len() {
+        assert!(!temp.path().join(format!("credential-{index}.txt")).exists());
+    }
+    for index in 0..encoded_authority_urls.len() {
+        assert!(!temp
+            .path()
+            .join(format!("credential-url-{index}.txt"))
+            .exists());
+    }
+    assert!(!temp.path().join("credential-alias.txt").exists());
+    assert!(!temp.path().join("credential-contents.txt").exists());
+    let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
+    assert!(!encoded_events.contains(&provider_canary));
+    assert!(!encoded_events.contains("safe=1&value=Basic+dTpw"));
+    assert!(!encoded_events.contains("VAULT_TOKEN"));
+    assert!(!encoded_events.contains("C03_STRUCTURED_CANARY"));
+    assert!(!encoded_events.contains("C03_PASSWORD_CANARY"));
+    assert!(!encoded_events.contains("C03_HEADER_VALUE_CANARY"));
+    for body in &encoded_string_bodies {
+        assert!(!encoded_events.contains(body));
+    }
+    for url in &encoded_authority_urls {
+        assert!(!encoded_events.contains(url));
+    }
+    for body in serialized_bodies {
+        assert!(
+            !encoded_events.contains(&body),
+            "raw numeric body must not enter trace"
+        );
+    }
+    let proposed = run
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceEventKind::CandidatesProposed { actions } => Some(actions),
+            _ => None,
+        })
+        .expect("candidate event");
+    assert_eq!(
+        proposed,
+        &vec![raw_credential_denied_action(); expected_denials]
+    );
     assert_current_runtime_commits_state_after_action_results(&run);
 }
 
@@ -633,6 +1378,43 @@ fn http_adapter_harness_allows_allowlisted_local_domain() {
         .expect("output");
     assert_eq!(output["status"], 200);
     assert_eq!(output["body"], "ok");
+    assert_current_runtime_commits_state_after_action_results(&run);
+    server.join();
+}
+
+#[test]
+fn http_adapter_harness_allows_ordinary_utf8_numeric_body() {
+    let server = TestServer::start("posted");
+    let adapter = HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    });
+    let counting = Arc::new(CountingAdapter::new(adapter));
+    let body = "safe=1&label=50%25&topic=Basic+planning&text=café\n"
+        .as_bytes()
+        .to_vec();
+    let action = action(
+        "http_post",
+        serde_json::json!({"url": server.url, "bytes": body}),
+        SideEffectClass::Network,
+    );
+    let usage = QuotaUsage {
+        http_requests: 1,
+        ..QuotaUsage::default()
+    };
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "http-ordinary-utf8-bytes",
+        vec![HarnessRegistration::new(
+            "http_post",
+            "http",
+            counting.clone(),
+        )],
+        vec![action_candidate(action, "http").with_usage(usage)],
+    ));
+
+    assert_action_status(&run, 0, ActionStatus::Executed);
+    assert_eq!(counting.executions(), 1);
+    assert_action_executed_trace(&run, 0, "http_post");
     assert_current_runtime_commits_state_after_action_results(&run);
     server.join();
 }
@@ -739,8 +1521,8 @@ fn trace_store_failure_before_adapter_dispatch_does_not_execute_or_commit() {
         .expect_err("trace failure should fail tick");
     assert!(matches!(
         error,
-        LoopError::Trace(splendor_kernel::TraceError::Store(
-            TraceStoreError::Poisoned
+        LoopError::Trace(splendor_kernel::TraceError::Compatibility(
+            splendor_evidence::TraceCompatibilityError::Store
         ))
     ));
     assert_eq!(counting.executions(), 0);

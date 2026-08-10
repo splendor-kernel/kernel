@@ -6,7 +6,10 @@
 //! flow through the gateway boundary rather than creating an alternate side
 //! effect path.
 
-use splendor_gateway::{ActionGateway, ActionOutcome, ActionRequest, ActionStatus, GatewayError};
+use splendor_gateway::{
+    guard_action_request, raw_credential_denied_outcome, ActionGateway, ActionOutcome,
+    ActionRequest, ActionStatus, GatewayError,
+};
 use splendor_store::LocalTraceBufferError;
 use splendor_types::{SideEffectClass, VerificationResult};
 use std::sync::{Arc, Mutex};
@@ -142,6 +145,9 @@ impl TraceDurabilityGateway {
 
 impl ActionGateway for TraceDurabilityGateway {
     fn submit(&self, request: ActionRequest) -> Result<ActionOutcome, GatewayError> {
+        if guard_action_request(&request).is_err() {
+            return Ok(raw_credential_denied_outcome(request.action_id));
+        }
         if self.policy.require_central_sync_for_side_effects
             && side_effectful(&request.action.side_effect_class)
         {

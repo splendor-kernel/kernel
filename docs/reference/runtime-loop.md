@@ -11,25 +11,53 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 
 0. `RunStarted` starts a new persisted run trace stream.
 1. `LoopTickStarted` starts the tick.
-2. Registered `Perceptor` implementations collect `Percept` values.
-3. `StateLoaded` records the state hash available to policy.
-4. `PolicyInvoked` records policy entry.
-5. The `Policy` callback receives current state and percepts and returns action
+2. Registered `Perceptor` implementations collect `Percept` values. The
+   Gateway-owned persisted-percept guard screens schema, payload, and provenance
+   under one budget before any percept trace or policy invocation.
+3. `PerceptsReceived` records only the screened percept batch.
+4. `StateLoaded` records the state hash available to policy.
+5. `PolicyInvoked` records policy entry.
+6. The `Policy` callback receives current state and percepts and returns action
    candidates plus next state.
-6. `PolicyCompleted` records successful policy return.
-7. The `ConstraintEngine` returns an aggregate `VerificationResult`.
-8. Each action candidate receives an `ActionId` and verification starts.
-9. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
-   adapter allowlists, permissions, quotas, invariants, and action preconditions.
-10. Only verified actions reach registered adapters.
-11. If an optional 0.04-S3 escalation policy is configured, explicit
+7. The policy-selected next-state bytes, content type, and optional state label
+   are screened under one budget before any action, outcome, or state
+   persistence. Declared JSON/text ambiguity, a match, or scanner failure fails
+   the tick; genuinely opaque binary remains compatible without an
+   encrypted/compressed absence claim.
+8. `PolicyCompleted` records successful policy return.
+9. The Gateway-owned raw credential guard screens every candidate before any
+   candidate/action payload trace, constraint callback, delegated-authority
+   evaluation, or gateway submission. Screening includes raw obligation-receipt
+   strings without interpreting those receipts as authority. Each candidate
+   receives its `ActionId` at this boundary.
+10. `CandidatesProposed` records safe actions unchanged and raw-credential
+   denials only as the constant suppression projection.
+11. The `ConstraintEngine` returns an aggregate `VerificationResult` over only
+   credential-free candidates.
+12. Each projected/safe action records verification start in original policy
+    order.
+13. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
+    adapter allowlists, permissions, quotas, invariants, and action preconditions.
+14. Only verified credential-free actions reach registered adapters.
+15. Every adapter-entered Gateway result records fixed operational facts in its
+    existing post-verification artifacts: adapter entry, effect certainty, retry
+    class, and whether reconciliation is required. Immediately after a successful
+    adapter return, output and satisfied-postcondition strings
+    pass the Gateway-owned persistence barrier before post-verifiers. Unsafe or
+    ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
+    with no output and adapter-entered/effect-uncertain/not-retryable/
+    reconciliation-required facts; adapter entry means no rollback or no-effect
+    claim is made.
+16. If an optional 0.04-S3 escalation policy is configured, explicit
     verifier/runtime facts can produce `EscalationTriggered` and
     `ActionNeedsIntervention` trace events before final outcome recording.
-12. Adapter output, denial, failure, or intervention need is recorded as an
+17. Safe adapter output, denial, failure, or intervention need is recorded as an
     action outcome.
-13. The outcome evaluator can attach feedback/reward.
-14. The state graph commits the next state node and optional snapshot.
-15. Trace records are appended in order.
+18. The outcome evaluator can attach feedback/reward for credential-free
+    candidates; it is not invoked with a denied raw action.
+19. The state graph commits the already-screened next state node and optional
+    snapshot.
+20. Trace records are appended in order.
 
 ## Identity scope
 
@@ -48,6 +76,22 @@ documented in [`identity.md`](identity.md).
 ## Failure behavior
 
 - Perceptor/policy errors return a loop error and do not execute actions.
+- Credential-bearing percepts return fixed `raw_credential_input_denied` before
+  `PerceptsReceived`; credential-bearing/ambiguous policy state returns the same
+  fixed error before `PolicyCompleted`, action execution, outcome recording, or
+  state commit. The engine then rejects another direct tick with fixed
+  `tick_reconciliation_required`; it does not repeatedly recollect the denied
+  percept or reinvoke the rejected policy state. No synthetic run lifecycle or
+  completed-tick event is emitted because the current trace taxonomy has no
+  compatible tick-abort fact.
+- Raw credential-bearing candidates return the fixed
+  `raw_credential_input_denied` outcome. They skip constraints, delegated
+  authority, gateway/adapters, escalation, and outcome evaluation. Their
+  `CandidatesProposed`, verification-started/completed, and `ActionDenied`
+  records contain only the constant safe projection.
+- In a mixed decision, safe and denied candidates retain original policy order;
+  safe candidates continue through constraints/gateway independently while the
+  raw candidate remains denied.
 - Constraint denial records action denial and skips gateway submission.
 - Gateway verifier denial records action denial and skips adapter execution.
 - Escalation policies consume explicit verifier/runtime facts. Verifier
@@ -55,8 +99,54 @@ documented in [`identity.md`](identity.md).
   escalation does not execute adapters, contact ticket systems, or install
   circuit breakers.
 - Adapter failure records a failed/denied outcome.
-- State commit failure prevents `StateCommitted` and `LoopTickCompleted` from
-  being emitted for that tick.
+- Every durable `ActionVerificationStarted` latches the live engine until the
+  complete action/tick suffix reaches durable `LoopTickCompleted`. A Gateway
+  denial or `NeedsApproval` result cannot clear that persistence latch merely
+  because no adapter entered. Adapter entry strengthens the block to an in-flight
+  effect boundary. A successful completed tick clears the transient block only
+  when no recorded outcome independently requires reconciliation. Generic adapter
+  failure, postcondition failure, or credential-bearing or ambiguous adapter
+  output remains not retryable and reconciliation-required; later same-tick
+  candidates are not submitted, and the local scheduler parks the engine after
+  the outcome is recorded. Any later trace, outcome, or state persistence failure
+  leaves the engine parked rather than runnable.
+  Fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
+  Persisted resume rejects a recorded reconciliation-required result or an
+  action-capable tick attempt without its matching `LoopTickCompleted`, including
+  when the first post-Gateway trace append was lost. Before deriving either fact,
+  resume validates the complete storage-owned run sequence and hash chain from
+  genesis. Payload/hash/prior-hash mutation, deletion, reorder, insertion, or a
+  mismatched event envelope fails before snapshot loading, policy, scheduler, or
+  adapter entry. Resume selects state only from the latest completed tick when
+  its snapshot metadata and state node
+  bind the exact `run_id`, `tenant_id`, and `agent_id`. If that tick has no
+  snapshot, or identity metadata is mismatched or incomplete, resume fails closed
+  rather than relabeling an older snapshot or restoring a sibling agent's state.
+  Recovery requires explicit operator/provider reconciliation and construction
+  of a replacement run/engine; no scheduler path automatically requeues the
+  parked action. A fresh persisted constructor rejects an already-existing run
+  with `run_already_exists`; only the explicit resume constructors may inspect
+  persisted history. Fresh and resumed persisted engines hold one exact
+  `run_id + tenant_id + agent_id` live-owner claim, so an independent constructor
+  or duplicate scheduler admission fails closed and appends no competing event.
+  Recovery retains the highest validated attempted tick. A strictly later tick
+  may supersede an earlier incomplete attempt only when the earlier attempt has
+  no `ActionVerificationStarted`/action order, outcome, state commit, pending
+  episode, or effect evidence. An unsuperseded open attempt and every attempt that
+  crossed one of those boundaries remain reconciliation-required. Every completed
+  tick, including a no-action tick, must contain exactly one ordered
+  `OutcomeRecorded`, exactly one later `StateCommitted`, and exactly one later
+  `LoopTickCompleted`. Duplicate, missing, orphaned, or misordered lifecycle
+  events fail closed. Duplicate
+  policy-supplied explicit action IDs in one decision are rejected with
+  `duplicate_action_id` before Gateway submission;
+  re-evaluation of one stable `ActionId` on a later distinct tick remains valid.
+  Ordinary failures before durable `ActionVerificationStarted` retain their
+  existing requeue behavior.
+- Every state graph commit failure latches persistence denial before returning,
+  including state-only ticks with no action or adapter entry. It prevents
+  `StateCommitted` and `LoopTickCompleted`, rejects a later direct tick, and makes
+  the scheduler park the engine.
 - Trace store failure fails the tick before side-effectful work can proceed when
   the event is required before execution.
 

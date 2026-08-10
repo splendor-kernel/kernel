@@ -376,12 +376,14 @@ origin-owned state commit, trace linkage, and replay of the reference boundary.
 Run directly when implemented:
 
 ```bash
-cargo test -p splendor-kernel --test integration_kernel_e2e_014_adapter_failure_retry
+cargo test -p splendor-daemon --test integration_kernel_e2e_014_adapter_failure_retry
 ```
 
 Review adapter failure outcome, failed-action trace, explicit state behavior,
-idempotent retry quota/trace, non-idempotent retry denial, telemetry failure signal,
-and replay without adapter execution.
+fixed uncertain/not-retryable/reconciliation-required operational facts, denial
+of same-process and restart retries despite caller-declared idempotency, predictable
+single-attempt quota, telemetry failure signal, and replay without adapter
+execution.
 
 ### K-E2E-015 — OpenAPI daemon contract
 

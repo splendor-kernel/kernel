@@ -27,63 +27,41 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  smoke:
+  secret-contracts:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository without default token
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+      - name: C03 secret contract and fixture guard
+        run: |
+          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}"
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf "${sandbox}"' EXIT
+          git archive "${GITHUB_SHA}" | tar -x -C "${sandbox}"
+          (
+            cd "${sandbox}"
+            git init -q
+            git add --all
+            env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
+          )
 
-      - name: Set image build date
-        id: build-date
-        run: printf 'created=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          labels: |
-            org.opencontainers.image.title=Splendor Kernel
-            org.opencontainers.image.description=Splendor 0.05-dev governed runtime image for local, physical, and edge primitive validation
-            org.opencontainers.image.licenses=Apache-2.0 OR MIT
-
-      - name: Build image for smoke test
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: splendor:publish-smoke
-          labels: |
-            ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.version=${{ (inputs.publish_0_05_dev == true || inputs.publish_0_05_dev == 'true') && 'v0.05-dev' || (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
-          build-args: |
-            SPLENDOR_IMAGE_VERSION=${{ (inputs.publish_0_05_dev == true || inputs.publish_0_05_dev == 'true') && 'v0.05-dev' || (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ steps.build-date.outputs.created }}
-
-      - name: Smoke test image before publish
-        env:
-          SPLENDOR_CONTAINER_IMAGE: splendor:publish-smoke
-          SPLENDOR_CONTAINER_BUILD: "0"
-        run: bash scripts/container-tests.sh
-
-  publish-platform:
-    needs: smoke
+  smoke:
+    needs: secret-contracts
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +78,9 @@ jobs:
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Set image build date
@@ -109,70 +88,210 @@ jobs:
         run: printf 'created=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Build each platform image exactly once
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+          tags: splendor:publish-smoke-${{ matrix.artifact }}
           labels: |
             org.opencontainers.image.title=Splendor Kernel
             org.opencontainers.image.description=Splendor 0.05-dev governed runtime image for local, physical, and edge primitive validation
             org.opencontainers.image.licenses=Apache-2.0 OR MIT
-
-      - name: Build and push platform image by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          labels: |
-            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ (inputs.publish_0_05_dev == true || inputs.publish_0_05_dev == 'true') && 'v0.05-dev' || (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             SPLENDOR_IMAGE_VERSION=${{ (inputs.publish_0_05_dev == true || inputs.publish_0_05_dev == 'true') && 'v0.05-dev' || (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.created }}
 
-      - name: Export digest
+      - name: Seal the exact image archive
+        env:
+          SPLENDOR_CONTAINER_IMAGE: splendor:publish-smoke-${{ matrix.artifact }}
         run: |
-          mkdir -p "${RUNNER_TEMP}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+          cd "${RUNNER_TEMP}"
+          sha256sum image.tar > image.tar.sha256
+          docker load --input image.tar
+          docker image inspect "${SPLENDOR_CONTAINER_IMAGE}" --format '{{.Id}}' > image.id
 
-      - name: Upload digest artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload tested image artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: digests-${{ matrix.artifact }}
-          path: ${{ runner.temp }}/digests/*
+          name: tested-image-${{ matrix.artifact }}
+          path: |
+            ${{ runner.temp }}/image.tar
+            ${{ runner.temp }}/image.tar.sha256
+            ${{ runner.temp }}/image.id
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-smoke:
+    needs: [secret-contracts, smoke]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository without default token
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Download sealed image artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tested-image-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/tested-image
+
+      - name: Load the exact sealed image copy
+        working-directory: ${{ runner.temp }}/tested-image
+        env:
+          SPLENDOR_CONTAINER_IMAGE: splendor:publish-smoke-${{ matrix.artifact }}
+        run: |
+          sha256sum --check image.tar.sha256
+          docker load --input image.tar
+          test "$(docker image inspect "${SPLENDOR_CONTAINER_IMAGE}" --format '{{.Id}}')" = "$(cat image.id)"
+
+      - name: Verify exact candidate dependency and binary release closure
+        env:
+          CANDIDATE_IMAGE: splendor:publish-smoke-${{ matrix.artifact }}
+        run: |
+          python3 scripts/architecture/check-secret-provider-release-closure.py \
+            --image "${CANDIDATE_IMAGE}" \
+            --expected-revision "${GITHUB_SHA}"
+
+      - name: Smoke test the sealed image copy
+        env:
+          SPLENDOR_CONTAINER_IMAGE: splendor:publish-smoke-${{ matrix.artifact }}
+          SPLENDOR_CONTAINER_BUILD: "0"
+        run: |
+          bash scripts/container-tests.sh
+
+  publish-platform:
+    needs: [secret-contracts, smoke, verify-smoke]
+    if: github.ref_protected == true
+    environment: ghcr-release
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository without default token
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Require a protected release ref
+        env:
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+        run: test "${GITHUB_REF_PROTECTED}" = "true"
+
+      - name: Download tested image artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tested-image-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/tested-image
+
+      - name: Verify and load tested image artifact
+        working-directory: ${{ runner.temp }}/tested-image
+        env:
+          TESTED_IMAGE: splendor:publish-smoke-${{ matrix.artifact }}
+        run: |
+          sha256sum --check image.tar.sha256
+          docker load --input image.tar
+          test "$(docker image inspect "${TESTED_IMAGE}" --format '{{.Id}}')" = "$(cat image.id)"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote the loaded tested image
+        env:
+          TESTED_IMAGE: splendor:publish-smoke-${{ matrix.artifact }}
+        run: |
+          target="${REGISTRY}/${IMAGE_NAME}:tested-${GITHUB_SHA}-${{ matrix.artifact }}"
+          docker tag "${TESTED_IMAGE}" "${target}"
+          docker push "${target}"
+          digest="$(docker image inspect "${target}" --format '{{index .RepoDigests 0}}')"
+          digest="${digest#*@}"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "${RUNNER_TEMP}/published-digests"
+          printf '%s\n' "${digest}" > "${RUNNER_TEMP}/published-digests/${{ matrix.artifact }}.digest"
+
+      - name: Upload published digest artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: published-digest-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/published-digests/*.digest
           if-no-files-found: error
           retention-days: 1
 
   publish-manifest:
-    needs: publish-platform
+    needs: [secret-contracts, publish-platform]
+    if: github.ref_protected == true
+    environment: ghcr-release
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
-      - name: Download digest artifacts
-        uses: actions/download-artifact@v4
+      - name: Checkout repository without default token
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Require a protected release ref
+        env:
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+        run: test "${GITHUB_REF_PROTECTED}" = "true"
+
+      - name: Download published digest artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-*
+          pattern: published-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -180,7 +299,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -210,16 +329,42 @@ jobs:
           done <<< "${DOCKER_METADATA_OUTPUT_TAGS}"
 
           sources=()
-          for digest in *; do
-            sources+=("${REGISTRY}/${IMAGE_NAME}@sha256:${digest}")
+          test "$(find . -maxdepth 1 -name '*.digest' -type f | wc -l | tr -d ' ')" = "2"
+          for digest_file in *.digest; do
+            digest="$(cat "${digest_file}")"
+            [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            sources+=("${REGISTRY}/${IMAGE_NAME}@${digest}")
           done
 
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
 
-      - name: Inspect published image
+      - name: Verify published manifest uses only tested children
         env:
           INSPECT_TAG: ${{ (inputs.publish_0_05_dev == true || inputs.publish_0_05_dev == 'true') && '0.05-dev' || (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && '0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && '0.02-dev' || github.ref_name }}
-        run: docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${INSPECT_TAG}"
+        run: |
+          docker buildx imagetools inspect --raw "${REGISTRY}/${IMAGE_NAME}:${INSPECT_TAG}" > "${RUNNER_TEMP}/published-manifest.json"
+          EXPECTED_DIR="${RUNNER_TEMP}/digests" MANIFEST="${RUNNER_TEMP}/published-manifest.json" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected = {
+              path.read_text(encoding="utf-8").strip()
+              for path in Path(os.environ["EXPECTED_DIR"]).glob("*.digest")
+          }
+          manifest = json.loads(Path(os.environ["MANIFEST"]).read_text(encoding="utf-8"))
+          entries = manifest.get("manifests", [])
+          actual = {entry["digest"] for entry in entries}
+          platforms = {
+              (entry.get("platform", {}).get("os"), entry.get("platform", {}).get("architecture"))
+              for entry in entries
+          }
+          if len(expected) != 2 or len(entries) != 2 or actual != expected or platforms != {
+              ("linux", "amd64"),
+              ("linux", "arm64"),
+          }:
+              raise SystemExit("published manifest children differ from tested digests")
+          PY
 
       - name: Optionally make GHCR package public
         env:
@@ -234,9 +379,8 @@ jobs:
               echo "No \`GHCR_VISIBILITY_TOKEN\` secret is configured, so this workflow did not change package visibility."
               echo "Publishing still completed, but first-time public pulls require a package admin to make the GHCR package public manually or configure that secret."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          else
+            gh api --method PATCH \
+              "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}/visibility" \
+              -f visibility=public
           fi
-
-          gh api --method PATCH \
-            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}/visibility" \
-            -f visibility=public

@@ -1,12 +1,29 @@
 use super::*;
-use splendor_store::{InMemoryTraceStore, TraceStore, TraceStoreError};
+use splendor_evidence::{inspect_trace, TraceCompatibilityError};
+use splendor_store::{InMemoryTraceStore, SqliteTraceStore, TraceStore, TraceStoreError};
 use splendor_types::{
     AgentId, SnapshotId, StateHandoffAuthority, StateHandoffSnapshot, StateReference,
     StateReferenceMode, TenantId,
 };
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Mutex, TryLockError};
 use std::thread;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+
+fn activate_runtime_writer(
+    runtime: &KernelRuntime,
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+) -> RuntimeWriterLease {
+    let writer = runtime
+        .acquire_engine_writer(tenant_id, agent_id)
+        .expect("runtime writer");
+    let inspected = inspect_trace(writer.reader(), runtime.run_id()).expect("validated trace");
+    runtime
+        .activate_engine_writer(&writer, inspected.tail)
+        .expect("activate runtime writer");
+    writer
+}
 
 #[derive(Default)]
 struct CapturingSink {
@@ -305,21 +322,216 @@ fn concurrent_record_event_calls_keep_contiguous_sequence_and_integrity_cursor()
 }
 
 #[test]
+fn fresh_distinct_agent_admission_and_event_append_follow_one_lock_order() {
+    let store = Arc::new(InMemoryTraceStore::default());
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(store, Some(RunId::new())).expect("trace runtime"),
+    );
+    let primary_tenant = TenantId::new();
+    let primary_agent = AgentId::new();
+    let primary_writer = activate_runtime_writer(&runtime, &primary_tenant, &primary_agent);
+    assert!(runtime
+        .admit_fresh_engine(&primary_tenant, &primary_agent)
+        .expect("primary fresh admission"));
+
+    // Hold the second lock in the documented hierarchy. Correct admission takes
+    // the trace cursor first and waits here; the old lifecycle-first path never
+    // takes the cursor and deterministically fails the observation below.
+    let (lifecycle_held_sender, lifecycle_held_receiver) = mpsc::channel();
+    let (release_lifecycle_sender, release_lifecycle_receiver) = mpsc::channel();
+    let lifecycle_runtime = Arc::clone(&runtime);
+    let lifecycle_thread = thread::spawn(move || {
+        let lifecycle = lifecycle_runtime
+            .writer_lifecycle
+            .state
+            .lock()
+            .expect("writer lifecycle lock");
+        lifecycle_held_sender
+            .send(())
+            .expect("announce held writer lifecycle");
+        release_lifecycle_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release writer lifecycle");
+        drop(lifecycle);
+    });
+    lifecycle_held_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer lifecycle held");
+    let admission_start = Arc::new(Barrier::new(2));
+    let (admission_sender, admission_receiver) = mpsc::channel();
+    let admission_runtime = Arc::clone(&runtime);
+    let admission_barrier = Arc::clone(&admission_start);
+    let admitted_tenant = TenantId::new();
+    let admitted_agent = AgentId::new();
+    let admitted_tenant_for_thread = admitted_tenant.clone();
+    let admitted_agent_for_thread = admitted_agent.clone();
+    let admission_thread = thread::spawn(move || {
+        admission_barrier.wait();
+        let result = (|| {
+            let writer = admission_runtime
+                .acquire_engine_writer(&admitted_tenant_for_thread, &admitted_agent_for_thread)?;
+            let admitted = admission_runtime
+                .admit_fresh_engine(&admitted_tenant_for_thread, &admitted_agent_for_thread)?;
+            Ok::<_, TraceError>((writer, admitted))
+        })();
+        admission_sender
+            .send(result)
+            .expect("send admission result");
+    });
+    admission_start.wait();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match runtime.trace_cursor.try_lock() {
+            Err(TryLockError::WouldBlock) => break,
+            Err(TryLockError::Poisoned(_)) => panic!("trace cursor lock poisoned"),
+            Ok(cursor) => drop(cursor),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh writer admission did not acquire the trace cursor before the writer lifecycle"
+        );
+        thread::yield_now();
+    }
+
+    let event_start = Arc::new(Barrier::new(2));
+    let (event_attempt_sender, event_attempt_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) = mpsc::channel();
+    let event_runtime = Arc::clone(&runtime);
+    let event_barrier = Arc::clone(&event_start);
+    let event_thread = thread::spawn(move || {
+        event_barrier.wait();
+        event_attempt_sender
+            .send(())
+            .expect("announce event append");
+        let result = event_runtime.record_event(TraceEventKind::PolicyInvoked {
+            policy: "concurrent-lock-order".to_string(),
+        });
+        event_sender.send(result).expect("send event result");
+    });
+    event_start.wait();
+    event_attempt_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("event append attempt");
+
+    release_lifecycle_sender
+        .send(())
+        .expect("release writer lifecycle");
+
+    let (admitted_writer, admitted) = admission_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fresh admission completed")
+        .expect("fresh admission succeeded");
+    let event = event_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("event append completed")
+        .expect("event append succeeded");
+    lifecycle_thread.join().expect("lifecycle thread");
+    admission_thread.join().expect("admission thread");
+    event_thread.join().expect("event thread");
+
+    assert!(admitted);
+    assert_eq!(event.sequence, 1);
+    assert_eq!(runtime.next_sequence(), 2);
+    drop(admitted_writer);
+    drop(primary_writer);
+}
+
+#[test]
+fn independent_sqlite_runtime_writers_have_one_success_and_one_typed_conflict() {
+    const RACE_COUNT: usize = 32;
+
+    for race in 0..RACE_COUNT {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let path = directory.path().join("trace.sqlite3");
+        let run_id = RunId::new();
+        let left = KernelRuntime::with_trace_store(
+            Arc::new(SqliteTraceStore::open(&path).expect("left trace store")),
+            Some(run_id.clone()),
+        )
+        .expect("left runtime");
+        let right = KernelRuntime::with_trace_store(
+            Arc::new(SqliteTraceStore::open(&path).expect("right trace store")),
+            Some(run_id.clone()),
+        )
+        .expect("right runtime");
+        let start = Arc::new(Barrier::new(3));
+        let acquired = Arc::new(Barrier::new(3));
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+
+        let handles = [left, right]
+            .into_iter()
+            .map(|runtime| {
+                let start = Arc::clone(&start);
+                let acquired = Arc::clone(&acquired);
+                let tenant_id = tenant_id.clone();
+                let agent_id = agent_id.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let writer = runtime.acquire_engine_writer(&tenant_id, &agent_id);
+                    acquired.wait();
+                    let writer = writer?;
+                    let inspected = inspect_trace(writer.reader(), runtime.run_id())?;
+                    runtime.activate_engine_writer(&writer, inspected.tail)?;
+                    runtime.record_event(TraceEventKind::RunStarted)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        acquired.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("writer thread"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "race {race}: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(TraceError::Compatibility(
+                            TraceCompatibilityError::WriterConflict
+                        ))
+                    )
+                })
+                .count(),
+            1,
+            "race {race}: {results:?}"
+        );
+        let records = SqliteTraceStore::open(&path)
+            .expect("inspection store")
+            .read(&run_id.to_string())
+            .expect("single trace record");
+        assert_eq!(records.len(), 1, "race {race}");
+        assert_eq!(records[0].sequence, 0, "race {race}");
+    }
+}
+
+#[test]
 fn runtime_resumes_sequence_with_trace_store() {
     let store = Arc::new(InMemoryTraceStore::default());
     let run_id = RunId::new();
-    let event = TraceEvent::new(
-        run_id.clone(),
-        0,
-        OffsetDateTime::now_utc(),
-        TraceEventKind::LoopTickStarted { tick_id: 1 },
-    );
-    let payload = serde_json::to_value(&event).expect("payload");
-    let sequence =
-        TraceStore::append(store.as_ref(), &run_id.to_string(), payload).expect("append");
-    assert_eq!(sequence, 0);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let first = KernelRuntime::with_trace_store(store.clone(), Some(run_id.clone()))
+        .expect("first runtime");
+    let first_writer = activate_runtime_writer(&first, &tenant_id, &agent_id);
+    let first_event = first
+        .record_event(TraceEventKind::LoopTickStarted { tick_id: 1 })
+        .expect("first event");
+    assert_eq!(first_event.sequence, 0);
+    drop(first_writer);
+    drop(first);
 
     let runtime = KernelRuntime::with_trace_store(store, Some(run_id.clone())).expect("runtime");
+    let _writer = activate_runtime_writer(&runtime, &tenant_id, &agent_id);
     let next = runtime
         .record_event(TraceEventKind::LoopTickCompleted {
             tick_id: 1,
@@ -341,6 +553,7 @@ fn loop_tick_completed_integrity_matches_trace_store_record() {
     let run_id = RunId::new();
     let runtime =
         KernelRuntime::with_trace_store(store.clone(), Some(run_id.clone())).expect("runtime");
+    let _writer = activate_runtime_writer(&runtime, &TenantId::new(), &AgentId::new());
     runtime
         .record_event(TraceEventKind::PolicyInvoked {
             policy: "unit".to_string(),

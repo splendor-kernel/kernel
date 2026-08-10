@@ -103,8 +103,9 @@ conditions.
 
 `VerifiedActionGateway` runs identity, live authority, approval obligation,
 permission, quota, safety, and invariant checks before executing adapters and
-evaluates postconditions after execution. It
-first validates `action_id`, `tenant_id`, `agent_id`, and `run_id`; missing or nil
+evaluates postconditions after execution. Its first operation is the bounded raw
+credential ingress guard described below. It then validates `action_id`,
+`tenant_id`, `agent_id`, and `run_id`; missing or nil
 identity returns a denied `ActionOutcome` with reason `identity_invalid` and does
 not call adapters. Approval-required, denied, expired, revoked, wrong-scope,
 unsupported-schema, forged, replayed, or exact-binding-mismatched approval
@@ -112,6 +113,186 @@ decisions/receipts also stop before adapter execution. Receipt validation is not
 enough by itself: the gateway re-evaluates the current conditional authority
 decision and atomically claims a one-use receipt immediately before durable
 pre-effect evidence and adapter invocation.
+
+### Raw credential ingress guard
+
+`splendor-gateway` owns one pure, always-on denial guard for the existing
+`Action` / `ActionRequest` path. The guard runs before identity validation,
+adapter lookup, authority/broker/provider evaluation, verifier calls, pre-effect
+recording, or adapter execution. Kernel and daemon pre-persistence ingresses call
+the same Gateway-owned implementation; they do not maintain independent key or
+content rules.
+
+The guard recursively checks action fields, param keys and values, requested
+adapter, satisfied-precondition strings, free-form raw approval-evidence fields,
+and free-form strings in raw authority obligation receipts. Approval-evidence and
+receipt screening is content denial only: it neither validates the object nor
+turns it into authority. Case/separator-normalized
+credential coordinates include authorization/proxy authorization, common
+`authKey`/`apiToken`/`X-API-Key`/`X-Auth-Token`/`Private-Token`/`authz` aliases,
+password/passwd, token/API key, Vault/Consul token environment coordinates,
+Kubernetes `secretKeyRef`, client secret, private key, cookie/set-cookie,
+secret/credential, connection-string/DSN, provider environment-password aliases,
+presigned signature coordinates such as `X-Amz-Signature`, URL userinfo, and
+equivalent nested map/list content. Credential material in an object key is
+screened as content as well as by normalized key name.
+
+Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
+authorization form, PEM private-key block, boundary-delimited provider token,
+embedded generic secret reference, or unambiguous credential URL/DSN/assignment
+form. Closed selector-plus-material objects such as `{ "name": "VAULT_TOKEN",
+"value": "..." }` are screened against the same Gateway-owned credential-key
+grammar, excluding the intentionally ambiguous generic `token` selector and
+non-ASCII labels. Generic schema descriptions such as `{ "name": "token",
+"type": "string" }` are not treated as credential material merely from their
+label. Lexical boundaries are complement-based and Unicode-safe: Unicode
+alphanumeric characters continue a surrounding word, while ASCII or Unicode
+punctuation/separators delimit authorization, provider-token, reference, and
+assignment syntax. Basic tokens are locally base64-decoded within the scanner
+limit and deny only when the decoded credential has the required colon structure;
+short valid Basic/Bearer credentials still deny. A valid bounded credential
+prefix ending at punctuation is denied even when that punctuation is also legal
+inside the broader Basic, Bearer, provider, or reference alphabet. Provider
+profiles use provider-specific prefixes, realistic minimum/maximum lengths, and
+alphabets—including exact legacy `sk-` and named modern variants rather than one
+broad `sk-` family. Ordinary prose such as `Basic planning`, standalone
+`hf_transformer`, and resource paths such as `models/hf_transformer` or
+`models/sk-learn-sentiment-classifier-v2` remain accepted.
+
+URL scanning extracts bounded candidates instead of treating surrounding prose as
+part of a scheme. It separates a structurally valid numeric authority port before
+screening the once-decoded host. Hosts must be nonempty bounded reg-name/IPv4-style
+names, parsed IPv6 literals with optional zone IDs, or valid IPvFuture literals;
+ports must use a raw structural colon and fit `u16`; an encoded colon is never
+promoted into a port separator. Raw and once-encoded IP-literal brackets receive
+equivalent candidate parsing, and scoped IPv6 `%25` zone delimiters accept bounded
+unreserved zone IDs. A preceding URL cannot suppress a later assignment/reference.
+The guard also screens
+decoded path/fragment components, standalone and URL form/query names and values,
+plus-as-space values, encoded non-URL spans beside even
+comma-adjacent benign URLs, query-bearing secret refs, and nested credential URLs
+with a maximum nesting depth of four. Each form/percent layer is decoded once;
+residual valid escapes or ambiguous encodings fail closed while an intentional
+literal percent encoded as `%25` remains ordinary content. Thus `see
+https://example.invalid/docs` remains accepted while encoded refs, presigned
+signatures, provider tokens in authorities or paths, and nested credential URLs
+deny. Object keys containing non-ASCII/confusable characters or residual percent
+escapes after one bounded decode also fail closed.
+
+Top-level numeric `params.bytes` content is a strict credential-capable
+coordinate by default, independent of requester routing metadata. The public
+general-purpose action guards always use this strict profile; an omitted adapter,
+an action-declared adapter, or a caller-supplied `filesystem` adapter can never
+select opaque-byte handling. The strict profile requires bounded
+integer bytes and unambiguous UTF-8; UTF-8 BOM, UTF-16LE/BE, UTF-32LE/BE,
+invalid UTF-8, NUL/control data, non-array, non-integer, out-of-range, or
+over-budget shapes fail closed. Credential-free bounded UTF-8 bodies remain
+accepted.
+
+The exact legacy filesystem write profile instead classifies that same bounded
+array as opaque file content only after a trusted composition root resolves all
+of the following before payload scanning: an immutable `TrustedActionProfile`,
+the profile's exact action-to-adapter registration, the full permission set, and
+the registered adapter's filesystem side-effect contract. The request must then
+have the exact closed `{path, bytes}` params shape and `write_file` operation. An
+omitted request adapter may use the owner-resolved registered adapter; a supplied
+adapter must match it exactly. Missing profiles, missing registrations, profile
+or permission mismatches, and spoofed routes retain the strict profile. The
+Gateway's Rust-only trusted-profile guard helper is denial-only and requires
+owner-resolved input; constructing or forwarding requester metadata does not make
+it trusted. `VerifiedActionGateway` resolves this input from its own immutable
+profile and adapter maps, and the daemon's policy wrapper receives the same
+already-validated run profiles from composition. Kernel policy-proposal paths
+without that owner-resolved evidence retain the strict profile. The opaque
+profile uses a dedicated bounded byte-candidate scan rather than the general
+persisted-value parser. Ordinary file bytes therefore retain NUL and control
+bytes and may begin with malformed-JSON-looking text such as `{not-json`; this
+path does not reinterpret them as persisted JSON. It still scans complete UTF-8
+runs around invalid byte sequences, strictly decodes leading UTF-8/UTF-16/
+UTF-32 byte-order marks, detects likely BOM-less UTF-16LE/BE and UTF-32LE/BE,
+and checks aligned embedded zero-interleaved ASCII runs. Recognizable credential
+text in any of those forms denies before adapter entry. Nested or midstream
+BOMs, malformed declared encodings, competing endian interpretations, and
+truncated or near-zero-interleaved text fail closed. The exception does not
+exempt arbitrary actions, adapters, or field paths, and it does not carry into
+percept, state, adapter-output, trace, or other persistence barriers; those
+general paths retain their strict text/JSON ambiguity rules. Numeric arrays
+under other action-param field names retain ordinary non-byte semantics.
+
+All inspected raw and decoded string and object-key coordinates must also be
+unambiguous text. UTF BOM markers and non-whitespace control/NUL characters fail
+closed before a string can enter traces, persistence, safety evidence, or an
+adapter. Tabs and ordinary line endings remain valid credential-free text.
+
+The Gateway also exposes the same recursive bounded value entry point for an
+owning service to screen a complete closed JSON envelope. The daemon uses it for
+`DeviceRuntimeProfile`; Gateway owns detection vocabulary while the daemon remains
+profile schema/mutation owner.
+
+Traversal is bounded to depth 16, 2,048 inspected nodes, 16 KiB per string/key,
+and 64 KiB cumulative inspected UTF-8 bytes. A cap overflow returns the same
+fieldless, non-serializable `RawCredentialInputDenied`; its `Display` and `Debug`
+are exactly `raw_credential_input_denied` and retain no key, value, path, parser
+detail, or derived digest. The matching `ActionOutcome` is `Denied`, has no
+output/artifacts, and uses only that fixed reason/error.
+
+Persisting callers must use `raw_credential_denied_action()` for every action
+trace associated with this denial. The projection is constant: it retains action
+identity only in the enclosing trace identity/outcome and replaces all
+requester-controlled action fields with `credential_input_suppressed` plus the
+fixed suppression marker. The original denied action must never be traced.
+
+This is a bounded denial-only compatibility barrier. It does not claim exhaustive
+high-entropy, arbitrary encoded, encrypted/compressed, or split-secret detection;
+does not implement RFC 0012's operation-specific `CredentialIngressProfile` or
+the future repository scanner; and does not create a typed secret requirement,
+broker permit, provider invocation, material delivery, or exception registry.
+Generic `secret_ref_id` fields and ref-like strings are denied because the stable
+generic action schema is not a typed C03 requirement path.
+
+### Adapter-result persistence barrier
+
+Immediately after `ActionAdapter::execute` returns successfully,
+`VerifiedActionGateway` submits the complete `AdapterResult.output` plus its
+satisfied-postcondition strings to the same Gateway-owned bounded scanner. The
+scan occurs before invariant or safety post-verification and before any output
+can enter `ActionOutcome`, traces, daemon responses, state, export, or replay.
+Persisted JSON screening includes strings and keys plus selected `bytes`, `body`,
+and `contents` numeric-byte envelopes, including the current filesystem and HTTP
+result shapes. A schema-free root array retains ordinary JSON semantics: a
+complete `0..=255` integer array is additionally scanned as a non-authorizing
+UTF-8/likely-UTF-16/likely-UTF-32 credential candidate, while mixed, fractional,
+negative, or out-of-range root arrays are not reclassified as malformed bytes.
+Credential matches still suppress the root result. Once a selected envelope has a
+numeric-byte profile, every member must be an integer in `0..=255`; floats,
+negative/out-of-range values, booleans, nulls, strings, objects, or mixed forms
+deny instead of abandoning reconstruction. Invalid UTF-8 opaque envelopes are
+still inspected, within the same byte budget, for complete recognizable UTF-8,
+UTF-16, and UTF-32 textual spans before genuinely opaque benign binary is
+allowed. No lossy candidate is retained or reflected. Declared JSON bodies must
+parse, textual bodies must be unambiguous UTF-8, and scanner/parser/encoding/
+resource uncertainty fails closed.
+
+A match or uncertainty after adapter entry is not a pre-effect denial. The
+Gateway returns `ActionStatus::Failed`, keeps the already-safe pre-verification
+result, sets `post_verification` to a denial whose only reason is
+`raw_credential_output_suppressed`, sets `error` to that same code, and omits
+output. Its fixed operational artifacts record `adapter_entered: true`,
+`effect_certainty: uncertain`, `retry_class: not_retryable`, and
+`reconciliation_required: true`. The same existing artifact channel now records
+operational facts for every adapter-entered result: an unclassified adapter error
+uses uncertain/not-retryable/reconciliation-required; a returned result uses
+known/not-retryable and requires reconciliation when post-verification fails;
+successful post-verification records reconciliation as false. Adapter errors keep
+the bounded `adapter failed` projection and never expose provider-controlled
+text. None of these facts claims rollback or authorizes blind retry.
+
+The companion pure percept/state guards share this scanner owner. Percepts are
+screened before trace/policy/queue retention. Policy-selected state declared as
+JSON or text is strictly parsed/decoded before commit; genuinely opaque binary
+state remains compatible and carries no encrypted/compressed absence claim.
+This bounded compatibility barrier is not RFC 0012's per-lease streaming leak
+detector, output-drain, incident, or quarantine owner.
 
 For physical actions, the gateway rejects forbidden low-level action names such
 as motor PWM, raw actuator writes, firmware safety bypass, flight-controller

@@ -89,7 +89,7 @@ pub use run_authority::{
     RunAuthorityHandle,
 };
 pub use runtime::{KernelRuntime, KernelRuntimeConfig};
-pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};
+pub use scheduler::{RuntimeTarget, Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};
 pub use splendor_types::{
     cloud_helper_failure_validation, validate_cloud_helper_work_order,
     validate_route_plan_for_local_execution, Action, ActionId, AgentId, AuthorityBudgetScope,

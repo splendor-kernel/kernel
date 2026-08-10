@@ -11,6 +11,7 @@ time = { workspace = true }
 uuid = { workspace = true }
 splendor-types = { path = "../splendor-types" }
 rusqlite = { version = "0.31", features = ["bundled"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -1,0 +1,15 @@
+[package]
+name = "splendor-evidence"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+splendor-store = { path = "../splendor-store" }
+splendor-types = { path = "../splendor-types" }
+
+[dev-dependencies]
+tempfile = "3.10"

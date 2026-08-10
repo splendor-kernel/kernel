@@ -1,0 +1,21 @@
+[package]
+name = "splendor-adapter-secrets-local-file"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+local-file-secret-provider = []
+
+[dependencies]
+blake3 = "1.5"
+libc = "0.2"
+splendor-authority = { path = "../../crates/splendor-authority" }
+splendor-types = { path = "../../crates/splendor-types" }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+splendor-authority = { path = "../../crates/splendor-authority", features = ["secret-provider-test-support"] }
+tempfile = "3"
+uuid = { workspace = true }

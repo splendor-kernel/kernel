@@ -38,6 +38,19 @@
 //! assert!(ActionGateway::submit(&gateway, request).is_err());
 //! ```
 
+mod credential_ingress;
+
+pub use credential_ingress::{
+    guard_action, guard_action_request, guard_action_request_with_trusted_profile,
+    guard_action_routing, guard_action_routing_and_receipts, guard_credential_capable_strings,
+    guard_credential_capable_value, guard_persisted_percept, guard_persisted_state,
+    raw_credential_denied_action, raw_credential_denied_outcome, RawCredentialInputDenied,
+    CREDENTIAL_INGRESS_MAX_DEPTH, CREDENTIAL_INGRESS_MAX_NODES,
+    CREDENTIAL_INGRESS_MAX_STRING_BYTES, CREDENTIAL_INGRESS_MAX_TOTAL_BYTES,
+    RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
+};
+use credential_ingress::{guard_adapter_result, raw_credential_output_suppressed_outcome};
+
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
     authority_decision_evidence, canonical_authority_request_digest,
@@ -1580,6 +1593,27 @@ impl VerifiedActionGateway {
 
 impl ActionGateway for VerifiedActionGateway {
     fn submit(&self, action: ActionRequest) -> Result<ActionOutcome, GatewayError> {
+        // Resolve immutable registry metadata before inspecting the untrusted
+        // payload. Request routing alone must never select opaque-byte handling.
+        let registration = self.adapters.get(&action.action.name);
+        let trusted_ingress_profile = self
+            .trusted_action_profiles
+            .as_ref()
+            .and_then(|profiles| profiles.get(&action.action.name))
+            .filter(|profile| {
+                registration.is_some_and(|entry| entry.adapter_id == profile.adapter)
+            });
+        let credential_guard = match (trusted_ingress_profile, registration) {
+            (Some(profile), Some(registration)) => guard_action_request_with_trusted_profile(
+                &action,
+                profile,
+                &registration.adapter_id,
+            ),
+            _ => guard_action_request(&action),
+        };
+        if credential_guard.is_err() {
+            return Ok(raw_credential_denied_outcome(action.action_id));
+        }
         if let Err(error) = action.validate_identity() {
             return Ok(identity_denied_outcome(action.action_id, error));
         }
@@ -1606,7 +1640,6 @@ impl ActionGateway for VerifiedActionGateway {
             return Ok(denied_outcome(action.action_id, verification));
         }
 
-        let registration = self.adapters.get(&action.action.name);
         let authority_adapter = action
             .adapter
             .as_deref()
@@ -2189,12 +2222,20 @@ impl ActionGateway for VerifiedActionGateway {
 
         let adapter_result = match registration.adapter.execute(&action) {
             Ok(result) => result,
-            Err(_error) => {
+            Err(error) => {
+                let taxonomy = error.taxonomy_for_adapter(adapter_id);
+                let mut post_verification = VerificationResult::deny("adapter failed");
+                attach_adapter_effect_facts(
+                    &mut post_verification,
+                    taxonomy.effect_certainty,
+                    taxonomy.retry_class,
+                    true,
+                );
                 return Ok(ActionOutcome {
                     action_id: action.action_id,
                     status: ActionStatus::Failed,
                     verification,
-                    post_verification: None,
+                    post_verification: Some(post_verification),
                     output: None,
                     // AdapterError::Failed contains provider-controlled human text.
                     // Keep public outcomes bounded and non-authorizing; the stable
@@ -2205,6 +2246,12 @@ impl ActionGateway for VerifiedActionGateway {
                 });
             }
         };
+        if guard_adapter_result(&adapter_result).is_err() {
+            return Ok(raw_credential_output_suppressed_outcome(
+                action.action_id,
+                verification,
+            ));
+        }
         drop((effect_permit, obligation_effect_permit));
 
         let post_verification = self
@@ -2216,7 +2263,14 @@ impl ActionGateway for VerifiedActionGateway {
             Some(adapter_id),
             &adapter_result,
         );
-        let post_verification = combine_post_verifications(post_verification, post_safety);
+        let mut post_verification = combine_post_verifications(post_verification, post_safety);
+        let reconciliation_required = !post_verification.allowed;
+        attach_adapter_effect_facts(
+            &mut post_verification,
+            EffectCertainty::Known,
+            RetryClass::NotRetryable,
+            reconciliation_required,
+        );
         let status = if post_verification.allowed {
             ActionStatus::Executed
         } else {
@@ -2786,6 +2840,33 @@ impl GatewayError {
             }
         }
     }
+}
+
+fn attach_adapter_effect_facts(
+    result: &mut VerificationResult,
+    effect_certainty: EffectCertainty,
+    retry_class: RetryClass,
+    reconciliation_required: bool,
+) {
+    if !result.artifacts.is_object() {
+        result.artifacts = serde_json::json!({});
+    }
+    let Some(artifacts) = result.artifacts.as_object_mut() else {
+        return;
+    };
+    artifacts.insert("adapter_entered".to_string(), serde_json::Value::Bool(true));
+    artifacts.insert(
+        "effect_certainty".to_string(),
+        serde_json::Value::String(effect_certainty.as_str().to_string()),
+    );
+    artifacts.insert(
+        "retry_class".to_string(),
+        serde_json::Value::String(retry_class.as_str().to_string()),
+    );
+    artifacts.insert(
+        "reconciliation_required".to_string(),
+        serde_json::Value::Bool(reconciliation_required),
+    );
 }
 
 fn check_conditions(reason: &str, expected: &[String], satisfied: &[String]) -> VerificationResult {

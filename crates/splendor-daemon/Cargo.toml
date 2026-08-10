@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 splendor-gateway = { path = "../splendor-gateway" }
 splendor-kernel = { path = "../splendor-kernel" }
 splendor-store = { path = "../splendor-store" }
+splendor-evidence = { path = "../splendor-evidence" }
 splendor-types = { path = "../splendor-types" }
 thiserror = { workspace = true }
 time = { workspace = true }

@@ -4,6 +4,256 @@
 
 ### Added
 
+- **status/incomplete correction:** reserves explicit static daemon-policy action
+  IDs against direct/physical preemption before audit or durable-history lookup,
+  while preserving later completed tick reuse and exact tick-approval
+  continuation. Raw requests carrying those reserved IDs now return only the
+  fixed denial without audit/action history or consuming the future policy ID.
+  Evidence requires complete ordered outcome/state/completion grammar for every
+  completed tick, while allowing a strictly later tick to supersede only an
+  earlier pre-action attempt with no action, outcome, state, pending episode, or
+  effect evidence. Closed, paused, and waiting raw-credential denials no longer
+  scan growing history or append trace records, and both direct and physical
+  OpenAPI routes declare the retryable `503 action_history_unavailable` response.
+  No request, trace-event, Store, Gateway, scanner, or canonical-command schema
+  changed.
+- **status/incomplete correction:** hardened daemon direct/physical action
+  duplicate suppression without adding a private command digest. A completely
+  used run-local `action_id` now returns uniform non-retryable
+  `action_id_conflict` instead of replaying a stored outcome; one initial
+  approval challenge permits only one exact continuation. Direct/physical
+  origins remain one-shot after that continuation; tick-origin IDs may be reused
+  only by the exact action on strictly later completed ticks after any challenge
+  closes. Concurrent trace-tail growth is retried with fresh bounded readers and
+  returns retryable `action_history_changed` on exhaustion; temporary pre-start
+  Store failure returns `action_history_unavailable`. Neither path permanently
+  closes admission. Live per-run contention returns
+  retryable `action_in_progress` without poisoning later authority, incomplete
+  durable history remains reconciliation-required, credential-bearing retries
+  are denied before durable disposition without persisting rejected metadata,
+  and physical cross-node reuse cannot become a profile/outcome oracle. Durable
+  history validation is bounded and runs outside the run mutex. This adds no
+  request, outcome, trace-event, or canonical digest schema and makes no
+  provider/global/distributed/restart exactly-once claim.
+- **status/incomplete correction:** redacted Evidence projections now tokenize
+  every 64-or-longer ASCII-hex run in every typed payload string and object key,
+  independent of source-chain membership or payload path. This closes percept
+  provenance, remote/idempotency, state-coordinate, action, and future typed-field
+  source-hash membership oracles. Structural payload hashes are intentionally
+  tokenized; source history is still fully validated first, and only the newly
+  computed projection-local envelope/completion hashes remain as integrity facts.
+- **status/incomplete correction:** moved durable action-episode interpretation
+  into `splendor-evidence`. The owner now validates strict terminal/outcome
+  grammar, action ID/status/source binding, effect certainty, endpoint-bound
+  approval continuation, and strictly later completed-tick reuse, while daemon handlers consume only a
+  bounded disposition plus live authority state. Approval continuation is bound
+  to its original endpoint class and physical node: direct/physical substitution
+  or cross-node retry fails before another episode, receipt claim, or adapter
+  call, leaves the run waiting, and preserves one-use receipt availability at the
+  original endpoint. No wire, request, outcome, trace variant, or canonical
+  digest changed.
+- **status/incomplete correction:** replaced the advisory persisted-run owner
+  shim with default-deny, externally implementable runtime trace reader/writer
+  capabilities. Recovery now acquires one append-fenced writer before bounded
+  history validation or state access and retains it through tail reconfirmation,
+  cursor initialization, and every append; close/drop revokes retained runtime
+  emitters. SQLite adds transactional, idempotent store/run anchor metadata,
+  full-envelope tail integrity, immutable anchored-history guards, and a bounded
+  private lock-shard namespace bound to verified opened-file identity. Non-empty
+  unanchored history remains inspect-only, current completions require integrity,
+  scheduler event/action/state-handoff operations target exact run/tenant/agent,
+  and trace/state/audit/replay output validates and spools before stdout with
+  fixed diagnostics. Stable trace event bytes/hashes and legacy custom-store
+  source compatibility are preserved; no transferable writer, live legacy
+  migration, catalog-task/Gold completion, or positive secret delivery is
+  claimed.
+- **status/incomplete correction:** runtime recovery now validates the complete
+  canonical trace record sequence, previous-hash links, and event hashes before
+  parsing recovery facts or restoring state. Built-in stores expose explicit
+  atomic conditional append while keeping arbitrary payload JSON opaque, so an
+  application field named `sequence` round-trips unchanged. SQLite uses bounded
+  immediate transactions for deterministic cross-connection conflicts and
+  identity-specific local lock sidecars for one live exact
+  run/tenant/agent owner; duplicate constructor and scheduler admission fail
+  closed. Recovery and scheduler admission retain the highest persisted attempted
+  tick so partial ticks are never reset or reused. This changes no public trace
+  event or SQLite `trace_events` schema and makes no transferable-writer, fleet,
+  Gold, task-completion, or positive secret-delivery claim.
+- **status/incomplete correction:** generalized the local runtime's post-Gateway
+  effect latch beyond credential-output suppression. Gateway outcomes now carry
+  fixed adapter-entry, effect-certainty, retry-class, and reconciliation facts in
+  the existing verification artifact channel; generic adapter and postcondition
+  failures park rather than retry, while successful effects become runnable only
+  after durable tick completion. Fresh shared-runtime admission is atomic per
+  exact tenant/agent identity, resume requires that identity's snapshot for its
+  latest completed tick, and runtime emitters use explicit atomic conditional
+  append expectations. Docker publication now
+  builds each platform candidate once, validates and smoke-tests that exact
+  archive, and later publishes only its checksum-matched bytes with registry write
+  authority isolated to post-validation jobs. No public schema was added and no
+  Gold or task-completion status changed.
+- **status/incomplete correction:** hardened the C03 persistence barrier so a
+  recognized root/`bytes`/`body`/`contents` numeric-byte profile denies every
+  malformed member instead of abandoning reconstruction, and bounded complete
+  textual spans around invalid UTF-8 are screened without retaining lossy
+  candidates. Post-adapter suppression now carries fixed adapter-entered,
+  uncertain-effect, not-retryable, and reconciliation-required facts; direct
+  ticks and local scheduler/CLI cycles cannot automatically repeat that action,
+  later same-tick candidates stop before Gateway submission, duplicate explicit
+  action IDs fail before submission, fresh constructors reject persisted runs,
+  and resume fails closed for incomplete action-capable ticks across post-effect
+  trace/state failures, while ordinary pre-effect failures retain their existing
+  behavior. The local-file development provider now validates trusted-root
+  ancestors and supported-platform ACLs, pins private process-keyed
+  content-integrity tags, and has a normal release dependency/binary closure gate
+  required before every exact-SHA Docker publication path and applied to
+  Docker-produced binaries. No public wire/trace schema or material API was
+  added, opaque custom encoding remains an explicit nonclaim, and `G07`, `G08`,
+  and `G82` remain `not_exercised`.
+- **status/incomplete:** added the offline, deterministic C03 contract/fixture
+  repository guard required by QA-089 and partial `SECR-006`. The
+  standard-library Python command structurally parses exact registered JSON,
+  bounded OpenAPI/example YAML, structured Markdown fences, and governed source
+  declarations; recognizes only path/schema/digest-pinned canonical C03 refs,
+  requirements, authorizations, Driver sink declarations, and expiring exact
+  caller-auth/bootstrap exceptions; and rejects
+  secret-like value fields, fake wrappers, malformed/duplicate contracts,
+  path/symlink ambiguity, unsupported governed formats, stale policy entries,
+  and resource overflow. A separate bounded content pass covers every
+  unambiguous UTF-8 tracked/non-ignored file plus magic-detected, globally
+  budgeted archive members, with digest/count-bound synthetic/public-vector
+  exceptions. The guard also closes low-entropy assignment/URL forms,
+  compatibility/control-character ambiguity, suffix-independent low-entropy and
+  ancestor-scoped config fields, digest-pinned source types and rebinding/record
+  forms, depth-bounded CommonMark/MyST/source fences, newly introduced OpenAPI/
+  SDK/package/Gold roots, all-offset V7 TAR polyglots, archive metadata/trailing
+  data, recursively normalized diagnostics, parser-operation budgets, and
+  descriptor-relative ancestor races. The self-test discovers and pins every
+  scanner test module. Both scanner commands use isolated `/usr/bin/python3 -I`;
+  every tracked workflow is enumerated and unknown workflows are rejected. Every
+  accepted CI build/test and Docker image
+  publication job fetches and verifies one immutable `GITHUB_SHA` and depends on
+  the exact-manifest self-test and current-tree scan. This is not runtime output-leak
+  scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK
+  parity, QA-090 release-provider evidence, issue closure, or a Gold pass.
+- **status/incomplete:** extended the single Gateway-owned bounded credential
+  scanner with a generic pre-persistence barrier for adapter results, percepts,
+  and policy-selected state. Adapter output and satisfied-postcondition strings
+  are screened immediately after one adapter return and before post-verifiers,
+  outcomes, traces, daemon responses, state, export, or replay; unsafe or
+  ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
+  with no output and no rollback/no-effect claim. Daemon and kernel percepts are
+  screened before queue retention, `PerceptsReceived`, or policy invocation, and
+  next-state bytes, content type, and optional label are screened before
+  `PolicyCompleted`, actions, outcomes, or state writes. Persisted JSON
+  screening covers strings/keys, root numeric byte arrays, and selected
+  `bytes`, `body`, and `contents` byte envelopes, including existing
+  filesystem/HTTP result shapes. Ordinary bounded JSON/text and genuinely
+  opaque binary remain compatible; encrypted/compressed/custom opaque content
+  is not claimed inspected. This bounded `SECR-004`/`SECR-006` slice adds no
+  live per-lease detector, positive secret delivery, incident/quarantine owner,
+  provider path, repository scanner, issue closure, or Gold evidence; `G07`,
+  `G08`, and `G82` remain `not_exercised`.
+- **status/incomplete:** added `splendor-adapter-secrets-local-file`, an
+  unpublished, empty-default-feature Unix provider restricted by construction
+  to explicit test/local-development modes. It accepts only a canonical absolute
+  trusted root and finite exact coordinate-to-relative-file map, retains the
+  root descriptor, uses descriptor-relative no-follow/nonblocking opens, and
+  enforces effective-user ownership, owner-only root/intermediate/file access,
+  regular single-link files, a 1..65,536-byte bound, and pinned descriptor
+  identity/change metadata before and after reads. Traversal, absolute or
+  noncanonical children, path aliases, symlinks, hard links, non-regular files,
+  insecure ownership/modes, missing/replaced/empty/oversized files, outage, and
+  poisoned state fail with fixed non-reflecting errors. Fetch uses only the
+  existing private-construction Authority provider port; audit/health expose
+  safe evidence, while renew/revoke return `unsupported_operation` and never
+  delete files. A default-off Authority test-support feature enables realistic
+  provider-port tests while returning only material length and safe evidence,
+  never request objects or bytes. Dependency-policy self-tests pin the adapter's
+  `publish = false`, empty default feature, narrow dependencies, dev-only test
+  support, and absence from normal release consumers. There is no environment,
+  home/current-directory/default-chain fallback, enumeration, listener, daemon
+  or Gateway composition, production provider, routing/failover/HA, issue
+  closure, or Gold claim; `G07` and `G08` remain `not_exercised`.
+- **status/incomplete:** added a Gateway-owned, always-on, bounded
+  pre-persistence raw-credential ingress denial across direct
+  `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run
+  admission, direct/physical action handlers, and Gateway policy/trace-durability
+  wrappers. Normalized credential coordinates, nested map/list content,
+  URL/userinfo/path/query, quoted/spaced connection/environment assignments,
+  structured cloud/device aliases, closed selector-plus-material coordinate
+  objects for credential aliases (while preserving generic/non-ASCII labels),
+  decoded colon-bearing Basic, short Bearer, provider-specific realistically
+  bounded token forms, PEM, embedded/encoded generic secret refs,
+  credential-bearing object keys, raw approval-evidence and receipt metadata,
+  physical/operator envelope strings, and complete device-profile envelopes are
+  covered. URL/form
+  parsing handles once-decoded URL authorities, paths, bare query names and
+  values, bounded nested URLs, standalone form bodies, encoded non-URL spans
+  adjacent to URLs, valid token prefixes before alphabet-overlapping punctuation,
+  structurally validated reg-name/IP-literal authorities, raw `u16` port
+  separators, IPv6 zone identifiers, and plus-as-space values with one decode
+  per layer;
+  ordinary literal-percent forms, embedded URLs, generic schema descriptors, and
+  provider-like resource names remain accepted. Every inspected raw or decoded
+  string rejects BOM and ambiguous NUL/control encodings. Every top-level numeric
+  `params.bytes` body additionally
+  requires unambiguous UTF-8 regardless of action label or adapter routing;
+  UTF-16, invalid UTF-8, malformed parsed coordinates, and
+  depth/node/string/byte overflow all return only
+  `raw_credential_input_denied`. Denied traces retain action identity/order but
+  use one constant action projection; raw input is excluded from constraints,
+  delegated authority, request fingerprints/idempotency, action traces, physical
+  safety evidence, device profile/status/audit records, operator records,
+  feedback, adapters/simulators, and
+  inspect-only replay. Complete-token grammar preserves ordinary Basic prose and
+  provider-looking resource paths. Existing wire schemas, trace variants, and
+  `ActionStatus` remain unchanged. Ordinary non-byte and bounded UTF-8 byte
+  actions remain compatible; generic top-level binary/ambiguous `params.bytes`
+  now fail closed until an owner-versioned ingress profile exists.
+  This is only a denial slice of `SECR-004`/`SECR-006`: it adds no typed secret
+  delivery, broker/provider Gateway session, operation-specific
+  `CredentialIngressProfile`, exhaustive runtime entropy/encoded/split detection,
+  quarantine/incident workflow, issue closure, or gold pass.
+- **status/incomplete:** added the first process-local C03 Secret Broker owner
+  slice for `SECR-001`, with bounded `SECR-003` renewal/revocation and
+  `SECR-005` provider-port progress. Additive ref-safe contracts are exported
+  only under `ProcessLocal*` names and bind exact tenant, principal, workload,
+  Driver declaration/slot/destination/trusted-send profile, placement, audience,
+  ref/provider version, intent, and purpose coordinates. The incomplete broker
+  lifecycle, constructors, handles/claims, clocks/IDs, limits, mutation errors,
+  inspection, and replay are crate-private; there is no callable production
+  lease API or complete live permit. The internal one-tenant prototype performs
+  current authenticated Authority/capability/revocation checks before
+  SecretRef/current-Driver, command, or handle lookup; derives command and
+  request partitions only from trusted tenant/principal/workload plus command
+  kind/nominal ID; and keeps placement/binding coordinates in explicit semantic
+  equality while excluding only lease-request `requested_at`. Historical
+  non-authorizing receipts are integrity-bound to their exact command/event and
+  retain/recreate no capability nonce. Fixed provider audit/health and memory
+  provider `Debug` output exposes no provider/ref/tenant/version/digest/time
+  coordinates. A live opaque capability is available only to the first
+  successful application.
+  Hidden hit/miss/conflict/cross-scope cases share `secret_not_available`.
+  `environment_variable` is never selected, renewal uses broker-observed current
+  time as its immediate cutover, and every valid clock observation latches a
+  monotonic high-water across later failures. Production compilation uses only
+  fixed local system clock/random-ID sources; custom synchronous sources and
+  narrowed limits are test-only. Bounded owner-local evidence and lifecycle
+  state otherwise commit atomically without an external callback, and elapsed
+  leases do not retain active-admission capacity. Provider fetch results validate
+  an exact request/audit digest, retain bytes only in zeroizing
+  request-borrowed `!Send`/`!Sync` storage, and expose no material escape.
+  `splendor-adapter-secrets-memory` is `publish = false`, requires the explicit
+  `memory-secret-provider` feature outside tests, enforces finite exact-version
+  storage, and erases rotated/revoked entries. This slice remains process-local
+  and non-restart-durable; it does not invoke a provider from the broker, return
+  material, add Gateway/node delivery, persistence, daemon/API/SDK/generated
+  surfaces, production providers, issue closure, or gold evidence. Its reduced
+  access-evidence construction rejects every cross-family command/event pairing
+  with the existing fixed shape error. Reduced records use explicit `*.local.v1`
+  schemas rather than claiming RFC 0012's
+  complete durable wire records; `G07` and `G08` remain `not_exercised`.
 - **status/incomplete:** added RFC 0018 Slice 1A's additive experimental,
   behavior-free C03 foundation lexical Rust primitives and the sole accepted
   `RegistryDeclarationDigest` construction over unchanged RFC 0013 declaration

@@ -79,6 +79,26 @@ fn sample_action() -> ActionRequest {
     }
 }
 
+fn utf32_bytes(text: &str, little_endian: bool, with_bom: bool) -> Vec<u8> {
+    let mut bytes = if with_bom {
+        if little_endian {
+            vec![0xff, 0xfe, 0x00, 0x00]
+        } else {
+            vec![0x00, 0x00, 0xfe, 0xff]
+        }
+    } else {
+        Vec::new()
+    };
+    bytes.extend(text.chars().flat_map(|character| {
+        if little_endian {
+            (character as u32).to_le_bytes()
+        } else {
+            (character as u32).to_be_bytes()
+        }
+    }));
+    bytes
+}
+
 #[test]
 fn unimplemented_gateway_denies_sync_and_async() {
     let gateway = UnimplementedGateway;
@@ -308,6 +328,10 @@ struct CountingAdapter {
 
 struct DenyResourceVerifier;
 
+struct CountingResourceVerifier {
+    calls: Arc<AtomicUsize>,
+}
+
 struct DefaultPostSafetyVerifier;
 
 impl SafetyVerifier for DefaultPostSafetyVerifier {
@@ -346,6 +370,17 @@ impl ResourceBoundaryVerifier for DenyResourceVerifier {
                 "adapter_execution": "not_attempted",
             }),
         }
+    }
+}
+
+impl ResourceBoundaryVerifier for CountingResourceVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        VerificationResult::allow()
     }
 }
 
@@ -406,6 +441,334 @@ fn resource_boundary_denial_prevents_adapter_execution() {
         .reasons
         .contains(&"resource_scope_denied".to_string()));
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    request.action.params = serde_json::json!({
+        "nested": [{"Pass-Word": "RAW_CREDENTIAL_GATEWAY_CANARY"}]
+    });
+
+    assert_raw_credential_guard_is_first(request, "baseline");
+}
+
+fn assert_raw_credential_guard_is_first(request: ActionRequest, case: &str) {
+    let action_name = request.action.name.clone();
+
+    let now = OffsetDateTime::now_utc();
+    let mut decision = authority_decision_for(&request, "adapter", PrincipalId::new(), now);
+    decision.status = AuthorityDecisionStatus::Allowed;
+    decision.reasons = vec!["capability_allowed".to_string()];
+    decision.obligations.clear();
+    bind_gateway_authority_decision_digest(&mut decision);
+
+    let authority_calls = Arc::new(AtomicUsize::new(0));
+    let resource_verifier_calls = Arc::new(AtomicUsize::new(0));
+    let recorder_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: vec![decision],
+        calls: Arc::clone(&authority_calls),
+    }));
+    gateway.set_resource_boundary_verifier(Arc::new(CountingResourceVerifier {
+        calls: Arc::clone(&resource_verifier_calls),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::clone(&recorder_calls),
+        adapter: Arc::clone(&adapter),
+    }));
+    gateway.register_adapter(action_name, "adapter", adapter.clone());
+
+    let outcome = gateway.submit(request).expect("fixed credential denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
+    assert_eq!(
+        outcome.verification,
+        VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(outcome.error.as_deref(), Some(RAW_CREDENTIAL_INPUT_DENIED));
+    assert_eq!(authority_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resource_verifier_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_seam() {
+    let mut vectors = Vec::new();
+    for params in [
+        serde_json::json!({"authKey": "synthetic"}),
+        serde_json::json!({"apiToken": "synthetic"}),
+        serde_json::json!({"X-API-Key": "synthetic"}),
+        serde_json::json!({"X-Auth-Token": "synthetic"}),
+        serde_json::json!({"Private-Token": "synthetic"}),
+        serde_json::json!({"VAULT_TOKEN": "synthetic"}),
+        serde_json::json!({"CONSUL_HTTP_TOKEN": "synthetic"}),
+        serde_json::json!({"secretKeyRef": {"name": "fixture"}}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Credential=synthetic"}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Security-Token=synthetic"}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Signature=synthetic"}),
+        serde_json::json!({"authz": "synthetic"}),
+        serde_json::json!({"POSTGRES_PASSWORD": "synthetic"}),
+        serde_json::json!({"Bearer synthetic-value": "ordinary"}),
+        serde_json::json!({"input": r#"export "POSTGRES_PASSWORD" = synthetic"#}),
+        serde_json::json!({"input": "read vault:team/service now"}),
+        serde_json::json!({"input": "https://example.invalid/%76ault%3Ateam%2Fservice"}),
+        serde_json::json!({"input": "vault://team/service?version=1"}),
+        serde_json::json!({"input": "https://example.invalid/redirect?target=https%3A%2F%2Fuser%3Apass%40nested.invalid"}),
+        serde_json::json!({"input": "https://example.invalid/form?value=Bearer+short"}),
+        serde_json::json!({"input": "https://example.invalid/form?value=Basic+dTpw"}),
+        serde_json::json!({"input": "Basic dTpw"}),
+        serde_json::json!({"input": "Basic YTpi"}),
+        serde_json::json!({"input": "Bearer x"}),
+        serde_json::json!({"body": "safe=1&value=Basic+dTpw"}),
+        serde_json::json!({"body": "safe=1&X-Auth-Token=synthetic"}),
+        serde_json::json!({"json": {"name": "VAULT_TOKEN", "value": "synthetic"}}),
+        serde_json::json!({"body": "\u{feff}Basic dTpw"}),
+        serde_json::json!({"contents": "B\0e\0a\0r\0e\0r\0 \0x\0"}),
+        serde_json::json!({"input": "Bearer%20x see https://example.invalid/docs"}),
+        serde_json::json!({"body": "name=VAULT_TOKEN&value=synthetic"}),
+        serde_json::json!({"body": "header=X-Auth-Token&value=synthetic"}),
+        serde_json::json!({"body": "Bearer%20x,https://example.invalid/docs"}),
+        serde_json::json!({"body": "vault%3Ateam%2Fservice,https://example.invalid/docs"}),
+        serde_json::json!({"body": "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs"}),
+        serde_json::json!({"body": "value=%EF%BB%BFBasic%20dTpw"}),
+        serde_json::json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
+        serde_json::json!({"body": "safe/Bearer x"}),
+        serde_json::json!({"body": "safe|Bearer x"}),
+        serde_json::json!({"body": "safe`Bearer x`"}),
+        serde_json::json!({"body": "safe—Bearer x—"}),
+        serde_json::json!({"body": "safe|token=synthetic"}),
+        serde_json::json!({"body": "safe`token=synthetic"}),
+        serde_json::json!({"json": {"key": "password", "value": "hunter2"}}),
+        serde_json::json!({"json": {"header": "Authorization", "value": "opaque"}}),
+        serde_json::json!({"body": "key=password&value=hunter2"}),
+        serde_json::json!({"body": "env=API_KEY&value=opaque"}),
+        serde_json::json!({"url": "https://example.invalid/Bearer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/safe.Bearer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/?%42earer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/?safe%60%42earer%20x%60"}),
+        serde_json::json!({"url": "https://example.invalid/?%76ault%3Aprod%2Fdb"}),
+        serde_json::json!({"body": "Basic dTpw/next"}),
+        serde_json::json!({"body": "Basic dTpw+next"}),
+        serde_json::json!({"body": "Basic dTpw=next"}),
+        serde_json::json!({"body": "Basic ICA+OnA=/next"}),
+        serde_json::json!({"body": "Basic ICA/OnA=+next"}),
+        serde_json::json!({"url": "https://example.invalid/Basic%20dTpw/next"}),
+        serde_json::json!({"url": "https://example.invalid/#Basic%20dTpw/next"}),
+        serde_json::json!({"url": "https://example.invalid/?q=Basic+dTpw%2Fnext"}),
+        serde_json::json!({"body": "https://example.invalid password:1234"}),
+        serde_json::json!({"body": "https://example.invalid vault:8200/path"}),
+        serde_json::json!({"body": "https://example.invalid,token:8443"}),
+        serde_json::json!({"body": "https://example.invalid|password:1234"}),
+        serde_json::json!({"body": "https://example.invalid—auth:8443"}),
+        serde_json::json!({"url": "https://example.invalid%20password:1234/path"}),
+        serde_json::json!({"url": "https://example.invalid%2Ctoken:8443/path"}),
+        serde_json::json!({"url": "https://example.invalid%20vault:8200/path"}),
+        serde_json::json!({"body": "https://example.invalid'token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%27token:8443/path"}),
+        serde_json::json!({"body": "https://example.invalid)token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%29token:8443/path"}),
+        serde_json::json!({"body": "https://example.invalid]token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
+        serde_json::json!({"url": "https://[vault]:8200/path"}),
+        serde_json::json!({"url": "https://[password]:1234/path"}),
+        serde_json::json!({"url": "https://[gggg]:8443/path"}),
+        serde_json::json!({"url": "https://[v1.]:8443/path"}),
+        serde_json::json!({"url": "https://[é]:8443/path"}),
+        serde_json::json!({"url": "https://:8443/path"}),
+        serde_json::json!({"url": "https://2001:db8::1/path"}),
+        serde_json::json!({"url": "https://example.invalid:99999/path"}),
+        serde_json::json!({"url": "https://example.invalid$password:1234/path"}),
+        serde_json::json!({"url": "https://example.invalid&vault:8200/path"}),
+        serde_json::json!({"url": "https://password%3A1234/path"}),
+        serde_json::json!({"url": "https://vault%3A8200/path"}),
+        serde_json::json!({"url": "https://%70assword%3A1234/path"}),
+        serde_json::json!({"url": "https://[::1]%3A8443/path"}),
+        serde_json::json!({"url": "https://%5B::1%5D%3A8443/path"}),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = params;
+        vectors.push(request);
+    }
+
+    for input in [
+        format!("safe|ghp_{}", "A".repeat(36)),
+        format!("safe`ghp_{}`", "A".repeat(36)),
+        format!("https://example.invalid/?%67hp%5F{}", "A".repeat(36)),
+        format!("https://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
+        format!("https://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+        format!("github_pat_{}-tail", "A".repeat(256)),
+        format!("xoxb-{}-tail", "A".repeat(128)),
+        format!("SG.{}.tail", "A".repeat(256)),
+        format!("AIza{}-tail", "A".repeat(35)),
+        format!("vault:{}/next", "A".repeat(2_048)),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = serde_json::json!({"input": input});
+        vectors.push(request);
+    }
+
+    let mut numeric_bytes = base_request();
+    numeric_bytes.adapter = Some("adapter".to_string());
+    numeric_bytes.action.name = "http_post".to_string();
+    numeric_bytes.action.params = serde_json::json!({"bytes": b"Bearer synthetic-value".to_vec()});
+    vectors.push(numeric_bytes);
+
+    let mut utf16_bytes = base_request();
+    utf16_bytes.adapter = Some("adapter".to_string());
+    utf16_bytes.action.name = "write_file".to_string();
+    utf16_bytes.action.params = serde_json::json!({
+        "bytes": "Bearer short"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    vectors.push(utf16_bytes);
+
+    for bytes in [
+        "Bearer short"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>(),
+        vec![0xef, 0xbb, 0xbf, b'o', b'k'],
+        vec![0xff, 0xfe, b'x'],
+        vec![b'o', b'k', 0, b'x'],
+    ] {
+        let mut ambiguous_bytes = base_request();
+        ambiguous_bytes.adapter = Some("http".to_string());
+        ambiguous_bytes.action.name = "custom_http_post".to_string();
+        ambiguous_bytes.action.params = serde_json::json!({"bytes": bytes});
+        vectors.push(ambiguous_bytes);
+    }
+
+    let mut alternate_route = base_request();
+    alternate_route.adapter = Some("filesystem".to_string());
+    alternate_route.action.name = "custom_write".to_string();
+    alternate_route.action.side_effect_class = SideEffectClass::ReadOnly;
+    alternate_route.action.params = serde_json::json!({"bytes": b"Basic dTpw".to_vec()});
+    vectors.push(alternate_route);
+
+    let mut implicit_route = base_request();
+    implicit_route.action.name = "custom_registered_write".to_string();
+    implicit_route.action.side_effect_class = SideEffectClass::ReadOnly;
+    implicit_route.action.params = serde_json::json!({
+        "bytes": "Bearer x"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    vectors.push(implicit_route);
+
+    let mut provider_path = base_request();
+    provider_path.adapter = Some("adapter".to_string());
+    provider_path.action.params = serde_json::json!({
+        "url": format!(
+            "https://example.invalid/models/ghp_{}/metadata",
+            "A".repeat(36)
+        )
+    });
+    vectors.push(provider_path);
+
+    let mut receipt_request = base_request();
+    receipt_request.adapter = Some("adapter".to_string());
+    let decision = authority_decision_for(
+        &receipt_request,
+        "adapter",
+        PrincipalId::new(),
+        OffsetDateTime::now_utc(),
+    );
+    let mut receipt =
+        unsigned_obligation_receipt(&decision, PrincipalId::new(), OffsetDateTime::now_utc());
+    receipt.evidence_ref = Some("Bearer synthetic-value".to_string());
+    receipt_request.authority_obligation_receipts = vec![receipt];
+    vectors.push(receipt_request);
+
+    for (index, request) in vectors.into_iter().enumerate() {
+        assert_raw_credential_guard_is_first(request, &format!("credential vector {index}"));
+    }
+}
+
+#[test]
+fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
+    for value in [
+        "Basic monthly reporting",
+        "Basic planning",
+        "hf_transformer",
+        "models/hf_transformer",
+        "see https://example.invalid/docs",
+        "models/sk-learn-sentiment-classifier-v2",
+        "topic=Basic+planning&mode=monthly",
+        "safe=1&label=50%25",
+        "name=token&value=linguistic+unit",
+        "name=CPU%25&value=ordinary",
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = serde_json::json!({"input": value});
+        let now = OffsetDateTime::now_utc();
+        let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+        request.authority_obligation_evidence = Some(evidence);
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway(context, adapter.clone());
+
+        let outcome = gateway.submit(request).expect("ordinary action outcome");
+        assert_eq!(outcome.status, ActionStatus::Executed, "{value}");
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1, "{value}");
+    }
+
+    for params in [
+        serde_json::json!({"descriptor": {"name": "token", "type": "string"}}),
+        serde_json::json!({"json": {"name": "token", "value": "linguistic unit"}}),
+        serde_json::json!({"json": {"name": "café", "value": "ordinary"}}),
+        serde_json::json!({"descriptor": {"key": "password", "description": "field label only"}}),
+        serde_json::json!({"example": {"header": "Authorization", "description": "header name only"}}),
+        serde_json::json!({"url": "https://auth:8443/path"}),
+        serde_json::json!({"url": "https://token:8443/path"}),
+        serde_json::json!({"url": "https://password:8443/path"}),
+        serde_json::json!({"url": "https://vault:8200/v1/sys/health"}),
+        serde_json::json!({"url": "https://[::1]:8443/path"}),
+        serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%2512]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25ab0]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25%31%32]:8443/path"}),
+        serde_json::json!({"url": "https://example.invalid:65535/path"}),
+        serde_json::json!({"url": "https://example.invalid.:8443/path"}),
+        serde_json::json!({"url": "https://[v1.a!b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a'b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a)b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a,b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%21b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%27b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%29b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%2Cb]:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a!b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a'b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a)b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a,b%5D:443/"}),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = params;
+        let now = OffsetDateTime::now_utc();
+        let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+        request.authority_obligation_evidence = Some(evidence);
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway(context, adapter.clone());
+
+        let outcome = gateway.submit(request).expect("ordinary action outcome");
+        assert_eq!(outcome.status, ActionStatus::Executed);
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+    }
 }
 
 #[test]
@@ -2956,8 +3319,12 @@ fn verified_gateway_reports_postcondition_failure() {
 
     let outcome = gateway.submit(request).expect("outcome");
     assert!(matches!(outcome.status, ActionStatus::Failed));
-    assert!(outcome.post_verification.is_some());
-    assert!(!outcome.post_verification.expect("post").allowed);
+    let post = outcome.post_verification.expect("post");
+    assert!(!post.allowed);
+    assert_eq!(post.artifacts["adapter_entered"], true);
+    assert_eq!(post.artifacts["effect_certainty"], "known");
+    assert_eq!(post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(post.artifacts["reconciliation_required"], true);
 }
 
 #[test]
@@ -3307,6 +3674,738 @@ fn verified_gateway_executes_when_checks_pass() {
     assert!(matches!(outcome.status, ActionStatus::Executed));
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
     assert!(outcome.output.is_some());
+    let post = outcome.post_verification.expect("post verification");
+    assert_eq!(post.artifacts["adapter_entered"], true);
+    assert_eq!(post.artifacts["effect_certainty"], "known");
+    assert_eq!(post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(post.artifacts["reconciliation_required"], false);
+}
+
+#[test]
+fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
+    struct FixedOutputAdapter {
+        calls: Arc<AtomicUsize>,
+        output: serde_json::Value,
+        satisfied_postconditions: Vec<String>,
+    }
+
+    impl ActionAdapter for FixedOutputAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AdapterResult {
+                output: self.output.clone(),
+                satisfied_postconditions: self.satisfied_postconditions.clone(),
+            })
+        }
+    }
+
+    struct CountingPostInvariant {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl InvariantEvaluator for CountingPostInvariant {
+        fn verify_pre(
+            &self,
+            _action: &Action,
+            _satisfied_preconditions: &[String],
+        ) -> VerificationResult {
+            VerificationResult::allow()
+        }
+
+        fn verify_post(
+            &self,
+            _action: &Action,
+            _satisfied_postconditions: &[String],
+        ) -> VerificationResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            VerificationResult::allow()
+        }
+    }
+
+    const CANARY: &str = "C03_ADAPTER_OUTPUT_CANARY";
+    let oversized = "x".repeat(CREDENTIAL_INGRESS_MAX_STRING_BYTES + 1);
+    let vectors = vec![
+        (
+            "plain",
+            serde_json::json!({"message": format!("password={CANARY}")}),
+        ),
+        (
+            "structured",
+            serde_json::json!({"api_key": CANARY, "status": "complete"}),
+        ),
+        (
+            "encoded",
+            serde_json::json!({"body": "value=Basic+dTpw", "marker": CANARY}),
+        ),
+        (
+            "numeric_root",
+            serde_json::json!(format!("password={CANARY}").into_bytes()),
+        ),
+        (
+            "numeric_root_utf16",
+            serde_json::json!("Bearer short"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()),
+        ),
+        (
+            "numeric_root_bom",
+            serde_json::json!([vec![0xef, 0xbb, 0xbf], b"Basic dTpw".to_vec()].concat()),
+        ),
+        (
+            "numeric_root_utf32le",
+            serde_json::json!(utf32_bytes("Bearer short", true, false)),
+        ),
+        (
+            "numeric_root_utf32be",
+            serde_json::json!(utf32_bytes("Bearer short", false, false)),
+        ),
+        (
+            "numeric_root_utf32le_bom",
+            serde_json::json!(utf32_bytes("Bearer short", true, true)),
+        ),
+        (
+            "numeric_root_utf32be_bom",
+            serde_json::json!(utf32_bytes("Bearer short", false, true)),
+        ),
+        (
+            "numeric_body",
+            serde_json::json!({
+                "body": format!("password={CANARY}").into_bytes()
+            }),
+        ),
+        (
+            "numeric_body_malformed",
+            serde_json::json!({"body": [1, null]}),
+        ),
+        (
+            "numeric_contents_malformed",
+            serde_json::json!({"contents": [1, "2"]}),
+        ),
+        (
+            "invalid_utf8_credential_span",
+            serde_json::json!({
+                "body": ([vec![0xff], b"Basic dTpw".to_vec(), vec![0xfe]].concat())
+            }),
+        ),
+        (
+            "malformed_json_body",
+            serde_json::json!({
+                "content_type": "application/json",
+                "body": "{not-json}"
+            }),
+        ),
+        (
+            "malformed_content_type",
+            serde_json::json!({
+                "content_type": "application/json/extra",
+                "body": "{}"
+            }),
+        ),
+        (
+            "ambiguous_utf16_body",
+            serde_json::json!({
+                "content_type": "application/octet-stream",
+                "body": "Bearer x"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+            }),
+        ),
+        (
+            "strict_opaque_control_bytes",
+            serde_json::json!({"bytes": b"ordinary\0\x01bytes"}),
+        ),
+        (
+            "strict_opaque_json_like_bytes",
+            serde_json::json!({"bytes": b"{not-json"}),
+        ),
+        ("oversized_text", serde_json::json!({"body": oversized})),
+    ];
+
+    for (case, output) in vectors {
+        let adapter_calls = Arc::new(AtomicUsize::new(0));
+        let post_calls = Arc::new(AtomicUsize::new(0));
+        let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        }));
+        gateway.register_adapter(
+            "noop",
+            "adapter",
+            Arc::new(FixedOutputAdapter {
+                calls: Arc::clone(&adapter_calls),
+                output,
+                satisfied_postconditions: Vec::new(),
+            }),
+        );
+        gateway.set_invariant_evaluator(Arc::new(CountingPostInvariant {
+            calls: Arc::clone(&post_calls),
+        }));
+
+        let outcome = gateway.submit(base_request()).expect("suppressed outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Failed, "{case}");
+        assert!(outcome.verification.allowed, "{case}");
+        let post_verification = outcome
+            .post_verification
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case}: post-verification"));
+        assert_eq!(
+            post_verification.reasons,
+            vec![RAW_CREDENTIAL_OUTPUT_SUPPRESSED.to_string()],
+            "{case}"
+        );
+        assert!(!post_verification.allowed, "{case}");
+        assert_eq!(
+            post_verification.artifacts["adapter_entered"], true,
+            "{case}"
+        );
+        assert_eq!(
+            post_verification.artifacts["effect_certainty"],
+            EffectCertainty::Uncertain.as_str(),
+            "{case}"
+        );
+        assert_eq!(
+            post_verification.artifacts["retry_class"],
+            RetryClass::NotRetryable.as_str(),
+            "{case}"
+        );
+        assert_eq!(
+            post_verification.artifacts["reconciliation_required"], true,
+            "{case}"
+        );
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED),
+            "{case}"
+        );
+        assert!(outcome.output.is_none(), "{case}");
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 1, "{case}");
+        assert_eq!(post_calls.load(Ordering::SeqCst), 0, "{case}");
+        let encoded = serde_json::to_string(&outcome).expect("outcome serializes");
+        assert!(!encoded.contains(CANARY), "{case}: {encoded}");
+        assert!(!encoded.contains("not-json"), "{case}: {encoded}");
+    }
+
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter(
+        "noop",
+        "adapter",
+        Arc::new(FixedOutputAdapter {
+            calls: Arc::clone(&adapter_calls),
+            output: serde_json::json!({"status": "ready"}),
+            satisfied_postconditions: vec![format!("password={CANARY}")],
+        }),
+    );
+    gateway.set_invariant_evaluator(Arc::new(CountingPostInvariant {
+        calls: Arc::clone(&post_calls),
+    }));
+
+    let outcome = gateway
+        .submit(base_request())
+        .expect("unsafe postcondition is suppressed");
+
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert!(outcome.output.is_none());
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(post_calls.load(Ordering::SeqCst), 0);
+    assert!(!serde_json::to_string(&outcome)
+        .expect("outcome serializes")
+        .contains(CANARY));
+}
+
+#[test]
+fn benign_json_text_and_opaque_binary_adapter_outputs_remain_compatible() {
+    struct FixedOutputAdapter(serde_json::Value);
+
+    impl ActionAdapter for FixedOutputAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            Ok(AdapterResult {
+                output: self.0.clone(),
+                satisfied_postconditions: Vec::new(),
+            })
+        }
+    }
+
+    for (case, output) in [
+        ("ordinary_root_numeric_json", serde_json::json!([0, 65])),
+        (
+            "ordinary_root_out_of_byte_range_json",
+            serde_json::json!([1, 2, 300]),
+        ),
+        (
+            "ordinary_root_bom_numbers_json",
+            serde_json::json!([0xef, 0xbb, 0xbf, 65]),
+        ),
+        (
+            "ordinary_json",
+            serde_json::json!({"status": "ready", "values": [1, 2, 3]}),
+        ),
+        (
+            "json_body",
+            serde_json::json!({
+                "content_type": "application/json; charset=utf-8",
+                "body": "{\"status\":\"ready\"}"
+            }),
+        ),
+        (
+            "filesystem_binary",
+            serde_json::json!({"bytes": [0, 1, 255], "bytes_read": 3}),
+        ),
+        (
+            "http_binary",
+            serde_json::json!({"content_type": null, "body": [0, 1, 255]}),
+        ),
+        (
+            "ordinary_named_collections",
+            serde_json::json!({
+                "body": [{"value": 1}, {"value": 2}],
+                "contents": ["section one", "section two"]
+            }),
+        ),
+    ] {
+        let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        }));
+        gateway.register_adapter(
+            "noop",
+            "adapter",
+            Arc::new(FixedOutputAdapter(output.clone())),
+        );
+
+        let outcome = gateway.submit(base_request()).expect("benign outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Executed, "{case}");
+        assert_eq!(outcome.output, Some(output), "{case}");
+    }
+}
+
+#[test]
+fn owner_profiled_opaque_filesystem_writes_preserve_ordinary_bytes() {
+    struct RoundTripFilesystemAdapter {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for RoundTripFilesystemAdapter {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl ActionAdapter for RoundTripFilesystemAdapter {
+        fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            match action.action.name.as_str() {
+                "write_file" => {
+                    let bytes = action.action.params["bytes"]
+                        .as_array()
+                        .expect("test write bytes")
+                        .iter()
+                        .map(|value| value.as_u64().expect("test byte") as u8)
+                        .collect::<Vec<_>>();
+                    std::fs::write(&self.path, &bytes)
+                        .map_err(|error| AdapterError::Failed(error.to_string()))?;
+                    Ok(AdapterResult {
+                        output: serde_json::json!({"bytes_written": bytes.len()}),
+                        satisfied_postconditions: Vec::new(),
+                    })
+                }
+                "read_file" => {
+                    let bytes = std::fs::read(&self.path)
+                        .map_err(|error| AdapterError::Failed(error.to_string()))?;
+                    Ok(AdapterResult {
+                        output: serde_json::json!({
+                            "path": self.path.to_string_lossy(),
+                            "bytes": bytes,
+                            "bytes_read": bytes.len(),
+                        }),
+                        satisfied_postconditions: Vec::new(),
+                    })
+                }
+                _ => unreachable!("closed test operation"),
+            }
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "splendor-gateway-opaque-round-trip-{}.bin",
+        ActionId::default()
+    ));
+    let adapter = Arc::new(RoundTripFilesystemAdapter { path: path.clone() });
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("write_file", "filesystem", adapter.clone());
+    gateway.register_adapter("read_file", "filesystem", adapter);
+    gateway
+        .set_trusted_action_profiles(vec![
+            TrustedActionProfile {
+                action_name: "write_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+            TrustedActionProfile {
+                action_name: "read_file".to_string(),
+                adapter: "filesystem".to_string(),
+                required_permissions: Vec::new(),
+            },
+        ])
+        .expect("trusted filesystem profiles");
+
+    for (case, bytes) in [
+        ("empty", Vec::new()),
+        ("binary", vec![0, 65, 255]),
+        ("controls_only", vec![0, 1, 2, 3]),
+        ("utf8_controls", b"ordinary\0\x01bytes".to_vec()),
+        (
+            "utf8_bom_text",
+            [vec![0xef, 0xbb, 0xbf], b"ordinary file".to_vec()].concat(),
+        ),
+        (
+            "utf16le_text",
+            "ordinary file"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        ("utf32be_text", utf32_bytes("ordinary file", false, false)),
+        ("json_like", b"{not-json".to_vec()),
+    ] {
+        let mut write = base_request();
+        write.action.name = "write_file".to_string();
+        write.action.params = serde_json::json!({"path": "opaque.bin", "bytes": bytes.clone()});
+        write.action.side_effect_class = SideEffectClass::Filesystem;
+        write.adapter = Some("filesystem".to_string());
+        let write_outcome = gateway.submit(write).expect("write outcome");
+        assert_eq!(write_outcome.status, ActionStatus::Executed, "{case}");
+        assert_eq!(std::fs::read(&path).expect("written file"), bytes, "{case}");
+
+        if case == "binary" {
+            let mut read = base_request();
+            read.action.name = "read_file".to_string();
+            read.action.params = serde_json::json!({"path": "opaque.bin"});
+            read.action.side_effect_class = SideEffectClass::Filesystem;
+            read.adapter = Some("filesystem".to_string());
+            let read_outcome = gateway.submit(read).expect("read outcome");
+
+            assert_eq!(read_outcome.status, ActionStatus::Executed);
+            assert_eq!(
+                read_outcome.output.expect("read output")["bytes"],
+                serde_json::json!(bytes)
+            );
+        }
+    }
+}
+
+#[test]
+fn public_action_guards_never_infer_opaque_bytes_from_request_routing_metadata() {
+    for adapter in [None, Some("filesystem")] {
+        let mut request = base_request();
+        request.action.name = "write_file".to_string();
+        request.action.params = serde_json::json!({
+            "path": "opaque.bin",
+            "bytes": [0, 65, 255]
+        });
+        request.action.side_effect_class = SideEffectClass::Filesystem;
+        request.adapter = adapter.map(str::to_string);
+
+        assert_eq!(
+            guard_action_request(&request),
+            Err(RawCredentialInputDenied),
+            "caller adapter {adapter:?} must not select opaque scanning"
+        );
+
+        request.action.params = serde_json::json!({
+            "path": "opaque.bin",
+            "bytes": b"Bearer short"
+        });
+        assert_eq!(
+            guard_action_request(&request),
+            Err(RawCredentialInputDenied),
+            "credential bytes must remain denied for caller adapter {adapter:?}"
+        );
+    }
+}
+
+#[test]
+fn verified_gateway_requires_owner_profile_and_matching_registration_for_opaque_bytes() {
+    for (case, registered_adapter, trusted_adapter, requested_adapter) in [
+        ("missing_profile_omitted_route", "filesystem", None, None),
+        (
+            "missing_profile_explicit_route",
+            "filesystem",
+            None,
+            Some("filesystem"),
+        ),
+        (
+            "profile_registration_mismatch",
+            "filesystem",
+            Some("daemon.local"),
+            Some("filesystem"),
+        ),
+        (
+            "caller_spoofed_filesystem_route",
+            "daemon.local",
+            Some("daemon.local"),
+            Some("filesystem"),
+        ),
+    ] {
+        let adapter = Arc::new(CountingAdapter::default());
+        let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        }));
+        gateway.register_adapter("write_file", registered_adapter, adapter.clone());
+        if let Some(trusted_adapter) = trusted_adapter {
+            gateway
+                .set_trusted_action_profiles(vec![TrustedActionProfile {
+                    action_name: "write_file".to_string(),
+                    adapter: trusted_adapter.to_string(),
+                    required_permissions: Vec::new(),
+                }])
+                .expect("trusted profile");
+        }
+
+        let mut request = base_request();
+        request.action.name = "write_file".to_string();
+        request.action.params = serde_json::json!({
+            "path": "opaque.bin",
+            "bytes": [0, 65, 255]
+        });
+        request.action.side_effect_class = SideEffectClass::Filesystem;
+        request.adapter = requested_adapter.map(str::to_string);
+
+        let outcome = gateway.submit(request).expect("opaque denial");
+        assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_INPUT_DENIED),
+            "{case}"
+        );
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0, "{case}");
+    }
+}
+
+#[test]
+fn opaque_filesystem_profile_denies_encoded_credentials_and_ambiguity_before_effect() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("write_file", "filesystem", adapter.clone());
+    gateway
+        .set_trusted_action_profiles(vec![TrustedActionProfile {
+            action_name: "write_file".to_string(),
+            adapter: "filesystem".to_string(),
+            required_permissions: Vec::new(),
+        }])
+        .expect("trusted filesystem profile");
+
+    for (case, bytes) in [
+        ("utf8", b"Bearer short".to_vec()),
+        (
+            "utf16",
+            "Bearer short"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "invalid_utf8_span",
+            [vec![0xff], b"Basic dTpw".to_vec()].concat(),
+        ),
+        ("utf32le", utf32_bytes("Bearer short", true, false)),
+        ("utf32be", utf32_bytes("Bearer short", false, false)),
+        ("utf32le_bom", utf32_bytes("Bearer short", true, true)),
+        ("utf32be_bom", utf32_bytes("Bearer short", false, true)),
+        (
+            "embedded_utf32le_span",
+            [
+                vec![0xff],
+                utf32_bytes("Bearer short", true, false),
+                vec![0xfe],
+            ]
+            .concat(),
+        ),
+        ("ambiguous_zero_lanes", vec![0; 8]),
+        ("truncated_utf32le", {
+            let mut bytes = utf32_bytes("ordinary encoded text", true, false);
+            bytes.pop();
+            bytes
+        }),
+    ] {
+        let mut request = base_request();
+        request.action.name = "write_file".to_string();
+        request.action.params = serde_json::json!({"path": "opaque.bin", "bytes": bytes});
+        request.action.side_effect_class = SideEffectClass::Filesystem;
+        request.adapter = Some("filesystem".to_string());
+        let outcome = gateway.submit(request).expect("credential denial");
+
+        assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_INPUT_DENIED),
+            "{case}"
+        );
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0, "{case}");
+    }
+}
+
+#[test]
+fn opaque_filesystem_profile_does_not_widen_other_routes_or_shapes() {
+    let trusted_profile = TrustedActionProfile {
+        action_name: "write_file".to_string(),
+        adapter: "filesystem".to_string(),
+        required_permissions: Vec::new(),
+    };
+    for (case, action_name, adapter_id, side_effect_class, params) in [
+        (
+            "custom_action",
+            "custom_write",
+            "filesystem",
+            SideEffectClass::Filesystem,
+            serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+        ),
+        (
+            "custom_adapter",
+            "write_file",
+            "custom",
+            SideEffectClass::Filesystem,
+            serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+        ),
+        (
+            "wrong_effect_class",
+            "write_file",
+            "filesystem",
+            SideEffectClass::ReadOnly,
+            serde_json::json!({"path": "opaque.bin", "bytes": [0, 65, 255]}),
+        ),
+        (
+            "open_params_shape",
+            "write_file",
+            "filesystem",
+            SideEffectClass::Filesystem,
+            serde_json::json!({
+                "path": "opaque.bin",
+                "bytes": [0, 65, 255],
+                "mode": "ordinary"
+            }),
+        ),
+    ] {
+        let mut request = base_request();
+        request.action.name = action_name.to_string();
+        request.action.params = params;
+        request.action.side_effect_class = side_effect_class;
+        request.adapter = Some(adapter_id.to_string());
+        assert_eq!(
+            guard_action_request_with_trusted_profile(&request, &trusted_profile, "filesystem"),
+            Err(RawCredentialInputDenied),
+            "{case}"
+        );
+    }
+
+    let mut permission_mismatch = base_request();
+    permission_mismatch.action.name = "write_file".to_string();
+    permission_mismatch.action.params = serde_json::json!({
+        "path": "opaque.bin",
+        "bytes": [0, 65, 255]
+    });
+    permission_mismatch.action.side_effect_class = SideEffectClass::Filesystem;
+    permission_mismatch.action.required_permissions = vec!["filesystem.write".to_string()];
+    permission_mismatch.adapter = Some("filesystem".to_string());
+    assert_eq!(
+        guard_action_request_with_trusted_profile(
+            &permission_mismatch,
+            &trusted_profile,
+            "filesystem",
+        ),
+        Err(RawCredentialInputDenied),
+    );
+}
+
+#[test]
+fn unsafe_physical_output_never_reaches_the_post_safety_verifier() {
+    struct UnsafeOutputAdapter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionAdapter for UnsafeOutputAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AdapterResult {
+                output: serde_json::json!({
+                    "body": "password=C03_PHYSICAL_OUTPUT_CANARY"
+                }),
+                satisfied_postconditions: Vec::new(),
+            })
+        }
+    }
+
+    struct CountingPostSafetyVerifier {
+        post_calls: Arc<AtomicUsize>,
+    }
+
+    impl SafetyVerifier for CountingPostSafetyVerifier {
+        fn verify_pre(
+            &self,
+            _action: &ActionRequest,
+            _adapter: Option<&str>,
+        ) -> SafetyVerification {
+            SafetyVerification::Allowed(VerificationResult::allow())
+        }
+
+        fn verify_post(
+            &self,
+            _action: &ActionRequest,
+            _adapter: Option<&str>,
+            _result: &AdapterResult,
+        ) -> SafetyVerification {
+            self.post_calls.fetch_add(1, Ordering::SeqCst);
+            SafetyVerification::Allowed(VerificationResult::allow())
+        }
+    }
+
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter(
+        "move_to_waypoint",
+        "robotics",
+        Arc::new(UnsafeOutputAdapter {
+            calls: Arc::clone(&adapter_calls),
+        }),
+    );
+    gateway.set_safety_verifier(Arc::new(CountingPostSafetyVerifier {
+        post_calls: Arc::clone(&post_calls),
+    }));
+
+    let outcome = gateway
+        .submit(physical_request())
+        .expect("suppressed outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(post_calls.load(Ordering::SeqCst), 0);
+    assert!(outcome.output.is_none());
 }
 
 #[test]
@@ -4282,7 +5381,12 @@ fn verified_gateway_reports_adapter_failure() {
     assert!(!encoded.contains("X-Api-Key"));
     assert!(!encoded.contains("secret"));
     assert!(outcome.output.is_none());
-    assert!(outcome.post_verification.is_none());
+    let post = outcome.post_verification.expect("effect facts");
+    assert!(!post.allowed);
+    assert_eq!(post.artifacts["adapter_entered"], true);
+    assert_eq!(post.artifacts["effect_certainty"], "uncertain");
+    assert_eq!(post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(post.artifacts["reconciliation_required"], true);
 }
 
 #[test]

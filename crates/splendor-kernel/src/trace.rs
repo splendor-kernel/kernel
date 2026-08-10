@@ -20,7 +20,8 @@
 //! sink.record(&event).expect("record");
 //! ```
 
-use splendor_store::{TraceStore, TraceStoreError};
+use splendor_evidence::TraceCompatibilityError;
+use splendor_store::{TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{ContentHash, IdentityValidationError, RunId, TraceEvent};
 use std::future::{ready, Future, Ready};
 use std::sync::Arc;
@@ -87,17 +88,17 @@ impl TraceStoreSink {
 
     /// Returns the latest sequence number stored for this run.
     pub fn latest_sequence(&self) -> Result<Option<u64>, TraceError> {
-        match self.store.read(&self.run_id.to_string()) {
-            Ok(records) => Ok(records.last().map(|record| record.sequence)),
-            Err(TraceStoreError::RunNotFound) => Ok(None),
-            Err(error) => Err(TraceError::Store(error)),
-        }
+        Ok(self.latest_record()?.map(|record| record.sequence))
     }
 
     /// Returns the latest event hash stored for this run.
     pub fn latest_event_hash(&self) -> Result<Option<ContentHash>, TraceError> {
+        Ok(self.latest_record()?.map(|record| record.event_hash))
+    }
+
+    pub(crate) fn latest_record(&self) -> Result<Option<TraceRecord>, TraceError> {
         match self.store.read(&self.run_id.to_string()) {
-            Ok(records) => Ok(records.last().map(|record| record.event_hash.clone())),
+            Ok(records) => Ok(records.last().cloned()),
             Err(TraceStoreError::RunNotFound) => Ok(None),
             Err(error) => Err(TraceError::Store(error)),
         }
@@ -133,6 +134,9 @@ pub enum TraceError {
     /// Trace store failure while persisting events.
     #[error("trace store error: {0}")]
     Store(#[from] TraceStoreError),
+    /// Stable trace compatibility owner rejected persistence or recovery.
+    #[error("trace compatibility error: {0}")]
+    Compatibility(#[from] TraceCompatibilityError),
     /// Trace store sequence drifted from runtime ordering.
     #[error("trace sequence mismatch: expected {expected} but stored {actual}")]
     SequenceMismatch { expected: u64, actual: u64 },

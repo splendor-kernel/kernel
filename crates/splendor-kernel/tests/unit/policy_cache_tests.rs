@@ -1,5 +1,7 @@
 use super::*;
-use splendor_gateway::{ActionGateway, ActionId, ActionOutcome, ActionRequest, GatewayError};
+use splendor_gateway::{
+    ActionGateway, ActionId, ActionOutcome, ActionRequest, GatewayError, TrustedActionProfile,
+};
 use splendor_types::{
     validate_policy_bundle, validate_policy_bundle_candidate, Action, AgentId,
     OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
@@ -303,6 +305,99 @@ fn non_enforced_empty_cache_allows_policy_and_gateway_forwarding() {
         .expect("gateway outcome");
 
     assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*calls.lock().expect("calls lock"), 1);
+}
+
+#[test]
+fn raw_credential_denial_precedes_policy_distribution_projection() {
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache),
+    );
+    let mut raw = request(SideEffectClass::External);
+    raw.action.params = serde_json::json!({"authorization": "synthetic"});
+
+    let outcome = gateway.submit(raw).expect("credential denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.verification,
+        VerificationResult::deny(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert!(outcome.verification.artifacts.is_null());
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn policy_gateway_uses_only_installed_owner_profile_for_opaque_filesystem_bytes() {
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: false,
+        },
+        cache_owner(),
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let mut gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache),
+    );
+    let mut opaque = named_request("write_file", SideEffectClass::Filesystem);
+    opaque.action.params = serde_json::json!({
+        "path": "opaque.bin",
+        "bytes": [0, 65, 255]
+    });
+
+    let strict = gateway
+        .submit(opaque.clone())
+        .expect("strict opaque denial");
+    assert_eq!(strict.status, ActionStatus::Denied);
+    assert_eq!(
+        strict.error.as_deref(),
+        Some(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    gateway.set_owner_trusted_action_profiles(vec![TrustedActionProfile {
+        action_name: "write_file".to_string(),
+        adapter: "filesystem".to_string(),
+        required_permissions: Vec::new(),
+    }]);
+    let allowed = gateway
+        .submit(opaque.clone())
+        .expect("trusted opaque forwarding");
+    assert_eq!(allowed.status, ActionStatus::Executed);
+    assert_eq!(*calls.lock().expect("calls lock"), 1);
+
+    opaque.adapter = Some("caller-spoofed".to_string());
+    let spoofed = gateway.submit(opaque.clone()).expect("spoofed denial");
+    assert_eq!(spoofed.status, ActionStatus::Denied);
+    assert_eq!(
+        spoofed.error.as_deref(),
+        Some(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
+
+    opaque.adapter = None;
+    opaque.action.params = serde_json::json!({
+        "path": "opaque.bin",
+        "bytes": b"Bearer short"
+    });
+    let credential = gateway.submit(opaque).expect("credential denial");
+    assert_eq!(credential.status, ActionStatus::Denied);
+    assert_eq!(
+        credential.error.as_deref(),
+        Some(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
     assert_eq!(*calls.lock().expect("calls lock"), 1);
 }
 

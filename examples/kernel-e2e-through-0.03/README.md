@@ -134,8 +134,9 @@ realistic kernel use cases through 0.03-S8:
   compatible node selection or explicit rejection without telemetry as authority.
 - `K-E2E-013`: remote specialist receives a read-only state reference, can inspect
   scoped context, and cannot mutate origin state.
-- `K-E2E-014`: adapter failure records trace/outcome/state explicitly, retries only
-  when idempotent and authorized, and replay does not execute adapters.
+- `K-E2E-014`: generic adapter failure records uncertain/not-retryable effect
+  evidence, parks same-process and restart retries even when caller metadata says
+  idempotent, and replay does not execute adapters.
 - `K-E2E-015`: OpenAPI daemon contract covers every exposed daemon operation used by
   the E2E suite, with request/response schema validation, canonical primitive
   parity, and API-client evidence.

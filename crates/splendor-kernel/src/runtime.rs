@@ -16,11 +16,16 @@
 //! ```
 
 use crate::{StdoutTraceSink, TraceError, TraceSink, TraceStoreSink};
-use splendor_store::TraceStore;
-use splendor_types::{
-    ContentHash, RunId, RuntimeIdentityContext, StateHandoff, StateHandoffTraceContext,
-    StateReference, TraceEvent, TraceEventKind, TraceIdentityContext, TraceIntegrity,
+use splendor_evidence::{acquire_current_trace_writer, append_stable_trace_event};
+use splendor_store::{
+    RuntimeTraceLimits, RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle, TraceStore,
 };
+use splendor_types::{
+    AgentId, ContentHash, RunId, RuntimeIdentityContext, StateHandoff, StateHandoffTraceContext,
+    StateReference, TenantId, TraceEvent, TraceEventKind, TraceIdentityContext, TraceIntegrity,
+};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
@@ -59,9 +64,77 @@ pub struct KernelRuntime {
     /// Base identity context embedded into each trace event.
     identity: TraceIdentityContext,
     /// Monotonic sequence and integrity state for successfully persisted events.
+    ///
+    /// When runtime locks must be combined, the order is this cursor, then the
+    /// writer lifecycle, then the writer-session operation lock.
     trace_cursor: Mutex<TraceCursor>,
     /// Trace sink used to emit serialized events.
     trace_sink: Arc<dyn TraceSink>,
+    /// Shared persistence boundary. No history is read during runtime creation.
+    trace_store: Option<Arc<dyn TraceStore>>,
+    /// One owner-bound writer lifecycle shared by the runtime and engine leases.
+    writer_lifecycle: Arc<WriterLifecycle>,
+}
+
+struct WriterLifecycle {
+    state: Mutex<WriterLifecycleState>,
+}
+
+struct WriterLifecycleState {
+    session: Option<Arc<RuntimeWriterSession>>,
+    engine_identities: HashSet<(TenantId, AgentId)>,
+    terminal: bool,
+}
+
+struct RuntimeWriterSession {
+    writer: RuntimeTraceWriterHandle,
+    operation: Mutex<RuntimeWriterSessionState>,
+    revoked: AtomicBool,
+}
+
+struct RuntimeWriterSessionState {
+    tail: Option<RuntimeTraceTail>,
+}
+
+pub(crate) struct RuntimeWriterLease {
+    lifecycle: Arc<WriterLifecycle>,
+    session: Arc<RuntimeWriterSession>,
+    identity: Option<(TenantId, AgentId)>,
+    primary: bool,
+}
+
+impl RuntimeWriterLease {
+    pub(crate) fn reader(&self) -> &dyn RuntimeTraceWriter {
+        self.session.writer.as_ref()
+    }
+
+    pub(crate) fn is_primary(&self) -> bool {
+        self.primary
+    }
+}
+
+impl Drop for RuntimeWriterLease {
+    fn drop(&mut self) {
+        let Some(identity) = self.identity.take() else {
+            return;
+        };
+        let session_to_revoke = {
+            let mut lifecycle = match self.lifecycle.state.lock() {
+                Ok(lifecycle) => lifecycle,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            lifecycle.engine_identities.remove(&identity);
+            if lifecycle.engine_identities.is_empty() {
+                lifecycle.terminal = true;
+                lifecycle.session.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(session) = session_to_revoke {
+            session.revoke();
+        }
+    }
 }
 
 /// Runtime trace cursor updated only after durable trace persistence succeeds.
@@ -69,6 +142,9 @@ pub struct KernelRuntime {
 struct TraceCursor {
     next_sequence: u64,
     prev_event_hash: Option<ContentHash>,
+    tick_activity_started: bool,
+    fresh_run_claimed: bool,
+    fresh_engine_identities: HashSet<(TenantId, AgentId)>,
 }
 
 impl KernelRuntime {
@@ -76,14 +152,26 @@ impl KernelRuntime {
     pub fn new(config: KernelRuntimeConfig) -> Self {
         let run_id = config.run_id.unwrap_or_default();
         let identity = TraceIdentityContext::from_runtime(run_id.clone(), &config.identity);
+        let initial_sequence = config.initial_sequence;
         Self {
             run_id,
             identity,
             trace_cursor: Mutex::new(TraceCursor {
-                next_sequence: config.initial_sequence,
+                next_sequence: initial_sequence,
                 prev_event_hash: config.initial_prev_hash,
+                tick_activity_started: false,
+                fresh_run_claimed: false,
+                fresh_engine_identities: HashSet::new(),
             }),
             trace_sink: config.trace_sink,
+            trace_store: None,
+            writer_lifecycle: Arc::new(WriterLifecycle {
+                state: Mutex::new(WriterLifecycleState {
+                    session: None,
+                    engine_identities: HashSet::new(),
+                    terminal: false,
+                }),
+            }),
         }
     }
 
@@ -102,21 +190,17 @@ impl KernelRuntime {
         identity: RuntimeIdentityContext,
     ) -> Result<Self, TraceError> {
         let run_id = run_id.unwrap_or_default();
-        let sink = TraceStoreSink::new(run_id.clone(), store);
-        let initial_sequence = match sink.latest_sequence()? {
-            Some(sequence) => sequence
-                .checked_add(1)
-                .ok_or(TraceError::SequenceOverflow(sequence))?,
-            None => 0,
-        };
-        let initial_prev_hash = sink.latest_event_hash()?;
-        Ok(Self::new(KernelRuntimeConfig {
-            trace_sink: Arc::new(sink),
+        let mut runtime = Self::new(KernelRuntimeConfig {
+            // Persisted runtimes bypass this compatibility sink and require the
+            // owner-bound writer session installed by `LoopEngine`.
+            trace_sink: Arc::new(TraceStoreSink::new(run_id.clone(), store.clone())),
             run_id: Some(run_id),
             identity,
-            initial_sequence,
-            initial_prev_hash,
-        }))
+            initial_sequence: 0,
+            initial_prev_hash: None,
+        });
+        runtime.trace_store = Some(store);
+        Ok(runtime)
     }
 
     /// Boots the runtime from `KernelRuntimeConfig` and emits `LoopTickStarted`.
@@ -144,6 +228,132 @@ impl KernelRuntime {
             .next_sequence
     }
 
+    /// Atomically admits one fresh engine per exact tenant/agent identity while
+    /// allowing distinct agents to assemble on the shared runtime before its
+    /// first tick. A runtime reopened over history or reused after tick activity
+    /// begins is denied.
+    pub(crate) fn admit_fresh_engine(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> Result<bool, TraceError> {
+        let mut cursor = self
+            .trace_cursor
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
+        if cursor.tick_activity_started {
+            return Ok(false);
+        }
+        let engine_identity = (tenant_id.clone(), agent_id.clone());
+        if cursor.fresh_engine_identities.contains(&engine_identity) {
+            return Ok(false);
+        }
+        if !cursor.fresh_run_claimed {
+            if cursor.next_sequence != 0 {
+                return Ok(false);
+            }
+
+            self.record_event_with_cursor(
+                &mut cursor,
+                self.trace_identity(),
+                TraceEventKind::RunStarted,
+            )?;
+            cursor.fresh_run_claimed = true;
+        }
+        cursor.fresh_engine_identities.insert(engine_identity);
+        Ok(true)
+    }
+
+    pub(crate) fn acquire_engine_writer(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> Result<RuntimeWriterLease, TraceError> {
+        let store = self
+            .trace_store
+            .as_ref()
+            .ok_or(splendor_evidence::TraceCompatibilityError::Store)?;
+        let identity = (tenant_id.clone(), agent_id.clone());
+        // Keep the same cursor -> lifecycle order used by event append. Holding
+        // both guards makes the fresh distinct-agent check and lifecycle insert
+        // atomic with respect to the first tick append.
+        let cursor = self
+            .trace_cursor
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
+        let mut lifecycle = self
+            .writer_lifecycle
+            .state
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
+        if lifecycle.terminal || lifecycle.engine_identities.contains(&identity) {
+            return Err(splendor_evidence::TraceCompatibilityError::WriterConflict.into());
+        }
+        if let Some(session) = lifecycle.session.clone() {
+            if cursor.tick_activity_started || session.revoked.load(Ordering::Acquire) {
+                return Err(splendor_evidence::TraceCompatibilityError::WriterConflict.into());
+            }
+            lifecycle.engine_identities.insert(identity.clone());
+            return Ok(RuntimeWriterLease {
+                lifecycle: Arc::clone(&self.writer_lifecycle),
+                session,
+                identity: Some(identity),
+                primary: false,
+            });
+        }
+        let writer = acquire_current_trace_writer(
+            store.as_ref(),
+            &self.run_id,
+            tenant_id,
+            agent_id,
+            RuntimeTraceLimits::default(),
+        )?;
+        let session = Arc::new(RuntimeWriterSession {
+            writer,
+            operation: Mutex::new(RuntimeWriterSessionState { tail: None }),
+            revoked: AtomicBool::new(false),
+        });
+        lifecycle.session = Some(Arc::clone(&session));
+        lifecycle.engine_identities.insert(identity.clone());
+        Ok(RuntimeWriterLease {
+            lifecycle: Arc::clone(&self.writer_lifecycle),
+            session,
+            identity: Some(identity),
+            primary: true,
+        })
+    }
+
+    pub(crate) fn activate_engine_writer(
+        &self,
+        lease: &RuntimeWriterLease,
+        tail: RuntimeTraceTail,
+    ) -> Result<(), TraceError> {
+        if tail.store_identity() != &lease.session.writer.store_identity() {
+            return Err(splendor_evidence::TraceCompatibilityError::Integrity.into());
+        }
+        {
+            let mut cursor = self
+                .trace_cursor
+                .lock()
+                .map_err(|_| TraceError::IntegrityLock)?;
+            cursor.next_sequence = tail.next_sequence();
+            cursor.prev_event_hash = tail.stable_tail_hash().cloned();
+        }
+        lease.session.activate(tail)?;
+        Ok(())
+    }
+
+    pub(crate) fn store_identity(
+        &self,
+    ) -> Result<splendor_store::RuntimeTraceStoreIdentity, TraceError> {
+        self.trace_store
+            .as_ref()
+            .ok_or(splendor_evidence::TraceCompatibilityError::Store)?
+            .runtime_store_identity()
+            .map_err(splendor_evidence::TraceCompatibilityError::from)
+            .map_err(TraceError::from)
+    }
+
     /// Records a `TraceEventKind` and returns the emitted `TraceEvent`.
     pub fn record_event(&self, kind: TraceEventKind) -> Result<TraceEvent, TraceError> {
         self.record_event_with_identity(self.trace_identity(), kind)
@@ -159,11 +369,20 @@ impl KernelRuntime {
         identity: TraceIdentityContext,
         kind: TraceEventKind,
     ) -> Result<TraceEvent, TraceError> {
-        identity.ensure_run(&self.run_id)?;
         let mut cursor = self
             .trace_cursor
             .lock()
             .map_err(|_| TraceError::IntegrityLock)?;
+        self.record_event_with_cursor(&mut cursor, identity, kind)
+    }
+
+    fn record_event_with_cursor(
+        &self,
+        cursor: &mut TraceCursor,
+        identity: TraceIdentityContext,
+        kind: TraceEventKind,
+    ) -> Result<TraceEvent, TraceError> {
+        identity.ensure_run(&self.run_id)?;
         let sequence = cursor.next_sequence;
         let next_sequence = sequence
             .checked_add(1)
@@ -180,7 +399,15 @@ impl KernelRuntime {
                 }),
             };
         }
-        self.trace_sink.record(&event)?;
+        if self.trace_store.is_some() {
+            let session = self.active_writer_session()?;
+            session.append(&event)?;
+        } else {
+            self.trace_sink.record(&event)?;
+        }
+        if matches!(event.kind, TraceEventKind::LoopTickStarted { .. }) {
+            cursor.tick_activity_started = true;
+        }
         cursor.next_sequence = next_sequence;
         cursor.prev_event_hash = Some(event_hash);
         Ok(event)
@@ -192,9 +419,15 @@ impl KernelRuntime {
         handoff: &mut StateHandoff,
     ) -> Result<TraceEvent, TraceError> {
         self.ensure_handoff_run_scope(&handoff.authority.run_id)?;
-        let event = self.record_event(TraceEventKind::StateHandoffExported {
-            handoff: StateHandoffTraceContext::exported(handoff),
-        })?;
+        let event = self.record_event_with_identity(
+            TraceIdentityContext::new(handoff.authority.run_id.clone()).with_tenant_agent(
+                handoff.authority.tenant_id.clone(),
+                handoff.authority.agent_id.clone(),
+            ),
+            TraceEventKind::StateHandoffExported {
+                handoff: StateHandoffTraceContext::exported(handoff),
+            },
+        )?;
         handoff.source_trace_id = Some(event.trace_event_id.clone());
         Ok(event)
     }
@@ -206,9 +439,15 @@ impl KernelRuntime {
         receiver_state_node_id: impl Into<String>,
     ) -> Result<TraceEvent, TraceError> {
         self.ensure_handoff_run_scope(&handoff.authority.run_id)?;
-        self.record_event(TraceEventKind::StateHandoffImported {
-            handoff: StateHandoffTraceContext::imported(handoff, receiver_state_node_id),
-        })
+        self.record_event_with_identity(
+            TraceIdentityContext::new(handoff.authority.run_id.clone()).with_tenant_agent(
+                handoff.authority.tenant_id.clone(),
+                handoff.authority.agent_id.clone(),
+            ),
+            TraceEventKind::StateHandoffImported {
+                handoff: StateHandoffTraceContext::imported(handoff, receiver_state_node_id),
+            },
+        )
     }
 
     /// Records a receiver-side failed state handoff import.
@@ -218,10 +457,16 @@ impl KernelRuntime {
         reason: impl Into<String>,
     ) -> Result<TraceEvent, TraceError> {
         self.ensure_handoff_run_scope(&handoff.authority.run_id)?;
-        self.record_event(TraceEventKind::StateHandoffImportFailed {
-            handoff: StateHandoffTraceContext::exported(handoff),
-            reason: reason.into(),
-        })
+        self.record_event_with_identity(
+            TraceIdentityContext::new(handoff.authority.run_id.clone()).with_tenant_agent(
+                handoff.authority.tenant_id.clone(),
+                handoff.authority.agent_id.clone(),
+            ),
+            TraceEventKind::StateHandoffImportFailed {
+                handoff: StateHandoffTraceContext::exported(handoff),
+                reason: reason.into(),
+            },
+        )
     }
 
     /// Records attachment of a read-only state reference.
@@ -230,9 +475,30 @@ impl KernelRuntime {
         reference: &StateReference,
     ) -> Result<TraceEvent, TraceError> {
         self.ensure_handoff_run_scope(&reference.authority.run_id)?;
-        self.record_event(TraceEventKind::ReadOnlyStateReferenced {
-            handoff: StateHandoffTraceContext::referenced(reference),
-        })
+        self.record_event_with_identity(
+            TraceIdentityContext::new(reference.authority.run_id.clone()).with_tenant_agent(
+                reference.authority.tenant_id.clone(),
+                reference.authority.agent_id.clone(),
+            ),
+            TraceEventKind::ReadOnlyStateReferenced {
+                handoff: StateHandoffTraceContext::referenced(reference),
+            },
+        )
+    }
+
+    fn active_writer_session(&self) -> Result<Arc<RuntimeWriterSession>, TraceError> {
+        let lifecycle = self
+            .writer_lifecycle
+            .state
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
+        if lifecycle.terminal {
+            return Err(splendor_evidence::TraceCompatibilityError::Store.into());
+        }
+        lifecycle
+            .session
+            .clone()
+            .ok_or(splendor_evidence::TraceCompatibilityError::Store.into())
     }
 
     fn ensure_handoff_run_scope(&self, handoff_run_id: &RunId) -> Result<(), TraceError> {
@@ -244,6 +510,51 @@ impl KernelRuntime {
                 handoff_run_id: handoff_run_id.clone(),
             })
         }
+    }
+}
+
+impl RuntimeWriterSession {
+    fn activate(&self, tail: RuntimeTraceTail) -> Result<(), TraceError> {
+        let mut operation = self
+            .operation
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
+        if self.revoked.load(Ordering::Acquire) || operation.tail.is_some() {
+            return Err(splendor_evidence::TraceCompatibilityError::WriterConflict.into());
+        }
+        self.writer
+            .confirm_tail(&tail)
+            .map_err(splendor_evidence::TraceCompatibilityError::from)?;
+        operation.tail = Some(tail);
+        Ok(())
+    }
+
+    fn append(&self, event: &TraceEvent) -> Result<(), TraceError> {
+        let mut operation = self
+            .operation
+            .lock()
+            .map_err(|_| TraceError::IntegrityLock)?;
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(splendor_evidence::TraceCompatibilityError::Store.into());
+        }
+        let tail = operation
+            .tail
+            .as_ref()
+            .ok_or(splendor_evidence::TraceCompatibilityError::Store)?
+            .clone();
+        let appended = append_stable_trace_event(self.writer.as_ref(), &tail, event)?;
+        operation.tail = Some(appended.into_tail());
+        Ok(())
+    }
+
+    fn revoke(&self) {
+        let mut operation = match self.operation.lock() {
+            Ok(operation) => operation,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.revoked.store(true, Ordering::Release);
+        operation.tail = None;
+        let _ = self.writer.close();
     }
 }
 

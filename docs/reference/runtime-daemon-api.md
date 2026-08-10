@@ -324,6 +324,19 @@ without changing the durable idempotency scope.
 Create-run request fingerprints and idempotency receipt hashes use
 domain-separated BLAKE3. The earlier FNV representation is not emitted.
 
+After work-order and caller authentication, but before request fingerprinting,
+idempotency lookup/receipt creation, run-authority admission, run-slot insertion,
+state creation, or trace creation, the daemon screens every configured
+`policy_actions` candidate, including its raw authority-obligation receipt
+strings, with the Gateway-owned raw credential guard. Receipt screening occurs
+before the receipt bytes can enter the creation fingerprint, idempotency scope,
+static policy, run slot, state, or trace; Authority remains the sole receipt
+validator. A match, ambiguity, or scanner-budget overflow returns HTTP `400` with only
+`raw_credential_input_denied`. The error has null details and does not reflect a
+key, value, path, parser error, digest, or configured action. Exact retries remain
+clean rejections; no idempotency receipt or run ID has been reserved, so a later
+credential-free request may use the same idempotency key normally.
+
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`
 remain decodable for compatibility and fail-closed trace/replay handling, but a
@@ -386,9 +399,180 @@ remain inspectable while an earlier effect or lifecycle wait is blocked. Action
 completion records cannot overwrite a terminal lifecycle status published while
 the effect was in flight.
 
-Raw approval evidence is admitted by the kernel before daemon audit, runtime
-trace, lifecycle, or gateway mutation. Active runs reject all raw grants and
-denials at that boundary. The only raw-evidence exception is the exact pending
+A caller-supplied `action_id` is the daemon-local durable duplicate-suppression
+identity for direct and physical submissions within that run. Explicit IDs in
+the run's immutable static `policy_actions` are reserved when the run is created.
+After a credential-free request passes credential screening, a direct or physical
+request using one of those IDs returns uniform `409 action_id_conflict` before effect reservation, audit append,
+durable-history inspection, device lookup, Gateway entry, or adapter execution;
+the reservation does not consume the policy action, so the scheduler can execute
+it on the next tick. The only exception is the existing exact direct continuation
+of a tick-origin pending approval, which still passes through durable-history and
+Authority validation. Duplicate explicit IDs in one static decision remain a
+tick-time `duplicate_action_id` failure before Gateway entry rather than a
+create-run schema rejection.
+
+Before admitting any other direct or physical attempt, the daemon validates the
+complete trusted run trace and reconstructs any matching action episode. A
+complete prior daemon action returns the same uniform
+`409 action_id_conflict` for an exact retry, changed action metadata, another
+endpoint source, or another physical node path. The conflict never returns the
+stored `ActionOutcome`; physical duplicate disposition occurs before device
+profile lookup so the request cannot use an old action ID as a profile or outcome
+oracle. An incomplete, ambiguous, or invalid durable episode closes live effect
+admission and returns `409 tick_reconciliation_required`. A direct- or
+physical-origin ID is one-shot except for one exact, same-endpoint pending-
+approval continuation. That continuation consumes the challenge whether it ends
+as `Denied`, `Executed`, `Failed`, or `NeedsIntervention`; another
+`NeedsApproval` or any later direct/physical episode requires reconciliation.
+Tick-origin episodes may reuse the same ID and exact action body only in strictly
+increasing, fully completed, non-overlapping tick scopes. A tick challenge must
+first close through its one direct continuation; a new tick while that challenge
+is open is invalid. Direct submission of an otherwise completed tick ID remains
+`action_id_conflict` and never replays an outcome.
+Omitting `action_id` asks the daemon to allocate a fresh identity and
+remains a fresh attempt. Original-response replay is not implemented because the
+daemon has no owner-approved canonical command grammar; this behavior is neither
+provider idempotency nor a global/distributed/restart exactly-once guarantee.
+Clients migrating from the provisional response-replay behavior must treat
+`action_id_conflict` as evidence that the ID is consumed, not automatically issue
+a fresh ID. If the original response was lost, inspect trace evidence and perform
+provider/operator reconciliation; the daemon exposes no action-result recovery
+endpoint in this correction.
+
+After run/tenant/agent scope and caller authentication, direct and physical
+handlers apply the same Gateway-owned raw credential guard to action/routing,
+raw approval-evidence, and raw receipt strings before run-authority
+admission/binding, approval-state mutation, safety/simulator work, or an action
+payload trace. A denied submission returns HTTP `200` with a fixed
+`ActionOutcome.status = Denied` and reason/error
+`raw_credential_input_denied`. For a fresh action ID, the daemon records caller
+audit attribution and the normal verification-started, verification-completed,
+denied, and outcome sequence only while the run is `pending` or `running`; every
+action-bearing event uses the constant suppression projection. For a
+`waiting_for_approval`, paused, interrupted, resuming, or terminal run, it returns
+the same fixed denial without opening durable history or appending audit/action
+trace records. Repeated rejected requests in those states therefore do not grow
+the trace. A raw request carrying an explicit ID reserved by static
+`policy_actions` receives that same fixed denial with no audit/action episode,
+durable-history read, quota mutation, or reservation consumption; the next
+scheduler tick may still use the ID. For an already used or currently admitted
+nonreserved action ID on an active run, it returns the same fixed denial without
+appending another action episode; one bounded metadata-free caller audit may
+still be appended. It does not persist the
+original action, causal reference, approval material, or physical envelope, call
+the Gateway wrapper, authority/broker/provider, adapter, or device simulator, or
+change pending approval authority. Caller authentication credentials are
+validated by the daemon security boundary and are not treated as workload action
+data by this guard.
+
+Configured adapter results are screened inside `VerifiedActionGateway`
+immediately after adapter return, before daemon reacquisition of the run slot or
+any action/outcome trace. A detected, malformed, ambiguous, or over-budget
+output returns HTTP `200` with `ActionOutcome.status = Failed`, absent `output`,
+`post_verification` denied only for `raw_credential_output_suppressed`, and
+`error` set to that same fixed code.
+Direct-action traces, raw backing trace records, read/export/replay views, and
+the response contain only that fixed projection. Because the adapter was entered,
+this outcome does not claim no effect, rollback, or safe retry. This is a bounded
+generic compatibility barrier, not a live per-lease detector or incident/
+quarantine workflow.
+
+Direct and run-bound physical handlers serialize effect admission per run after
+scope/authentication and raw-credential guards. A live competing action returns
+`409 action_in_progress` with `details.retryable = true`; it does not close run
+authority or enter the Gateway. The Evidence owner, not the daemon handler,
+validates the complete action episode, strict stored outcome/action ID/status,
+effect certainty, repeated-ID legality, and immutable `tick`, `direct`, or
+`physical` origin. It returns only fresh, complete, pending-approval, or
+reconciliation-required disposition. Unknown, malformed, reordered, incomplete,
+legacy-ambiguous, or source-substituted history reconciles instead of appearing
+fresh. A trace tail that grows during validation is retried three times with a
+fresh reader and captured tail. Continued movement returns retryable
+`409 action_history_changed`; pre-start Store unavailability returns retryable
+`503 action_history_unavailable`. Both release the temporary admission
+reservation and leave the run usable; neither is converted into permanent
+reconciliation. Durable trace lookup uses the runtime reader's default
+100,000-record/64-MiB bounds and runs without holding the run mutex. The lookup
+remains O(n) in that bounded run history because this correction adds no private
+durable hot index. A clean failure before a durable action start releases the
+reservation.
+Every returned Gateway outcome—including `Denied`, `NeedsApproval`, and
+`NeedsIntervention` outcomes that prove no adapter entry—keeps it through the
+complete required terminal-action, `OutcomeRecorded`, approval/status, and
+physical offline trace suffix. A failure anywhere in that suffix returns the
+existing persistence error, leaves admission closed, and monotonically closes the
+shared live run authority. Another direct, physical, or lifecycle attempt returns
+`409 tick_reconciliation_required` before Gateway, scheduler, or adapter entry.
+Approval-resume and physical offline suffix records precede the final durable
+`OutcomeRecorded`, so trace reconstruction cannot mistake a partial suffix for a
+completed response.
+A fully durable non-reconciliation outcome releases the temporary reservation
+only after status is updated. Ordinary denial can therefore admit a later action
+while the run remains effect-capable; `NeedsApproval` leaves the run
+`waiting_for_approval`, while `NeedsIntervention` fails it, so both block unrelated
+work. A complete used action ID returns `action_id_conflict` rather than a stored
+response. A pending approval may continue only through its original endpoint
+class: tick/direct challenges use `/actions`, while physical challenges use
+`/devices/{original_node_id}/actions`. Endpoint-source mismatch returns
+`action_id_conflict` before a new episode or receipt claim; a different physical
+node is rejected by the exact pending challenge's server-derived resource binding
+before receipt claim. Both leave the run `waiting_for_approval`, preserve the
+receipt for the original endpoint, and execute no adapter. A post-effect outcome
+marked reconciliation-required, including credential-output suppression,
+instead completes its safe trace suffix,
+transitions the run to `failed`, and keeps the private admission guard at
+`tick_reconciliation_required`. These are private daemon admission rules and add
+no request, outcome, or trace-event schema.
+
+Pause uses the same per-run admission barrier. If an action reserves admission
+first, a concurrent pause fails with retryable `action_in_progress` and cannot
+suppress the action's later `NeedsApproval` or `NeedsIntervention` status. If pause
+reserves first and publishes `paused`, later direct and physical submissions fail
+before Gateway/adapter entry with `run_not_effect_capable`. This ordering is local
+linearization, not cancellation of an already-admitted effect.
+
+Authenticated `POST /devices/profiles` applies tenant/node scope validation first,
+then serializes and recursively screens the complete caller-supplied
+`DeviceRuntimeProfile` through the Gateway-owned bounded value guard before device
+profile validation, audit, or profile-map mutation. This includes capabilities,
+allowed/forbidden action strings, every nested constraint/status string and object
+key, policy-cache strings, trace-buffer strings, zone refs, and caller-supplied
+registration metadata. Rejection is HTTP `400` with fixed null-detail
+`raw_credential_input_denied`; the profile cannot subsequently be read or copied
+into safety evidence. Closed selector-plus-material coordinates for specific
+provider/header/environment aliases, standalone form representations, and raw or
+decoded BOM/NUL/control ambiguity receive the same denial as direct credential
+forms. Generic schema labels such as `name=token` remain ordinary metadata.
+Credential-free profiles preserve registration/read and physical execution behavior.
+
+The physical handler additionally screens every caller-controlled string in
+`SafetyContext` (`allowed_zone_refs`, `zone_ref`, and cloud-helper proposal ID)
+and attached operator-intervention evidence after authenticated tenant/run scope
+validation but before physical authority binding, safety snapshot/evidence,
+physical traces, Gateway construction, or simulator access. The operator
+intervention request/grant/deny handlers screen their free-form IDs, action,
+reason, decision-expiry metadata at the same authenticated boundary before
+device audit or intervention-record mutation. Operator endpoint rejection uses
+HTTP `400` with the same fixed, null-detail denial; physical action rejection
+uses the fixed suppressed `ActionOutcome` above.
+
+Direct and physical raw-input classification still precedes full lifecycle/quota
+admission so the raw payload cannot enter Authority. After classification, the
+suppressed path consults only trusted run status and the caller's explicit action
+ID reservation. A non-action-admissible run or static-policy-reserved ID returns
+the fixed denial without an audit/action episode, durable-history read, quota
+mutation, or ID consumption. An active `pending`/`running` request with a
+nonreserved ID may append the bounded fixed denial evidence described above. No
+raw field is retained and no Gateway/adapter/simulator effect occurs; this remains
+partial SECR-004/006 evidence rather than a completion claim.
+
+Credential-free raw approval evidence is admitted by the kernel before daemon
+audit, runtime trace, lifecycle, or gateway mutation. Its schema, optional
+action/adapter, and reason strings first pass the same bounded Gateway-owned
+credential screen; a match returns only the fixed suppressed denial above.
+Active runs reject all raw grants and denials at the kernel boundary. The only
+raw-evidence exception is the exact pending
 `waiting_for_approval` retry carrying a fail-closed `Denied`, expired, or revoked
 decision with no obligation receipts; it can record a terminal denial but cannot
 reach adapter execution.
@@ -412,6 +596,15 @@ This endpoint does not claim restart-durable revocation storage.
 provenance source match the run's allowlist. Accepted percepts are consumed by
 the run's queued perceptor on the next tick and appear in the normal
 `PerceptsReceived` trace event, matching SDK/CLI perceptor ingestion semantics.
+
+After authenticated allowlist validation and before queue insertion or percept
+trace data, the daemon applies the Gateway-owned persisted-percept guard to the
+schema, payload, provenance source, and provenance detail under one bounded
+scan. A match, text/JSON ambiguity, or scanner overflow returns HTTP `400` with
+only `raw_credential_input_denied` and null details. A safe caller-attribution
+audit may be recorded, but the percept is not retained and no candidate bytes or
+paths are reflected. The loop applies the same guard to non-daemon perceptors
+before `PerceptsReceived` and policy invocation.
 
 The daemon also records a `PerceptsAppended` trace event through the run's trace
 runtime, preserving trace sequence continuity before the next tick.
@@ -475,14 +668,26 @@ source event/evidence verification, and durable replay semantics.
 
 Trace responses return `TraceRecord` values from the run's trace store. Records
 are returned in monotonic sequence order. Range reads use `start` inclusive and
-`end` exclusive semantics from `TraceStore::read_range`. `GET /runs/{run_id}/traces`
+`end` exclusive semantics from `TraceStore::read_range`. Either bound may be
+omitted independently: absent `start` begins at sequence zero, absent `end`
+continues through the validated source tail, and equal bounds return an empty
+projection. `start > end` returns `400 invalid_trace_range`. The daemon validates
+and tail-reconfirms the complete source history before selecting the range, so
+corruption outside the selected interval still fails closed with
+`trace_evidence_unavailable`. `GET /runs/{run_id}/traces`
 and `POST /runs/{run_id}/traces/export` both require an explicit
 `redaction_policy`; the export response also includes a deterministic
-`integrity_hash` summary over the returned trace chain.
-Resident audit records retain only the bounded domain-separated `sha256:`
-`credential_id` correlation digest described above; arbitrary credential IDs
-and credential material remain redacted. This permits central trace sync to
-verify the resident's original hash chain without exposing bearer or JTI bytes.
+`integrity_hash` summary computed only from the selected returned redacted
+projection. Full and ranged exports use the returned record count and returned
+projection tail; no trusted source-chain hash is copied into the response.
+Resident audit records expose only a fixed credential-correlation marker at the
+exact typed `DaemonAudit.audit.credential_id` path; the bounded source digest,
+arbitrary credential IDs, and credential material remain redacted. Projection
+integrity attests only that redacted response; trusted source-chain verification
+remains an internal trace reader/sync responsibility. Range integrations must use
+the Evidence owner's range projection helper so selection occurs before the
+projection-local chain is derived; slicing an already projected full history is
+not equivalent.
 For resident daemon configuration, run trace identities carry the configured
 `instance_id`; local development retains the existing unset placement identity.
 
@@ -549,6 +754,9 @@ remain outside a scheduler tick and do not fabricate a tick ID. Direct and
 run-bound physical requests allocate the effective action ID before verification;
 their started, single completed, terminal, and outcome records share the exact
 run/tenant/agent/action identity through the run's common trace cursor.
+Raw credential denials preserve that identity/order while replacing every
+request-controlled action field with the constant safe projection before the
+first action trace.
 Their caller-supplied quota estimate is untrusted: the daemon normalizes it to at
 least one action and one millisecond before quota verification. See
 [`quotas.md`](quotas.md) for the current reconciliation limitation.
@@ -597,6 +805,9 @@ and redacted decision digests; they omit concrete operation names and grant
 payloads. Replay does not invoke perceptors, policies, authority evaluators,
 receipt issuers/validators, gateways, verifiers, or adapters, and cannot repeat filesystem, network,
 database, webhook, shell, or external-service side effects.
+Raw credential denials therefore replay only the already-sanitized projection
+and fixed outcome; replay cannot recover the denied input or invoke a provider or
+adapter.
 
 Replay request bodies must include non-null `credential` and
 `audit_attribution`; both principal identity and `credential_id` are validated
@@ -628,6 +839,7 @@ Required 0.02-S5 failures include:
 | Verified bearer has wrong endpoint scope/tenant or mismatched metadata mirror | `403` | daemon security or mirror mismatch code |
 | Invalid run | `404` | `invalid_run` |
 | Malformed percept body | `400` | `malformed_percept` |
+| Credential-bearing/ambiguous/over-budget percept envelope | `400` | `raw_credential_input_denied`; no queue retention or percept trace |
 | Invalid policy bundle | `400` or `403` | policy validation reason code |
 | Unauthorized or missing scope/action trace link | `403` | daemon security error code |
 | Runtime unavailable | `503` | `runtime_unavailable` |
@@ -637,6 +849,15 @@ Required 0.02-S5 failures include:
 | Non-exact `/actions` retry while waiting for approval | `409` | `approval_exact_action_retry_required` or `approval_challenge_retry_mismatch` |
 | Pending challenge unavailable while retrying | `503` | `approval_challenge_unavailable` |
 | Direct/physical effect from another non-capable lifecycle state | `409` | `run_not_effect_capable` |
+| Direct/physical use of an explicit static-policy `action_id`, or reuse of a completely recorded daemon `action_id`, including changed metadata, another endpoint source, or another physical node path | `409` | `action_id_conflict`; `details.retryable = false`; no stored outcome is returned; static reservation preflight does not inspect history or consume the future tick action |
+| Same-run action or lifecycle attempt while a direct/physical action is live | `409` | `action_in_progress`; `details.retryable = true`; authority remains usable after the admitted attempt completes |
+| Durable action history keeps advancing through all bounded fresh-reader attempts | `409` | `action_history_changed`; `details.retryable = true`; pre-start admission is released |
+| Durable action history Store capability is temporarily unavailable before direct or physical action start | `503` | `action_history_unavailable`; `details.retryable = true`; pre-start admission is released; neither route enters Gateway/adapter |
+| Same-run lifecycle tick or direct/physical attempt while any Gateway outcome suffix is incomplete | `409` | `tick_reconciliation_required`; scheduler/Gateway/adapter is not entered |
+| Configured create-run action contains/ambiguously resembles raw credentials or exceeds scanner bounds | `400` | `raw_credential_input_denied`; no run/idempotency/state/trace mutation |
+| Authenticated direct/physical action contains/ambiguously resembles raw credentials or exceeds scanner bounds | `200` | fixed `ActionOutcome.status = Denied`, reason `raw_credential_input_denied`, safe traces only |
+| Entered adapter returns credential-bearing, malformed textual/JSON, or over-budget output | `200` | fixed `ActionOutcome.status = Failed`, absent output, `raw_credential_output_suppressed`; effect not claimed absent |
+| Required direct/physical terminal, approval/status, or outcome trace append fails after any Gateway outcome | `500` | `trace_error`; admission and live run authority remain closed, and retries add no adapter execution |
 | Start/resume from an incompatible lifecycle state | `409` | `invalid_run_state` |
 | Resume with a different original work-order ID | `403` | `resume_work_order_identity_mismatch` |
 | Resume with changed canonical work-order payload | `403` | `resume_work_order_payload_mismatch` |

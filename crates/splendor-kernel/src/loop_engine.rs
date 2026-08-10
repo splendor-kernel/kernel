@@ -4,27 +4,54 @@
 //! policy, evaluate constraints, verify/execute actions, record outcomes, and
 //! commit state. It emits the ordered trace events required for auditability.
 
+use crate::runtime::RuntimeWriterLease;
+use crate::state::RuntimeSnapshotExpectation;
 use crate::{
     apply_escalation_to_outcome, escalations_require_intervention, AgentContext,
     EscalationEvaluator, EscalationOutcomeInput, KernelRuntime, KernelRuntimeConfig,
     PolicyRuntimeAuthority, StateCommit, StateGraph, StateGraphError, StateHandoffExportRequest,
-    StateHandoffScope,
+    StateHandoffScope, TraceError,
 };
+use splendor_evidence::{inspect_trace, resume_trace, TraceCompatibilityError};
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, ActionGateway, ActionId, ActionOutcome, ActionRequest,
-    ActionStatus, GatewayError,
+    authority_pre_effect_evidence_recorded, guard_action_routing_and_receipts,
+    guard_persisted_percept, guard_persisted_state, raw_credential_denied_action,
+    raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
+    ActionStatus, GatewayError, RAW_CREDENTIAL_INPUT_DENIED,
 };
-use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
+use splendor_store::{
+    RuntimeTraceReader, RuntimeTraceTail, StateData, StateMetadata, TraceStore, TraceStoreError,
+};
 use splendor_types::{
-    Action, ApprovalTraceContext, CapabilityGrantId, Constraint, ContentHash, EscalationContext,
-    EscalationPolicy, EscalationPolicyError, Feedback, Percept, PolicyBundleId,
-    PolicyBundleTraceContext, QuotaUsage, Reward, RunId, SnapshotId, StateHandoff, TickId,
-    TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext, VerificationResult, WorkOrder,
-    WorkOrderEnvelope, WorkOrderKeyring,
+    Action, ApprovalTraceContext, CapabilityGrantId, Constraint, ContentHash, EffectCertainty,
+    EscalationContext, EscalationPolicy, EscalationPolicyError, Feedback, Percept, PolicyBundleId,
+    PolicyBundleTraceContext, QuotaUsage, RetryClass, Reward, RunId, SnapshotId, StateHandoff,
+    StateNodeId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
+    VerificationResult, WorkOrder, WorkOrderEnvelope, WorkOrderKeyring,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
+
+/// Fixed local compatibility reason returned when another tick cannot be
+/// attempted until rejected persistence or an uncertain effect is reconciled.
+pub(crate) const TICK_RECONCILIATION_REQUIRED: &str = "tick_reconciliation_required";
+
+/// Fixed reason returned when a fresh persisted constructor targets an existing run.
+pub(crate) const RUN_ALREADY_EXISTS: &str = "run_already_exists";
+
+/// Fixed reason returned when one decision repeats an explicit action identity.
+pub(crate) const DUPLICATE_ACTION_ID: &str = "duplicate_action_id";
+
+/// Fixed reason returned when persisted state does not belong to the exact
+/// tenant/agent/run identity selected for resume.
+pub(crate) const RESUME_STATE_IDENTITY_MISMATCH: &str = "resume_state_identity_mismatch";
+
+/// Fixed reason returned when the latest completed tick has no matching durable
+/// snapshot and therefore cannot be resumed without skipping committed state.
+pub(crate) const RESUME_LATEST_COMPLETED_SNAPSHOT_UNAVAILABLE: &str =
+    "resume_latest_completed_snapshot_unavailable";
 
 /// Collects percepts for a tick.
 pub trait Perceptor: Send + Sync {
@@ -135,6 +162,13 @@ pub struct ActionCandidate {
     pub delegated_capability_grant_id: Option<CapabilityGrantId>,
 }
 
+struct ScreenedActionCandidate<'a> {
+    candidate: &'a ActionCandidate,
+    action_id: ActionId,
+    trace_action: Action,
+    raw_credential_denied: bool,
+}
+
 impl ActionCandidate {
     /// Creates a candidate with default usage and no adapter.
     pub fn new(action: Action) -> Self {
@@ -225,6 +259,16 @@ pub struct ResumeInfo {
     pub tick_id: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ResumeSelection {
+    info: ResumeInfo,
+    state_node_id: StateNodeId,
+    state_hash: ContentHash,
+    trace_event_id: TraceEventId,
+    max_tick_id: u64,
+    tail: RuntimeTraceTail,
+}
+
 /// Optional trace/run metadata supplied when constructing a persisted loop
 /// engine.
 #[derive(Clone, Debug, Default)]
@@ -310,6 +354,12 @@ pub enum LoopError {
     /// Resume discovery failed.
     #[error("resume error: {0}")]
     Resume(String),
+    /// A caller attempted to reuse or move backward from a durable tick identity.
+    #[error("tick identity conflict: attempted {attempted}, last persisted {last_persisted}")]
+    TickIdentityConflict { attempted: u64, last_persisted: u64 },
+    /// A persisted trace-event envelope disagreed with its storage-owned record.
+    #[error("trace envelope integrity error at sequence {sequence}: {reason}")]
+    TraceEnvelopeIntegrity { sequence: u64, reason: &'static str },
     /// Policy callback failed.
     #[error("policy error: {0}")]
     Policy(String),
@@ -319,6 +369,19 @@ pub enum LoopError {
     /// Escalation policy validation failed.
     #[error("escalation policy error: {0}")]
     EscalationPolicy(#[from] EscalationPolicyError),
+}
+
+#[derive(Clone, Copy)]
+enum TickReconciliationBlock {
+    PersistenceDenied,
+    EffectInFlight,
+}
+
+#[derive(Clone, Copy)]
+struct EffectBoundary {
+    effect_certainty: EffectCertainty,
+    retry_class: RetryClass,
+    reconciliation_required_after_tick: bool,
 }
 
 /// Kernel loop engine for a single agent.
@@ -334,6 +397,9 @@ pub struct LoopEngine {
     outcome_evaluator: Box<dyn OutcomeEvaluator>,
     escalation_evaluator: Option<EscalationEvaluator>,
     policy_authority: Option<Arc<dyn PolicyRuntimeAuthority>>,
+    reconciliation_block: Option<TickReconciliationBlock>,
+    _runtime_writer: Option<RuntimeWriterLease>,
+    last_tick_id: Option<u64>,
 }
 
 impl LoopEngine {
@@ -399,10 +465,15 @@ impl LoopEngine {
             outcome_evaluator: Box::new(NoopOutcomeEvaluator),
             escalation_evaluator: None,
             policy_authority: None,
+            reconciliation_block: None,
+            _runtime_writer: None,
+            last_tick_id: None,
         }
     }
 
-    /// Builds a loop engine that records traces in a trace store.
+    /// Builds a fresh loop engine that records traces in a trace store.
+    /// Existing persisted history for the selected run is rejected; use an
+    /// explicit `resume_from_*` constructor for recovery.
     pub fn with_trace_store(
         agent: AgentContext,
         state_graph: StateGraph,
@@ -449,11 +520,12 @@ impl LoopEngine {
         )
     }
 
-    /// Builds a persisted loop with a runtime shared by the gateway's mandatory
-    /// pre-effect authority evidence recorder.
+    /// Builds a fresh persisted loop with a runtime shared by the gateway's
+    /// mandatory pre-effect authority evidence recorder. A runtime reopened over
+    /// persisted history, or reused after tick execution begins, is rejected.
     #[allow(clippy::too_many_arguments)]
     pub fn with_shared_trace_runtime_and_work_order(
-        mut agent: AgentContext,
+        agent: AgentContext,
         state_graph: StateGraph,
         state: StateData,
         policy: Box<dyn Policy>,
@@ -461,8 +533,69 @@ impl LoopEngine {
         runtime: Arc<KernelRuntime>,
         context: RunTraceContext,
     ) -> Result<Self, LoopError> {
-        if runtime.next_sequence() == 0 {
-            runtime.record_event(TraceEventKind::RunStarted)?;
+        if context
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| run_id != runtime.run_id())
+        {
+            return Err(LoopError::Resume(
+                "shared trace runtime run_id does not match requested run".to_string(),
+            ));
+        }
+        let runtime_writer = match runtime.acquire_engine_writer(&agent.tenant_id, &agent.agent_id)
+        {
+            Ok(writer) => writer,
+            Err(error) if trace_error_is_fresh_admission_conflict(&error) => {
+                return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if runtime_writer.is_primary() {
+            let inspected = inspect_trace(runtime_writer.reader(), runtime.run_id())
+                .map_err(TraceError::from)?;
+            if !inspected.records.is_empty() {
+                return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
+            }
+            runtime.activate_engine_writer(&runtime_writer, inspected.tail)?;
+        }
+        Self::finish_persisted_construction(
+            agent,
+            state_graph,
+            state,
+            policy,
+            gateway,
+            runtime,
+            context,
+            runtime_writer,
+            None,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_persisted_construction(
+        mut agent: AgentContext,
+        state_graph: StateGraph,
+        state: StateData,
+        policy: Box<dyn Policy>,
+        gateway: Arc<dyn ActionGateway>,
+        runtime: Arc<KernelRuntime>,
+        context: RunTraceContext,
+        runtime_writer: RuntimeWriterLease,
+        last_tick_id: Option<u64>,
+        fresh: bool,
+    ) -> Result<Self, LoopError> {
+        if fresh {
+            match runtime.admit_fresh_engine(&agent.tenant_id, &agent.agent_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
+                }
+                Err(error) if trace_error_is_fresh_admission_conflict(&error) => {
+                    return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         if let Some(work_order) = context.work_order.as_ref() {
             agent.config.metadata.insert(
@@ -489,14 +622,11 @@ impl LoopEngine {
                 bundle: policy_bundle.clone(),
             })?;
         }
-        Ok(Self::with_shared_runtime(
-            agent,
-            state_graph,
-            state,
-            policy,
-            gateway,
-            runtime,
-        ))
+        let mut engine =
+            Self::with_shared_runtime(agent, state_graph, state, policy, gateway, runtime);
+        engine._runtime_writer = Some(runtime_writer);
+        engine.last_tick_id = last_tick_id;
+        Ok(engine)
     }
 
     /// Builds a loop engine by resuming from the most recent snapshot in the trace store.
@@ -530,27 +660,20 @@ impl LoopEngine {
         run_id: RunId,
         work_order: Option<&WorkOrder>,
     ) -> Result<Self, LoopError> {
-        let context = RunTraceContext::new(Some(run_id.clone()));
-        let context = match work_order {
-            Some(work_order) => context.with_work_order(work_order.clone()),
-            None => context,
-        };
-        let resume = Self::resume_info(trace_store.as_ref(), &run_id)?;
-        let mut engine = Self::with_trace_store_and_work_order(
+        let runtime = Arc::new(KernelRuntime::with_trace_store(
+            trace_store.clone(),
+            Some(run_id.clone()),
+        )?);
+        Self::resume_from_shared_trace_runtime_and_work_order(
             agent,
             state_graph,
-            StateData {
-                bytes: Vec::new(),
-                content_type: None,
-            },
             policy,
             gateway,
             trace_store,
-            context,
-        )?;
-        engine.restore_snapshot(&resume.snapshot_id)?;
-        engine.state_graph.set_tick(resume.tick_id);
-        Ok(engine)
+            runtime,
+            run_id,
+            work_order,
+        )
     }
 
     /// Resumes a persisted loop while sharing the exact trace runtime used by a
@@ -558,7 +681,7 @@ impl LoopEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn resume_from_shared_trace_runtime_and_work_order(
         agent: AgentContext,
-        state_graph: StateGraph,
+        mut state_graph: StateGraph,
         policy: Box<dyn Policy>,
         gateway: Arc<dyn ActionGateway>,
         trace_store: Arc<dyn TraceStore>,
@@ -571,27 +694,61 @@ impl LoopEngine {
                 "shared trace runtime run_id does not match resumed run".to_string(),
             ));
         }
+        let supplied_store_identity = trace_store
+            .runtime_store_identity()
+            .map_err(TraceCompatibilityError::from)
+            .map_err(TraceError::from)?;
+        if supplied_store_identity != runtime.store_identity()? {
+            return Err(TraceError::from(TraceCompatibilityError::Integrity).into());
+        }
         let context = RunTraceContext::new(Some(run_id.clone()));
         let context = match work_order {
             Some(work_order) => context.with_work_order(work_order.clone()),
             None => context,
         };
-        let resume = Self::resume_info(trace_store.as_ref(), &run_id)?;
-        let mut engine = Self::with_shared_trace_runtime_and_work_order(
+        let runtime_writer = runtime.acquire_engine_writer(&agent.tenant_id, &agent.agent_id)?;
+        let resume = Self::resume_info(
+            runtime_writer.reader(),
+            &run_id,
+            &agent.tenant_id,
+            &agent.agent_id,
+        )?;
+        let snapshot = state_graph
+            .restore_snapshot_for_runtime_identity(
+                &resume.info.snapshot_id,
+                RuntimeSnapshotExpectation {
+                    state_node_id: &resume.state_node_id,
+                    state_hash: &resume.state_hash,
+                    trace_event_id: &resume.trace_event_id,
+                    tenant_id: &agent.tenant_id,
+                    agent_id: &agent.agent_id,
+                    run_id: &run_id,
+                },
+            )?
+            .ok_or_else(|| LoopError::Resume(RESUME_STATE_IDENTITY_MISMATCH.to_string()))?;
+        state_graph.set_tick(resume.info.tick_id);
+        runtime_writer
+            .reader()
+            .confirm_tail(&resume.tail)
+            .map_err(TraceCompatibilityError::from)
+            .map_err(TraceError::from)?;
+        if runtime_writer.is_primary() {
+            runtime.activate_engine_writer(&runtime_writer, resume.tail)?;
+        } else if runtime.next_sequence() != resume.tail.next_sequence() {
+            return Err(TraceError::from(TraceCompatibilityError::Integrity).into());
+        }
+        Self::finish_persisted_construction(
             agent,
             state_graph,
-            StateData {
-                bytes: Vec::new(),
-                content_type: None,
-            },
+            snapshot.state,
             policy,
             gateway,
             runtime,
             context,
-        )?;
-        engine.restore_snapshot(&resume.snapshot_id)?;
-        engine.state_graph.set_tick(resume.tick_id);
-        Ok(engine)
+            runtime_writer,
+            Some(resume.max_tick_id),
+            false,
+        )
     }
 
     /// Returns the agent identifier for this loop.
@@ -602,6 +759,30 @@ impl LoopEngine {
     /// Returns the tenant identifier for this loop.
     pub fn tenant_id(&self) -> &splendor_types::TenantId {
         &self.agent.tenant_id
+    }
+
+    /// Returns the run identifier owned by this loop.
+    pub fn run_id(&self) -> &RunId {
+        self.runtime.run_id()
+    }
+
+    pub(crate) fn has_runtime_identity(
+        &self,
+        run_id: &RunId,
+        tenant_id: &splendor_types::TenantId,
+        agent_id: &splendor_types::AgentId,
+    ) -> bool {
+        self.runtime.run_id() == run_id
+            && &self.agent.tenant_id == tenant_id
+            && &self.agent.agent_id == agent_id
+    }
+
+    pub(crate) fn last_tick_id(&self) -> Option<u64> {
+        self.last_tick_id
+    }
+
+    pub(crate) fn requires_reconciliation(&self) -> bool {
+        self.reconciliation_block.is_some()
     }
 
     fn trace_identity(&self, tick_id: u64) -> TraceIdentityContext {
@@ -730,7 +911,13 @@ impl LoopEngine {
 
     /// Records a non-tick runtime event through this loop's trace runtime.
     pub fn record_runtime_event(&self, kind: TraceEventKind) -> Result<TraceEvent, LoopError> {
-        self.runtime.record_event(kind).map_err(LoopError::Trace)
+        let identity = self
+            .runtime
+            .trace_identity()
+            .with_tenant_agent(self.agent.tenant_id.clone(), self.agent.agent_id.clone());
+        self.runtime
+            .record_event_with_identity(identity, kind)
+            .map_err(LoopError::Trace)
     }
 
     /// Records a non-tick action event with the run's tenant/agent/action scope
@@ -752,10 +939,30 @@ impl LoopEngine {
 
     /// Executes a single tick of the loop engine.
     pub fn tick(&mut self, tick_id: u64) -> Result<TickOutcome, LoopError> {
+        if self.reconciliation_block.is_some() {
+            return Err(LoopError::Policy(TICK_RECONCILIATION_REQUIRED.to_string()));
+        }
+        if self
+            .last_tick_id
+            .is_some_and(|last_tick_id| tick_id <= last_tick_id)
+        {
+            return Err(LoopError::TickIdentityConflict {
+                attempted: tick_id,
+                last_persisted: self.last_tick_id.expect("checked persisted tick"),
+            });
+        }
         let start = Instant::now();
         self.record_tick_event(tick_id, TraceEventKind::LoopTickStarted { tick_id })?;
+        self.last_tick_id = Some(tick_id);
 
-        let percepts = self.collect_percepts()?;
+        let percepts = match self.collect_percepts() {
+            Ok(percepts) => percepts,
+            Err(LoopError::Perceptor(reason)) if reason == RAW_CREDENTIAL_INPUT_DENIED => {
+                self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+                return Err(LoopError::Perceptor(reason));
+            }
+            Err(error) => return Err(error),
+        };
         self.record_tick_event(
             tick_id,
             TraceEventKind::PerceptsReceived {
@@ -794,6 +1001,16 @@ impl LoopEngine {
             },
         )?;
         let decision = self.policy.decide(&self.state, &percepts)?;
+        if guard_persisted_state(
+            &decision.next_state.bytes,
+            decision.next_state.content_type.as_deref(),
+            decision.metadata.label.as_deref(),
+        )
+        .is_err()
+        {
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+            return Err(LoopError::Policy(RAW_CREDENTIAL_INPUT_DENIED.to_string()));
+        }
         self.record_tick_event(
             tick_id,
             TraceEventKind::PolicyCompleted {
@@ -811,21 +1028,57 @@ impl LoopEngine {
             ));
         }
 
-        let candidate_actions = decision
+        let mut explicit_action_ids = HashSet::new();
+        if decision
             .actions
             .iter()
-            .map(|candidate| candidate.action.clone())
+            .filter_map(|candidate| candidate.action_id.as_ref())
+            .any(|action_id| !explicit_action_ids.insert(action_id))
+        {
+            return Err(LoopError::Policy(DUPLICATE_ACTION_ID.to_string()));
+        }
+
+        let screened_actions = decision
+            .actions
+            .iter()
+            .map(|candidate| {
+                let raw_credential_denied = guard_action_routing_and_receipts(
+                    &candidate.action,
+                    candidate.adapter.as_deref(),
+                    &candidate.satisfied_preconditions,
+                    &candidate.authority_obligation_receipts,
+                )
+                .is_err();
+                ScreenedActionCandidate {
+                    candidate,
+                    action_id: candidate.action_id.clone().unwrap_or_default(),
+                    trace_action: if raw_credential_denied {
+                        raw_credential_denied_action()
+                    } else {
+                        candidate.action.clone()
+                    },
+                    raw_credential_denied,
+                }
+            })
             .collect::<Vec<_>>();
         self.record_tick_event(
             tick_id,
             TraceEventKind::CandidatesProposed {
-                actions: candidate_actions,
+                actions: screened_actions
+                    .iter()
+                    .map(|candidate| candidate.trace_action.clone())
+                    .collect(),
             },
         )?;
 
+        let constraint_candidates = screened_actions
+            .iter()
+            .filter(|candidate| !candidate.raw_credential_denied)
+            .map(|candidate| candidate.candidate.clone())
+            .collect::<Vec<_>>();
         let constraint_evaluation =
             self.constraint_engine
-                .evaluate(&self.state, &percepts, &decision.actions);
+                .evaluate(&self.state, &percepts, &constraint_candidates);
         self.record_tick_event(
             tick_id,
             TraceEventKind::ConstraintsEvaluated {
@@ -836,9 +1089,12 @@ impl LoopEngine {
 
         let mut outcomes = Vec::new();
         let mut escalations = Vec::new();
-        for candidate in &decision.actions {
-            let action = candidate.action.clone();
-            let action_id = candidate.action_id.clone().unwrap_or_else(ActionId::new);
+        let mut tick_effect_entered = false;
+        let mut tick_requires_reconciliation = false;
+        for screened in &screened_actions {
+            let candidate = screened.candidate;
+            let action = screened.trace_action.clone();
+            let action_id = screened.action_id.clone();
             self.record_action_event(
                 tick_id,
                 &action_id,
@@ -846,17 +1102,15 @@ impl LoopEngine {
                     action: action.clone(),
                 },
             )?;
+            // This durable event opens an action episode. Until every required
+            // action and tick suffix record is durable, any later persistence
+            // failure must park the engine even when no adapter is entered.
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
 
-            let mut delegated_scope = self.agent.verify_delegated_action_with_grant(
-                &action,
-                candidate.adapter.as_deref(),
-                self.runtime.run_id(),
-                candidate.delegated_capability_grant_id.as_ref(),
-                candidate.usage,
-                OffsetDateTime::now_utc(),
-                tick_id,
-            );
-            let mut outcome = if !constraint_evaluation.result.allowed {
+            let mut effect_boundary = None;
+            let mut outcome = if screened.raw_credential_denied {
+                raw_credential_denied_outcome(action_id.clone())
+            } else if !constraint_evaluation.result.allowed {
                 ActionOutcome {
                     action_id: action_id.clone(),
                     status: ActionStatus::Denied,
@@ -867,54 +1121,101 @@ impl LoopEngine {
                     approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
                 }
-            } else if !delegated_scope.allowed() {
-                ActionOutcome {
-                    action_id: action_id.clone(),
-                    status: ActionStatus::Denied,
-                    verification: delegated_scope.verification.clone(),
-                    post_verification: None,
-                    output: None,
-                    error: Some(delegated_scope.verification.reasons.join(", ")),
-                    approval_challenge: None,
-                    completed_at: OffsetDateTime::now_utc(),
-                }
             } else {
-                let request = ActionRequest {
-                    action_id: action_id.clone(),
-                    tenant_id: self.agent.tenant_id.clone(),
-                    agent_id: self.agent.agent_id.clone(),
-                    run_id: self.runtime.run_id().clone(),
-                    tick_id: Some(TickId::from(tick_id)),
-                    action: action.clone(),
-                    adapter: candidate.adapter.clone(),
-                    quota_usage: candidate.usage,
-                    satisfied_preconditions: candidate.satisfied_preconditions.clone(),
-                    requested_at: candidate
-                        .requested_at
-                        .unwrap_or_else(OffsetDateTime::now_utc),
-                    physical_action_resource_coordinate: None,
-                    approval_evidence: candidate.approval_evidence.clone(),
-                    authority_obligation_evidence: None,
-                    authority_obligation_receipts: candidate.authority_obligation_receipts.clone(),
-                };
+                let mut delegated_scope = self.agent.verify_delegated_action_with_grant(
+                    &candidate.action,
+                    candidate.adapter.as_deref(),
+                    self.runtime.run_id(),
+                    candidate.delegated_capability_grant_id.as_ref(),
+                    candidate.usage,
+                    OffsetDateTime::now_utc(),
+                    tick_id,
+                );
+                if !delegated_scope.allowed() {
+                    ActionOutcome {
+                        action_id: action_id.clone(),
+                        status: ActionStatus::Denied,
+                        verification: delegated_scope.verification.clone(),
+                        post_verification: None,
+                        output: None,
+                        error: Some(delegated_scope.verification.reasons.join(", ")),
+                        approval_challenge: None,
+                        completed_at: OffsetDateTime::now_utc(),
+                    }
+                } else {
+                    let request = ActionRequest {
+                        action_id: action_id.clone(),
+                        tenant_id: self.agent.tenant_id.clone(),
+                        agent_id: self.agent.agent_id.clone(),
+                        run_id: self.runtime.run_id().clone(),
+                        tick_id: Some(TickId::from(tick_id)),
+                        action: candidate.action.clone(),
+                        adapter: candidate.adapter.clone(),
+                        quota_usage: candidate.usage,
+                        satisfied_preconditions: candidate.satisfied_preconditions.clone(),
+                        requested_at: candidate
+                            .requested_at
+                            .unwrap_or_else(OffsetDateTime::now_utc),
+                        physical_action_resource_coordinate: None,
+                        approval_evidence: candidate.approval_evidence.clone(),
+                        authority_obligation_evidence: None,
+                        authority_obligation_receipts: candidate
+                            .authority_obligation_receipts
+                            .clone(),
+                    };
 
-                // Keep the live authority permit through gateway entry. The
-                // permit linearizes cleanup/revocation against this effect.
-                let _delegated_permit = delegated_scope.take_permit();
-                match self.gateway.submit(request) {
-                    Ok(outcome) => outcome,
-                    Err(error) => outcome_from_gateway_error(action_id.clone(), error),
+                    // Keep the live authority permit through gateway entry. The
+                    // permit linearizes cleanup/revocation against this effect.
+                    let _delegated_permit = delegated_scope.take_permit();
+                    // Until the gateway returns a result that proves no adapter
+                    // entry, every following failure must conservatively park
+                    // this live engine.
+                    self.reconciliation_block = Some(TickReconciliationBlock::EffectInFlight);
+                    match self.gateway.submit(request) {
+                        Ok(mut outcome) => {
+                            effect_boundary = effect_boundary_from_outcome(&outcome);
+                            if let Some(boundary) = effect_boundary {
+                                attach_effect_boundary(&mut outcome, boundary);
+                            }
+                            outcome
+                        }
+                        Err(error) => {
+                            effect_boundary = effect_boundary_from_gateway_error(&error);
+                            let mut outcome = outcome_from_gateway_error(action_id.clone(), error);
+                            if let Some(boundary) = effect_boundary {
+                                attach_effect_boundary(&mut outcome, boundary);
+                            }
+                            outcome
+                        }
+                    }
                 }
             };
 
-            let action_escalations = self.evaluate_escalations(
-                &action_id,
-                &action,
-                candidate.adapter.as_deref(),
-                &mut outcome,
-            );
+            if let Some(boundary) = effect_boundary {
+                tick_effect_entered = true;
+                tick_requires_reconciliation |= boundary.reconciliation_required_after_tick;
+                self.reconciliation_block = Some(TickReconciliationBlock::EffectInFlight);
+            } else if !tick_effect_entered {
+                // The gateway result proved that no adapter was entered, but
+                // the durable action episode still needs its complete suffix.
+                self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+            }
 
-            if let Some(policy_expired) = action_policy_expired_trace_kind(&action, &outcome) {
+            let action_escalations = if screened.raw_credential_denied {
+                Vec::new()
+            } else {
+                self.evaluate_escalations(
+                    &action_id,
+                    &candidate.action,
+                    candidate.adapter.as_deref(),
+                    &mut outcome,
+                )
+            };
+
+            if let Some(policy_expired) = (!screened.raw_credential_denied)
+                .then(|| action_policy_expired_trace_kind(&candidate.action, &outcome))
+                .flatten()
+            {
                 self.record_action_event(tick_id, &action_id, policy_expired)?;
             }
 
@@ -941,7 +1242,9 @@ impl LoopEngine {
 
             match outcome.status {
                 ActionStatus::Executed => {
-                    self.record_approval_event_if_present(tick_id, &action_id, &outcome)?;
+                    if !screened.raw_credential_denied {
+                        self.record_approval_event_if_present(tick_id, &action_id, &outcome)?;
+                    }
                     self.record_action_event(
                         tick_id,
                         &action_id,
@@ -1024,9 +1327,17 @@ impl LoopEngine {
 
             escalations.extend(action_escalations);
             outcomes.push(outcome);
+            if effect_boundary.is_some_and(|boundary| boundary.reconciliation_required_after_tick) {
+                break;
+            }
         }
 
-        let (feedback, reward) = self.evaluate_outcomes(&decision, &outcomes);
+        let raw_credential_denials = screened_actions
+            .iter()
+            .map(|candidate| candidate.raw_credential_denied)
+            .collect::<Vec<_>>();
+        let (feedback, reward) =
+            self.evaluate_outcomes(&decision, &outcomes, &raw_credential_denials);
         let duration_ms = start.elapsed().as_millis() as u64;
         let needs_intervention = escalations_require_intervention(&escalations)
             || outcomes.iter().any(|outcome| {
@@ -1068,28 +1379,56 @@ impl LoopEngine {
         metadata.agent_id = Some(self.agent.agent_id.clone());
         metadata.run_id = Some(self.runtime.run_id().clone());
         metadata.trace_event_id = Some(state_trace_event_id);
-        let commit = self
+        let previous_state_head = self.state_graph.head().cloned();
+        let previous_state_tick = self.state_graph.tick();
+        let commit = match self
             .state_graph
-            .commit(decision.next_state.clone(), metadata)?;
-        self.state = decision.next_state;
-        self.agent.set_state_head(commit.node_id.clone());
+            .commit(decision.next_state.clone(), metadata)
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+                return Err(error.into());
+            }
+        };
 
-        self.runtime.record_event_with_identity(
+        if let Err(error) = self.runtime.record_event_with_identity(
             self.trace_identity(tick_id)
                 .with_state_node_id(commit.node_id.clone()),
             TraceEventKind::StateCommitted {
                 state_hash: commit.node_id.hash().clone(),
                 snapshot_id: commit.snapshot_id.clone(),
             },
-        )?;
+        ) {
+            // The legacy StateStore and TraceStore are separate durability
+            // boundaries. The immutable prepared node may remain in the store,
+            // but it must not become this live engine's visible head or state.
+            // Park the engine before returning so no later tick can consume it.
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+            self.state_graph.set_head(previous_state_head);
+            self.state_graph.set_tick(previous_state_tick);
+            return Err(error.into());
+        }
+        self.state = decision.next_state;
+        self.agent.set_state_head(commit.node_id.clone());
 
-        self.record_tick_event(
+        if let Err(error) = self.record_tick_event(
             tick_id,
             TraceEventKind::LoopTickCompleted {
                 tick_id,
                 integrity: None,
             },
-        )?;
+        ) {
+            // StateCommitted is already durable and remains the truthful live
+            // head. Park before returning the original completion append error
+            // so no later tick can advance from an incomplete trace lifecycle.
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+            return Err(error);
+        }
+
+        if !tick_requires_reconciliation {
+            self.reconciliation_block = None;
+        }
 
         Ok(TickOutcome {
             tick_id,
@@ -1119,6 +1458,14 @@ impl LoopEngine {
         let mut percepts = Vec::new();
         for perceptor in &self.perceptors {
             let mut batch = perceptor.collect(&self.agent)?;
+            if batch
+                .iter()
+                .any(|percept| guard_persisted_percept(percept).is_err())
+            {
+                return Err(LoopError::Perceptor(
+                    RAW_CREDENTIAL_INPUT_DENIED.to_string(),
+                ));
+            }
             percepts.append(&mut batch);
         }
         Ok(percepts)
@@ -1128,10 +1475,19 @@ impl LoopEngine {
         &self,
         decision: &PolicyDecision,
         outcomes: &[ActionOutcome],
+        raw_credential_denials: &[bool],
     ) -> (Option<Feedback>, Option<Reward>) {
         let mut feedback = None;
         let mut reward = None;
-        for (candidate, outcome) in decision.actions.iter().zip(outcomes.iter()) {
+        for ((candidate, outcome), raw_credential_denied) in decision
+            .actions
+            .iter()
+            .zip(outcomes.iter())
+            .zip(raw_credential_denials.iter().copied())
+        {
+            if raw_credential_denied {
+                continue;
+            }
             let signal = self.outcome_evaluator.evaluate(&candidate.action, outcome);
             if feedback.is_none() {
                 feedback = signal.feedback;
@@ -1169,32 +1525,24 @@ impl LoopEngine {
         escalations
     }
 
-    fn resume_info(trace_store: &dyn TraceStore, run_id: &RunId) -> Result<ResumeInfo, LoopError> {
-        let records = trace_store.read(&run_id.to_string())?;
-        let mut snapshot_id = None;
-        let mut tick_id = None;
-        for record in records {
-            let event: TraceEvent = serde_json::from_value(record.payload)?;
-            if let TraceEventKind::StateCommitted {
-                snapshot_id: Some(snapshot),
-                ..
-            } = &event.kind
-            {
-                snapshot_id = Some(snapshot.clone());
-            }
-            if let TraceEventKind::LoopTickCompleted {
-                tick_id: completed, ..
-            } = &event.kind
-            {
-                tick_id = Some(*completed);
-            }
-        }
-
-        let snapshot_id = snapshot_id
-            .ok_or_else(|| LoopError::Resume("no snapshot found in trace history".to_string()))?;
-        Ok(ResumeInfo {
-            snapshot_id,
-            tick_id: tick_id.unwrap_or(0),
+    fn resume_info(
+        reader: &(dyn RuntimeTraceReader + '_),
+        run_id: &RunId,
+        tenant_id: &splendor_types::TenantId,
+        agent_id: &splendor_types::AgentId,
+    ) -> Result<ResumeSelection, LoopError> {
+        let resume = resume_trace(reader, run_id, tenant_id, agent_id)
+            .map_err(map_resume_compatibility_error)?;
+        Ok(ResumeSelection {
+            info: ResumeInfo {
+                snapshot_id: resume.snapshot_id,
+                tick_id: resume.tick_id,
+            },
+            state_node_id: resume.state_node_id,
+            state_hash: resume.state_hash,
+            trace_event_id: resume.trace_event_id,
+            max_tick_id: resume.max_tick_id,
+            tail: resume.tail,
         })
     }
 }
@@ -1211,6 +1559,138 @@ fn outcome_from_gateway_error(action_id: ActionId, error: GatewayError) -> Actio
         approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
+}
+
+fn trace_error_is_fresh_admission_conflict(error: &TraceError) -> bool {
+    matches!(
+        error,
+        TraceError::Compatibility(TraceCompatibilityError::WriterConflict)
+            | TraceError::Store(TraceStoreError::SequenceMismatch {
+                expected: 0,
+                actual: _
+            })
+    )
+}
+
+fn map_resume_compatibility_error(error: TraceCompatibilityError) -> LoopError {
+    match error {
+        TraceCompatibilityError::ReconciliationRequired => {
+            LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string())
+        }
+        TraceCompatibilityError::LatestSnapshotUnavailable => {
+            LoopError::Resume(RESUME_LATEST_COMPLETED_SNAPSHOT_UNAVAILABLE.to_string())
+        }
+        TraceCompatibilityError::SnapshotUnavailable => {
+            LoopError::Resume("no snapshot found in trace history".to_string())
+        }
+        other => LoopError::Trace(TraceError::from(other)),
+    }
+}
+
+fn effect_boundary_from_gateway_error(error: &GatewayError) -> Option<EffectBoundary> {
+    let taxonomy = error.taxonomy();
+    (taxonomy.effect_certainty != EffectCertainty::None).then_some(EffectBoundary {
+        effect_certainty: taxonomy.effect_certainty,
+        retry_class: RetryClass::NotRetryable,
+        reconciliation_required_after_tick: true,
+    })
+}
+
+fn effect_boundary_from_outcome(outcome: &ActionOutcome) -> Option<EffectBoundary> {
+    let declared = outcome
+        .post_verification
+        .as_ref()
+        .and_then(effect_boundary_from_verification);
+    if let Some(mut boundary) = declared {
+        if outcome.status == ActionStatus::Failed {
+            boundary.reconciliation_required_after_tick = true;
+        }
+        return Some(boundary);
+    }
+
+    match outcome.status {
+        ActionStatus::Executed => Some(EffectBoundary {
+            effect_certainty: EffectCertainty::Known,
+            retry_class: RetryClass::NotRetryable,
+            reconciliation_required_after_tick: false,
+        }),
+        ActionStatus::Failed => Some(EffectBoundary {
+            effect_certainty: if outcome.output.is_some() {
+                EffectCertainty::Known
+            } else {
+                EffectCertainty::Uncertain
+            },
+            retry_class: RetryClass::NotRetryable,
+            reconciliation_required_after_tick: true,
+        }),
+        ActionStatus::Denied | ActionStatus::NeedsApproval | ActionStatus::NeedsIntervention => {
+            None
+        }
+    }
+}
+
+fn effect_boundary_from_verification(result: &VerificationResult) -> Option<EffectBoundary> {
+    if result.artifacts.get("adapter_entered")?.as_bool() != Some(true) {
+        return None;
+    }
+    let effect_certainty = match result
+        .artifacts
+        .get("effect_certainty")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("known") => EffectCertainty::Known,
+        Some("none") => EffectCertainty::None,
+        _ => EffectCertainty::Uncertain,
+    };
+    Some(EffectBoundary {
+        effect_certainty,
+        retry_class: RetryClass::NotRetryable,
+        reconciliation_required_after_tick: result
+            .artifacts
+            .get("reconciliation_required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    })
+}
+
+fn attach_effect_boundary(outcome: &mut ActionOutcome, boundary: EffectBoundary) {
+    let failed = outcome.status == ActionStatus::Failed;
+    let fallback_reason = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| "action_failed".to_string());
+    let result = outcome.post_verification.get_or_insert_with(|| {
+        if failed {
+            VerificationResult::deny(fallback_reason)
+        } else {
+            VerificationResult::allow()
+        }
+    });
+    if failed && result.allowed {
+        result.allowed = false;
+        if result.reasons.is_empty() {
+            result.reasons.push("action_failed".to_string());
+        }
+    }
+    if !result.artifacts.is_object() {
+        result.artifacts = serde_json::json!({});
+    }
+    let Some(artifacts) = result.artifacts.as_object_mut() else {
+        return;
+    };
+    artifacts.insert("adapter_entered".to_string(), serde_json::Value::Bool(true));
+    artifacts.insert(
+        "effect_certainty".to_string(),
+        serde_json::Value::String(boundary.effect_certainty.as_str().to_string()),
+    );
+    artifacts.insert(
+        "retry_class".to_string(),
+        serde_json::Value::String(boundary.retry_class.as_str().to_string()),
+    );
+    artifacts.insert(
+        "reconciliation_required".to_string(),
+        serde_json::Value::Bool(boundary.reconciliation_required_after_tick),
+    );
 }
 
 fn action_policy_expired_trace_kind(

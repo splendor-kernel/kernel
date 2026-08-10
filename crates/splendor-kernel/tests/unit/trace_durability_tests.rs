@@ -111,6 +111,33 @@ fn side_effectful_action_is_denied_when_trace_sync_required_and_stale() {
 }
 
 #[test]
+fn raw_credential_denial_precedes_trace_durability_projection() {
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = gateway_with_state(
+        TraceDurabilityState {
+            local_latest_sequence: Some(5),
+            central_latest_sequence: Some(4),
+            last_sync_error: Some("C03_TRACE_DURABILITY_CANARY".to_string()),
+            last_local_buffer_error: None,
+        },
+        true,
+        calls.clone(),
+    );
+    let mut request = request(SideEffectClass::Filesystem);
+    request.action.params = serde_json::json!({"password": "C03_RAW_INPUT_CANARY"});
+
+    let outcome = gateway.submit(request).expect("credential denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.verification,
+        VerificationResult::deny(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert!(outcome.verification.artifacts.is_null());
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
 fn read_only_action_is_allowed_even_when_sync_is_stale() {
     let calls = Arc::new(Mutex::new(0));
     let gateway = gateway_with_state(
