@@ -1,4 +1,7 @@
 use serde::Serialize;
+use splendor_authority::{
+    grant_from_legacy_allowlists, CompatibilityGrantContext, LegacyScopeProfile,
+};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionRequest, AdapterError, AdapterResult, VerifiedActionGateway,
 };
@@ -11,10 +14,11 @@ use splendor_store::{
     SqliteStateStore, SqliteTraceStore, StateData, StateMetadata, StateStore, TraceStore,
 };
 use splendor_types::{
-    Action, ActionId, AgentId, DelegatedAuthority, Message, MessageDeliveryStatus, MessageEnvelope,
-    MessageId, MessageSchemaVersion, MessageTraceLinks, QuotaUsage, RunId, SideEffectClass,
-    TenantId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
-    TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    Action, ActionId, AgentId, AuthorityBudgetScope, CapabilityGrantId, DelegatedAuthority,
+    Message, MessageDeliveryStatus, MessageEnvelope, MessageId, MessageSchemaVersion,
+    MessageTraceLinks, PrincipalId, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId,
+    TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext, TASK_REQUEST_SCHEMA,
+    TASK_RESPONSE_SCHEMA,
 };
 use std::env;
 use std::fs;
@@ -29,8 +33,15 @@ const ORCHESTRATOR_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const SPECIALIST_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const REVIEWER_ID: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const OTHER_TENANT_SPECIALIST_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+const ORCHESTRATOR_PRINCIPAL_ID: &str = "abababab-abab-4aba-8bab-abababababab";
+const SPECIALIST_PRINCIPAL_ID: &str = "bcbcbcbc-bcbc-4bcb-8cbc-bcbcbcbcbcbc";
+const REVIEWER_PRINCIPAL_ID: &str = "cdcdcdcd-cdcd-4cdc-8dcd-cdcdcdcdcdcd";
+const OTHER_TENANT_SPECIALIST_PRINCIPAL_ID: &str = "dededede-dede-4ded-8ede-dededededede";
 const PARENT_RUN_ID: &str = "11111111-2222-4333-8444-555555555555";
 const CHILD_RUN_ID: &str = "66666666-7777-4888-8999-000000000000";
+const AUTHORITY_AUDIENCE: &str = "daemon:local";
+const AUTHORITY_DIGEST: &str =
+    "blake3:2222222222222222222222222222222222222222222222222222222222222222";
 
 #[derive(Default)]
 struct CountingAdapter {
@@ -170,6 +181,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let specialist_id = AgentId::parse(SPECIALIST_ID)?;
     let reviewer_id = AgentId::parse(REVIEWER_ID)?;
     let other_specialist_id = AgentId::parse(OTHER_TENANT_SPECIALIST_ID)?;
+    let orchestrator_principal = PrincipalId::parse(ORCHESTRATOR_PRINCIPAL_ID)?;
+    let specialist_principal = PrincipalId::parse(SPECIALIST_PRINCIPAL_ID)?;
+    let reviewer_principal = PrincipalId::parse(REVIEWER_PRINCIPAL_ID)?;
+    let other_specialist_principal = PrincipalId::parse(OTHER_TENANT_SPECIALIST_PRINCIPAL_ID)?;
     let parent_run_id = RunId::parse(PARENT_RUN_ID)?;
     let child_run_id = RunId::parse(CHILD_RUN_ID)?;
 
@@ -226,8 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["document.read"],
     );
     let manager = LocalDelegationManager::new();
-    manager.register_agent(
+    manager.register_agent_with_principal(
         orchestrator.clone(),
+        orchestrator_principal.clone(),
         authority(
             &[
                 "data.read_fixture",
@@ -242,9 +258,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
         ),
     )?;
-    manager.register_agent(specialist.clone(), delegated.clone())?;
-    manager.register_agent(reviewer.clone(), DelegatedAuthority::empty())?;
-    manager.register_agent(other_specialist.clone(), delegated.clone())?;
+    manager.register_agent_with_principal(
+        specialist.clone(),
+        specialist_principal.clone(),
+        delegated.clone(),
+    )?;
+    manager.register_agent_with_principal(
+        reviewer.clone(),
+        reviewer_principal,
+        DelegatedAuthority::empty(),
+    )?;
+    manager.register_agent_with_principal(
+        other_specialist.clone(),
+        other_specialist_principal.clone(),
+        delegated.clone(),
+    )?;
     manager.register_root_run(parent_run_id.clone(), orchestrator_id.clone())?;
 
     parent_runtime.record_event(TraceEventKind::LoopTickStarted { tick_id: 1 })?;
@@ -261,7 +289,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(causal_parent.trace_event_id.clone()),
     );
     request.child_run_id = child_run_id.clone();
-    let child_run = manager.create_child_run(&parent_runtime, &child_runtime, request)?;
+    let parent_grant = local_delegation_parent_grant(
+        orchestrator_principal.clone(),
+        specialist_principal.clone(),
+        &tenant_id,
+        &request,
+    )?;
+    manager.bind_root_run_capability_grant(&parent_run_id, &parent_grant)?;
+    let mut child_authority = manager.child_authority_for_run(
+        &parent_run_id,
+        specialist_principal.clone(),
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    )?;
+    child_authority.max_fan_out = 3;
+    let child_run =
+        manager.create_child_run(&parent_runtime, &child_runtime, request, child_authority)?;
     let consumed_request = manager.router().consume(
         &parent_runtime,
         &specialist_id,
@@ -397,7 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_id: &parent_run_id,
         schema: TASK_RESPONSE_SCHEMA,
     })?);
-    negatives.push(invalid_schema_negative(
+    negatives.push(invalid_v2_payload_negative(
         &parent_runtime,
         manager.router(),
         trace_store.as_ref(),
@@ -421,11 +464,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overbroad.child_run_id = RunId::parse("12121212-1212-4121-8121-121212121212")?;
     let overbroad_child_run_id = overbroad.child_run_id.clone();
     let overbroad_runtime = runtime(overbroad.child_run_id.clone(), Arc::clone(&trace_store));
+    let mut overbroad_authority = manager.child_authority_for_run(
+        &parent_run_id,
+        specialist_principal.clone(),
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    )?;
+    overbroad_authority.max_fan_out = 4;
     let before_events = manager
         .router()
         .outbox(&orchestrator_id, &parent_run_id)?
         .len();
-    let overbroad_result = manager.create_child_run(&parent_runtime, &overbroad_runtime, overbroad);
+    let overbroad_result = manager.create_child_run(
+        &parent_runtime,
+        &overbroad_runtime,
+        overbroad,
+        overbroad_authority,
+    );
     let overbroad_error = overbroad_result.expect_err("overbroad delegation denied");
     let overbroad_trace_id = find_delegation_rejection_trace_id(
         trace_store.as_ref(),
@@ -452,13 +507,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         orchestrator_id.clone(),
         other_specialist.agent_id.clone(),
         "cross tenant delegation must fail",
-        DelegatedAuthority::empty(),
+        delegated.clone(),
         Some(causal_parent.trace_event_id),
     );
     cross_tenant.child_run_id = RunId::parse("34343434-3434-4343-8343-343434343434")?;
     let cross_child_run_id = cross_tenant.child_run_id.clone();
     let cross_runtime = runtime(cross_tenant.child_run_id.clone(), Arc::clone(&trace_store));
-    let cross_result = manager.create_child_run(&parent_runtime, &cross_runtime, cross_tenant);
+    let mut cross_authority = manager.child_authority_for_run(
+        &parent_run_id,
+        other_specialist_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    )?;
+    cross_authority.max_fan_out = 4;
+    let cross_result = manager.create_child_run(
+        &parent_runtime,
+        &cross_runtime,
+        cross_tenant,
+        cross_authority,
+    );
     let cross_error = cross_result.expect_err("cross tenant denied");
     let cross_trace_id = find_delegation_rejection_trace_id(
         trace_store.as_ref(),
@@ -607,6 +674,44 @@ fn authority(actions: &[&str], adapters: &[&str], permissions: &[&str]) -> Deleg
     }
 }
 
+fn local_delegation_parent_grant(
+    parent_principal: PrincipalId,
+    child_principal: PrincipalId,
+    tenant_id: &TenantId,
+    request: &LocalDelegationRequest,
+) -> Result<splendor_authority::ValidatedCapabilityGrant, Box<dyn std::error::Error>> {
+    let parent_grant = grant_from_legacy_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: parent_principal,
+            audience: AUTHORITY_AUDIENCE.to_string(),
+            validation_digest: AUTHORITY_DIGEST.to_string(),
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: tenant_id.clone(),
+            agent_id: request.target_agent_id.clone(),
+            run_id: Some(request.child_run_id.clone()),
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(4),
+                max_action_duration_ms: Some(1_000),
+                ..AuthorityBudgetScope::default()
+            },
+        },
+        &request.delegated_authority.allowed_actions,
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        OffsetDateTime::now_utc() + time::Duration::minutes(30),
+        RevocationStatus::Active,
+        Some("local_delegation:example".to_string()),
+    )?;
+    let _ = child_principal;
+    Ok(parent_grant)
+}
+
 fn gateway(
     tenant_id: TenantId,
     orchestrator: &AgentContext,
@@ -660,6 +765,7 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         tenant_id: input.tenant_id,
         agent_id: input.agent_id,
         run_id: input.run_id,
+        tick_id: None,
         action: Action {
             name: input.name.to_string(),
             params: serde_json::json!({"ref": format!("fixture:{}", input.name)}),
@@ -677,7 +783,10 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         quota_usage: input.quota_usage,
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
+        authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     }
 }
 
@@ -855,7 +964,7 @@ fn router_negative(
     })
 }
 
-fn invalid_schema_negative(
+fn invalid_v2_payload_negative(
     runtime: &KernelRuntime,
     router: &splendor_kernel::LocalMessageRouter,
     trace_store: &SqliteTraceStore,
@@ -876,24 +985,31 @@ fn invalid_schema_negative(
             requires_response: true,
             created_at: OffsetDateTime::now_utc(),
         },
-        schema_version: MessageSchemaVersion::V1,
+        schema_version: MessageSchemaVersion::V2,
         delivery_status: MessageDeliveryStatus::Pending,
         trace_links: MessageTraceLinks::default(),
     };
     let err = router
         .send(runtime, envelope)
         .expect_err("invalid schema denied");
-    let trace_id =
-        find_message_rejection_trace_id(trace_store, run_id, &message_id, "unsupported")?;
+    let trace_id = find_message_rejection_trace_id(
+        trace_store,
+        run_id,
+        &message_id,
+        "message payload validation failed for `splendor.message.task_request.v2`: missing field `parent_run_id`",
+    )?;
     Ok(NegativeEvidence {
-        case: "unsupported_message_schema_rejected_before_delivery".to_string(),
+        case: "invalid_v2_task_request_payload_rejected_before_delivery".to_string(),
         status: format!("{err}"),
-        reason_codes: vec!["unsupported_schema_version".to_string()],
+        reason_codes: vec!["task_request_v2_payload_validation_failed".to_string()],
         trace_event_ids: vec![trace_id.to_string()],
         message_id: Some(message_id.to_string()),
         adapter_executions_before: 0,
         adapter_executions_after: 0,
-        artifacts: serde_json::json!({"delivery_status": "rejected"}),
+        artifacts: serde_json::json!({
+            "delivery_status": "rejected",
+            "router_error": err.to_string()
+        }),
     })
 }
 

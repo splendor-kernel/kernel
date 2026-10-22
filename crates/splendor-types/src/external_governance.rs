@@ -7,9 +7,10 @@
 //! bypassing the Action Gateway.
 
 use crate::{
-    ApprovalDenial, ApprovalGrant, ApprovalId, ApprovalStatus, GovernanceExtensions,
-    GovernanceIssuer, GovernanceScope, GovernanceTraceLink, GovernanceValidationError, RunId,
-    StateNodeId, TraceEventId, WorkOrderEnvelope, WorkOrderValidationError,
+    schema_extensions, ApprovalDenial, ApprovalGrant, ApprovalId, ApprovalStatus,
+    GovernanceExtensions, GovernanceIssuer, GovernanceScope, GovernanceTraceLink,
+    GovernanceValidationError, RunId, StateNodeId, TraceEventId, WorkOrderEnvelope,
+    WorkOrderValidationError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -662,107 +663,9 @@ fn reject_authoritative_metadata(
     values: &GovernanceExtensions,
     field: &str,
 ) -> Result<(), ExternalGovernanceAdapterError> {
-    for (key, value) in values {
-        reject_authoritative_key(key, &format!("{field}.{key}"))?;
-        reject_authoritative_value(value, &format!("{field}.{key}"))?;
-    }
-    Ok(())
-}
-
-fn reject_authoritative_value(
-    value: &serde_json::Value,
-    field: &str,
-) -> Result<(), ExternalGovernanceAdapterError> {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, child) in object {
-                reject_authoritative_key(key, &format!("{field}.{key}"))?;
-                reject_authoritative_value(child, &format!("{field}.{key}"))?;
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for (index, child) in values.iter().enumerate() {
-                reject_authoritative_value(child, &format!("{field}[{index}]"))?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn reject_authoritative_key(key: &str, field: &str) -> Result<(), ExternalGovernanceAdapterError> {
-    if key.trim().is_empty() || key.trim() != key {
-        return Err(ExternalGovernanceAdapterError::BroadCredentialSupplied {
-            field: field.to_string(),
-        });
-    }
-    let normalized = normalize_authority_key(key);
-    let forbidden_exact = [
-        "scope",
-        "scope_type",
-        "tenant_id",
-        "agent_id",
-        "run_id",
-        "action_id",
-        "adapter",
-        "authority",
-        "authorization",
-        "auth_header",
-        "work_order",
-        "allowed_actions",
-        "allowed_adapters",
-        "allowed_permissions",
-        "permissions",
-    ];
-    let forbidden_fragments = [
-        "credential",
-        "token",
-        "secret",
-        "password",
-        "api_key",
-        "apikey",
-        "private_key",
-        "authorization",
-        "auth_header",
-        "cookie",
-        "session",
-        "bearer",
-        "jwt",
-        "oauth",
-        "signature",
-        "work_order",
-    ];
-    if forbidden_exact.contains(&normalized.as_str())
-        || forbidden_fragments
-            .iter()
-            .any(|fragment| normalized.contains(fragment))
-    {
-        return Err(ExternalGovernanceAdapterError::BroadCredentialSupplied {
-            field: field.to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn normalize_authority_key(key: &str) -> String {
-    let mut normalized = String::with_capacity(key.len());
-    let mut previous_was_separator = false;
-    for (index, character) in key.chars().enumerate() {
-        if character.is_ascii_uppercase() {
-            if index > 0 && !previous_was_separator {
-                normalized.push('_');
-            }
-            normalized.push(character.to_ascii_lowercase());
-            previous_was_separator = false;
-        } else if character.is_ascii_alphanumeric() {
-            normalized.push(character.to_ascii_lowercase());
-            previous_was_separator = false;
-        } else if !previous_was_separator {
-            normalized.push('_');
-            previous_was_separator = true;
-        }
-    }
-    normalized.trim_matches('_').to_string()
+    schema_extensions::validate_extension_map(values, field).map_err(|error| {
+        ExternalGovernanceAdapterError::BroadCredentialSupplied { field: error.path }
+    })
 }
 
 #[cfg(test)]

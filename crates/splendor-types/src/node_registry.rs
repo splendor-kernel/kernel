@@ -192,7 +192,8 @@ pub struct NodeRegistration {
     pub runtime_version: String,
     /// Initial health reported during registration.
     pub health: NodeHealth,
-    /// Registration timestamp supplied by the management boundary.
+    /// Node-reported registration timestamp retained as observational metadata;
+    /// registries use their own receipt time for freshness.
     #[serde(with = "time::serde::rfc3339")]
     pub registered_at: OffsetDateTime,
 }
@@ -244,7 +245,8 @@ pub struct InstanceRegistration {
     pub runtime_version: String,
     /// Initial health reported during registration.
     pub health: InstanceHealth,
-    /// Registration timestamp supplied by the management boundary.
+    /// Instance-reported registration timestamp retained as observational
+    /// metadata; registries use their own receipt time for freshness.
     #[serde(with = "time::serde::rfc3339")]
     pub registered_at: OffsetDateTime,
 }
@@ -299,7 +301,8 @@ pub struct NodeHeartbeat {
     pub node_id: NodeId,
     /// New mutable health document.
     pub health: NodeHealth,
-    /// Management-observed heartbeat timestamp.
+    /// Sender-reported heartbeat timestamp retained for observation only. The
+    /// receiving registry owns the timestamp used for freshness.
     #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: OffsetDateTime,
 }
@@ -324,7 +327,8 @@ pub struct InstanceHeartbeat {
     pub instance_id: InstanceId,
     /// New mutable health document.
     pub health: InstanceHealth,
-    /// Management-observed heartbeat timestamp.
+    /// Sender-reported heartbeat timestamp retained for observation only. The
+    /// receiving registry owns the timestamp used for freshness.
     #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: OffsetDateTime,
 }

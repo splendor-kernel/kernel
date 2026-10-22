@@ -181,6 +181,7 @@ fn denied_for_trace_durability(
         post_verification: None,
         output: None,
         error: Some("trace_durability_required".to_string()),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }

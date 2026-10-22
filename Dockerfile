@@ -25,7 +25,9 @@ FROM rust-builder AS acceptance-builder
 ARG RUST_TOOLCHAIN=1.88.0
 
 RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release \
-    -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation
+    -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation \
+    -p splendor-daemon --example resident_auth_key_tool \
+    -p splendor-acceptance-action-host
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS python-builder
 
@@ -47,7 +49,7 @@ LABEL org.opencontainers.image.title="Splendor Kernel" \
       org.opencontainers.image.version="${SPLENDOR_IMAGE_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
-      org.opencontainers.image.source="https://github.com/splendor-os/kernel" \
+      org.opencontainers.image.source="https://github.com/splendor-kernel/kernel" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
 RUN apt-get update \
@@ -92,9 +94,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         nodejs \
         npm \
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=acceptance-builder /src/target/release/examples/uc_e2e_s3_multi_agent_delegation /usr/local/bin/uc_e2e_s3_multi_agent_delegation
+COPY --from=acceptance-builder /src/target/release/examples/resident_auth_key_tool /usr/local/bin/resident_auth_key_tool
 
 WORKDIR /opt/splendor
 COPY package.json package-lock.json ./
@@ -104,5 +108,27 @@ RUN npm ci --ignore-scripts \
 ENV PATH="/opt/splendor/node_modules/.bin:/opt/splendor-venv/bin:${PATH}"
 
 USER splendor
+
+FROM runtime AS acceptance-action-host
+
+COPY --from=acceptance-builder /src/target/release/splendor-acceptance-action-host /usr/local/bin/splendor-acceptance-action-host
+
+CMD ["splendor-acceptance-action-host"]
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS acceptance-action-provider
+
+RUN groupadd --system --gid 999 splendor \
+    && useradd --system --uid 999 --gid splendor --home-dir /opt/splendor-provider --create-home --shell /usr/sbin/nologin splendor
+
+WORKDIR /opt/splendor-provider
+COPY --chown=splendor:splendor tests/e2e/use-cases/fixtures/action_provider.py ./
+COPY --chown=splendor:splendor tests/e2e/use-cases/fixtures/acceptance_provider_protocol.py ./
+COPY --chown=splendor:splendor tests/e2e/use-cases/fixtures/acceptance-operation-profiles.v3.json ./
+COPY --chown=splendor:splendor tests/e2e/use-cases/fixtures/acceptance-operation-profiles.v3.sha256 ./
+COPY --from=acceptance-builder /src/target/release/examples/resident_auth_key_tool /usr/local/bin/resident_auth_key_tool
+
+ENV PYTHONUNBUFFERED=1
+USER splendor
+CMD ["python3", "action_provider.py"]
 
 FROM runtime AS production

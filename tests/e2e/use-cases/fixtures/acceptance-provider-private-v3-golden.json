@@ -1,0 +1,71 @@
+{
+  "canonical_bytes": "{\"alpha\":1,\"nested\":{\"enabled\":true,\"value\":null},\"omega\":[\"x\",2]}",
+  "canonical_digest": "sha256:81f8218e42329245108bca9341f05b3d6252c460c58399e00b83cc62cd2905d7",
+  "canonical_digest_domain": "splendor.acceptance.golden.v3",
+  "canonical_value": {
+    "alpha": 1,
+    "nested": {"enabled": true, "value": null},
+    "omega": ["x", 2]
+  },
+  "canonical_integer_boundaries": [
+    {"raw_b64": "eyJhIjotOTIyMzM3MjAzNjg1NDc3NTgwOH0", "value": -9223372036854775808},
+    {"raw_b64": "eyJhIjo5MjIzMzcyMDM2ODU0Nzc1ODA3fQ", "value": 9223372036854775807}
+  ],
+  "closed_object_vectors": [
+    {"allowed_fields": ["a"], "raw_b64": "eyJhIjoxLCJiIjoyfQ"}
+  ],
+  "invalid_base64url": ["", "AA==", "AA=", "AA+", "AA/", "A", "A A", "é"],
+  "invalid_generated_json": [
+    {"case": "huge_integer", "limit": 5000, "reason": "integer_out_of_range"},
+    {"case": "depth", "limit": 4, "reason": "json_depth_exceeded"},
+    {"case": "fields", "limit": 2, "reason": "json_fields_exceeded"},
+    {"case": "array", "limit": 2, "reason": "json_array_items_exceeded"},
+    {"case": "string", "limit": 2, "reason": "json_string_not_printable_ascii"},
+    {"case": "body", "limit": 8, "reason": "json_size_invalid"}
+  ],
+  "invalid_json": [
+    {"raw_b64": "eyJhIjoxLCJhIjoyfQ", "reason": "duplicate_object_key"},
+    {"raw_b64": "eyJiIjoxLCAiYSI6Mn0", "reason": "json_not_canonical"},
+    {"raw_b64": "eyJiIjoxLCJhIjoyfQ", "reason": "json_not_canonical"},
+    {"raw_b64": "eyJhIjotMH0", "reason": "negative_zero_not_supported"},
+    {"raw_b64": "eyJhIjoxLjB9", "reason": "floating_point_not_supported"},
+    {"raw_b64": "eyJhIjoxZTB9", "reason": "floating_point_not_supported"},
+    {"raw_b64": "eyJhIjo5MjIzMzcyMDM2ODU0Nzc1ODA4fQ", "reason": "integer_out_of_range"},
+    {"raw_b64": "eyJhIjotOTIyMzM3MjAzNjg1NDc3NTgwOX0", "reason": "integer_out_of_range"},
+    {"raw_b64": "eyJhIjoiw6kifQ", "reason": "json_string_not_printable_ascii"},
+    {"raw_b64": "eyJhIjoiXG4ifQ", "reason": "json_string_not_printable_ascii"},
+    {"raw_b64": "eyJhIjoiXHVkODAwIn0", "reason": "json_string_not_unicode_scalar"},
+    {"raw_b64": "eyJhIjoi_yJ9", "reason": "json_not_utf8"},
+    {"raw_b64": "eyJhIjoxfXg", "reason": "invalid_json"}
+  ],
+  "operation_digests": {
+    "acceptance-fixture/s9.adapter_failure": "sha256:3a208307c2bfb2827079b4b5b1ac8595d0881d396e963e8173ca2497f51460db",
+    "acceptance-fixture/s9.approval_required": "sha256:71e611d56a95b7db164cc29a2afada48bd9889f6da85d75fef85b643008a23ac",
+    "acceptance-fixture/s9.idempotent_read": "sha256:0065353870bbc5fca79bea2cc888544309edbc01632d4791919577d90381c6ba",
+    "acceptance-fixture/s9.quota_once": "sha256:90e407bca6940631e975a40a1e0b264bb14851a3cd86802c925f5408b67888be",
+    "acceptance-fixture/s9.unsafe_retry": "sha256:fce513d8ac1f9eb66eedf392584da4eaa8bbe0c4b4a3b4911cb50e38308e688f",
+    "artifact-store/artifact.create_internal": "sha256:3fd63c2d614bd3171ee6b23fb2def2b819e83d9275a2c012d8140aee47d56ef7",
+    "artifact-store/artifact.publish_external": "sha256:d3428c0e99d889dab3f4f33cb6f2d8452084185751d40ca69441f78f3f0b60de",
+    "daemon.local/daemon_management_action": "sha256:a5145f12bd15b0db2a236eb8f3d6faa2f17dd77677e13f3e5dabaf4f3365f307",
+    "device-sim/capture_image": "sha256:989393b5c45116ebc4e2ca18fd339d5f33f291213ad3e4bb150bdcbdb8c97c06",
+    "device-sim/inspect_zone": "sha256:28fd0f1fef70f32b588898274681ecd0ce0cbe428c60566615c54ddc0e0845fa",
+    "device-sim/move_to_waypoint": "sha256:46b350662492722cf405086f62427773e6bfd7b556e1da2ec25027132b6c8b05",
+    "device-sim/read_battery": "sha256:2b7d0004c4aa169b8d0f99274af85bc53b47d2b19538e84c4562f590a10b4f0b",
+    "device-sim/read_sensor_summary": "sha256:282635eaa5e159f521161ab274b091c1cc0bd442bccda7bbda3993729ad6acfd",
+    "device-sim/return_to_base": "sha256:69fdc0d829488dba770081b3d57351b1d03a22aef90e1dfd376d0904de408818",
+    "device-sim/upload_trace_summary": "sha256:9b645f5fc8d76b8fffb167ab6960fcfcdd4e4945589663b9f7cd269c80d6dd9f",
+    "fixture-data-store/data.read_fixture": "sha256:2d0c82abdc34917add8e204c71245bd94f347cc4786a16f1ca5c8a21fff57086",
+    "fixture-sql/sql.read_fixture": "sha256:d790bcfafd6dbeb8af5ed80effe582e74d58f34d51169e587105b9cbfa5bf2f1",
+    "remote-message/message.remote.proposal": "sha256:d76f3051816747b363a5c9a28d424480c4dd2c7dfdd819edc6b1147c982013ec"
+  },
+  "receipt_payload_b64": "eyJnb2xkZW4iOiJwcml2YXRlLXYzIiwic2VxdWVuY2UiOjd9",
+  "receipt_public_key_b64": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+  "receipt_signature_b64": "GpLrocr3YUl3I_HaiIA2idfl9CrLIknsMBLlagL26_tO5BlJ2riT8ODDxKSzMzqHHTY5Af1QpbKvds8Ct-fkBA",
+  "request_hmac_test_input_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "request_key_id": "acceptance-golden-request-v3",
+  "request_signature_b64": "IQxB2VzKCjRuhqqiZbQtXfBz7S1X6DLc1PlioULenCw",
+  "typed_integer_vectors": [
+    {"field": "value", "raw_b64": "eyJ2YWx1ZSI6dHJ1ZX0"}
+  ],
+  "schema_version": "splendor.acceptance.private_v3_golden.v1"
+}

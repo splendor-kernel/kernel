@@ -1,0 +1,503 @@
+{
+  "format_id": "splendor.internal.conformance.rfc0021.offline-slice-1-cases.v1",
+  "profile": "rfc0021_c03_foundation_offline_slice_1",
+  "polarity": "positive",
+  "case_count": 55,
+  "cases": [
+    {
+      "case_id": "p001.schema.parse.minimum",
+      "subject": "canonical_schema_id_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "a.v1"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"a.v1\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p002.schema.construct.maximum",
+      "subject": "canonical_schema_id_v1",
+      "operation": "construct",
+      "input": {"kind": "text", "body": {"value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.v1"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.v1\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p003.schema.from-str.registered-looking",
+      "subject": "canonical_schema_id_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "splendor.driver.operation_credential_sinks.v1"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"splendor.driver.operation_credential_sinks.v1\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p004.schema.serialize.unregistered",
+      "subject": "canonical_schema_id_v1",
+      "operation": "serialize",
+      "input": {"kind": "text", "body": {"value": "future.experimental.v9"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"future.experimental.v9\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p005.label.parse.same-spelling",
+      "subject": "canonical_label_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "shared_name"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"shared_name\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p006.label.construct.maximum",
+      "subject": "canonical_label_v1",
+      "operation": "construct",
+      "input": {"kind": "text", "body": {"value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p007.label.from-str.representative",
+      "subject": "canonical_label_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "alpha.beta-1"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"alpha.beta-1\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p008.label.serialize.representative",
+      "subject": "canonical_label_v1",
+      "operation": "serialize",
+      "input": {"kind": "text", "body": {"value": "label_serialize"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"label_serialize\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p009.code.parse.same-spelling",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "shared_name"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"shared_name\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p010.code.construct.maximum",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "construct",
+      "input": {"kind": "text", "body": {"value": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p011.code.from-str.representative",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "code.v1"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"code.v1\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p012.code.serialize.representative",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "serialize",
+      "input": {"kind": "text", "body": {"value": "code_serialize"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"code_serialize\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p013.timestamp.parse.minimum",
+      "subject": "canonical_timestamp_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "0001-01-01T00:00:00.000000Z"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"0001-01-01T00:00:00.000000Z\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p014.timestamp.construct.leap-day",
+      "subject": "canonical_timestamp_v1",
+      "operation": "construct",
+      "input": {"kind": "text", "body": {"value": "2000-02-29T23:59:59.999999Z"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"2000-02-29T23:59:59.999999Z\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p015.timestamp.from-str.maximum",
+      "subject": "canonical_timestamp_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "9999-12-31T23:59:59.999999Z"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"9999-12-31T23:59:59.999999Z\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p016.timestamp.serialize.representative",
+      "subject": "canonical_timestamp_v1",
+      "operation": "serialize",
+      "input": {"kind": "text", "body": {"value": "2030-01-02T00:00:00.000001Z"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"2030-01-02T00:00:00.000001Z\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p017.count.parse.minimum",
+      "subject": "canonical_count_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "0"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "0"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p018.count.construct.maximum",
+      "subject": "canonical_count_v1",
+      "operation": "construct",
+      "input": {"kind": "u64", "body": {"value": 9007199254740991}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "9007199254740991"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p019.count.from-str.middle",
+      "subject": "canonical_count_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "42"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "42"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p020.count.serialize.middle",
+      "subject": "canonical_count_v1",
+      "operation": "serialize",
+      "input": {"kind": "u64", "body": {"value": 7}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "7"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p021.ordinal.parse.minimum",
+      "subject": "canonical_ordinal_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "0"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "0"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p022.ordinal.construct.maximum",
+      "subject": "canonical_ordinal_v1",
+      "operation": "construct",
+      "input": {"kind": "u64", "body": {"value": 9007199254740991}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "9007199254740991"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p023.ordinal.from-str.middle",
+      "subject": "canonical_ordinal_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "43"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "43"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p024.ordinal.serialize.middle",
+      "subject": "canonical_ordinal_v1",
+      "operation": "serialize",
+      "input": {"kind": "u64", "body": {"value": 8}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "8"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p025.sequence.parse.minimum",
+      "subject": "canonical_sequence_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "0"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "0"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p026.sequence.construct.maximum",
+      "subject": "canonical_sequence_v1",
+      "operation": "construct",
+      "input": {"kind": "u64", "body": {"value": 9007199254740991}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "9007199254740991"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p027.sequence.from-str.middle",
+      "subject": "canonical_sequence_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "44"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "44"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p028.sequence.serialize.middle",
+      "subject": "canonical_sequence_v1",
+      "operation": "serialize",
+      "input": {"kind": "u64", "body": {"value": 9}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "9"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p029.revision.parse.minimum",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "1"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "1"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p030.revision.construct.maximum",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "construct",
+      "input": {"kind": "u64", "body": {"value": 9007199254740991}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "9007199254740991"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p031.revision.from-str.middle",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "45"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "45"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p032.revision.serialize.middle",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "serialize",
+      "input": {"kind": "u64", "body": {"value": 10}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "10"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p033.error.binding",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_binding"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_binding"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p034.error.bound",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_bound"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_bound"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p035.error.digest",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_digest"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p036.error.identity",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_identity"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_identity"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p037.error.integer",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_integer"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p038.error.shape",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_shape"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p039.error.signature",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_signature"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_signature"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p040.error.timestamp",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_timestamp"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p041.error.version",
+      "subject": "foundation_grammar_error",
+      "operation": "inspect_error",
+      "input": {"kind": "error_code", "body": {"value": "invalid_contract_version"}},
+      "expected": {"execution_result": "accepted", "stable_error_code": "invalid_contract_version"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p042.digest.parse.golden-wire",
+      "subject": "registry_declaration_digest",
+      "operation": "parse",
+      "input": {"kind": "text", "body": {"value": "blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p043.digest.from-str.golden-wire",
+      "subject": "registry_declaration_digest",
+      "operation": "from_str",
+      "input": {"kind": "text", "body": {"value": "blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p044.digest.serialize.golden-wire",
+      "subject": "registry_declaration_digest",
+      "operation": "serialize",
+      "input": {"kind": "text", "body": {"value": "blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6\""},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p045.digest.declaration.golden",
+      "subject": "registry_declaration_digest",
+      "operation": "declaration_digest",
+      "input": {"kind": "declaration", "body": {"resource_id": "rfc0013_driver_operation_credential_sinks_v1", "mutation": "none", "digest_domain": "production"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6\"", "expected_digest_wire": "blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6", "digest_equality": true},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p046.digest.declaration.revision-mutation",
+      "subject": "registry_declaration_digest",
+      "operation": "declaration_digest",
+      "input": {"kind": "declaration", "body": {"resource_id": "rfc0013_driver_operation_credential_sinks_v1", "mutation": "driver_declaration_revision_1_to_2", "digest_domain": "production"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"blake3:389beec569d117cd75596113ea8283bf0595d6beb5c9a15fa9bb6401648f5444\"", "expected_digest_wire": "blake3:389beec569d117cd75596113ea8283bf0595d6beb5c9a15fa9bb6401648f5444", "digest_equality": true},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p047.trace.canonical",
+      "subject": "trace_event",
+      "operation": "trace_deserialize_serialize",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p048.trace.alias",
+      "subject": "trace_event",
+      "operation": "trace_deserialize_serialize",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p049.trace.nested-wrong-boundary-alias",
+      "subject": "trace_event",
+      "operation": "trace_deserialize_serialize",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"trace_id\":\"33333333-3333-4333-8333-333333333333\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p050.trace.unknown-nested",
+      "subject": "trace_event",
+      "operation": "trace_deserialize_serialize",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"future_hint\":\"display\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p051.trace.unknown-top-level",
+      "subject": "trace_event",
+      "operation": "trace_deserialize_serialize",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\",\"future_hint\":\"display\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p052.extension.map.safe",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map",
+      "input": {"kind": "extension_json", "body": {"json": "{\"display\":\"safe\",\"nested\":{\"items\":[{\"label\":\"alpha\"},2,true]}}", "root_path": "extensions", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "accepted"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p053.extension.map-with-reserved.safe",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map_with_reserved_keys",
+      "input": {"kind": "extension_json", "body": {"json": "{\"display\":\"safe\"}", "root_path": "extensions", "additional_reserved_keys": ["status"]}},
+      "expected": {"execution_result": "accepted"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p054.extension.value.safe",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value",
+      "input": {"kind": "extension_json", "body": {"json": "[{\"display\":\"safe\"},2]", "root_path": "metadata", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "accepted"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "p055.extension.value-with-reserved.safe",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value_with_reserved_keys",
+      "input": {"kind": "extension_json", "body": {"json": "{\"display\":\"safe\"}", "root_path": "metadata", "additional_reserved_keys": ["status"]}},
+      "expected": {"execution_result": "accepted"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    }
+  ]
+}

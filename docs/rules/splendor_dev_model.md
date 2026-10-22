@@ -910,7 +910,7 @@ Message fields:
   "source_agent_id": "finance.orchestrator",
   "target_agent_id": "finance.forecast",
   "run_id": "run_456",
-  "schema": "splendor.message.task_request.v1",
+  "schema": "splendor.message.task_request.v2",
   "payload": {
     "task": "forecast revenue for Q3",
     "input_ref": "dataset:finance.revenue_monthly_v4"

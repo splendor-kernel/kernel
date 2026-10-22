@@ -14,6 +14,8 @@ and inspect deterministic stale-heartbeat status.
 - Defines `NodeRegistration`, `InstanceRegistration`, `NodeHeartbeat`, and
   `InstanceHeartbeat` contracts.
 - Implements `splendor_kernel::NodeRegistry` and `InMemoryNodeRegistry`.
+- Uses manager-observed receipt timestamps for registration and heartbeat
+  freshness; sender timestamps remain observational.
 - Emits management audit events for registry mutations.
 - Extends the daemon security contract with node/instance registry endpoint
   scopes.
@@ -119,7 +121,9 @@ registry metadata:
 
 Heartbeats update only mutable health and heartbeat timestamp. They do not
 overwrite static fields such as node kind, scope, capability document, runtime
-version, hosted tenants, or supported features.
+version, hosted tenants, or supported features. `last_heartbeat_at` is owned by
+the receiving registry. Old or future sender timestamps cannot reorder or pin
+freshness, while a regressing manager receipt timestamp fails closed.
 
 ## 8. Verifier/gateway behavior added or changed
 
@@ -147,7 +151,8 @@ nodes, refresh heartbeats, dispatch work, execute policies, or call adapters.
 | Unknown parent node | Reject instance registration/heartbeat. |
 | Instance hosted tenants exceed parent node tenant scope | Reject before registration. |
 | Duplicate node or instance | Reject without overwrite. |
-| Heartbeat timestamp regression | Reject and preserve previous health. |
+| Old/future sender timestamp | Retain as observation; use manager receipt time for freshness. |
+| Manager receipt-time regression | Reject and preserve previous health. |
 | Audit sink failure | Fail closed and do not apply mutation. |
 | Invalid daemon endpoint scope/binding | Reject before daemon mutation. |
 
@@ -159,6 +164,7 @@ nodes, refresh heartbeats, dispatch work, execute policies, or call adapters.
 | Instance registration under node with runtime mode, hosted tenants, supported features | `registers_instance_under_node_with_runtime_mode_tenants_features_and_audit`; `instance_registration_validates_parent_node_runtime_mode_tenants_and_features` |
 | Heartbeat updates health without static overwrite | `heartbeat_updates_health_without_overwriting_static_registration`; `instance_heartbeat_checks_parent_and_updates_only_mutable_health` |
 | Deterministic stale heartbeat detection | `stale_heartbeat_detection_is_deterministic_at_boundary` |
+| Sender timestamps cannot pin freshness and receipt time is monotonic | `sender_timestamps_cannot_pin_heartbeat_freshness_or_reorder_receipts` |
 | Invalid capability documents rejected before registration | `invalid_capability_document_is_rejected_before_registration_and_audit`; `invalid_capability_documents_fail_closed` |
 | Registry changes emit management audit events | `registers_node_with_scope_capabilities_version_health_and_audit`; `registers_instance_under_node_with_runtime_mode_tenants_features_and_audit`; `management_audit_event_classes_are_stable` |
 | Daemon endpoint scopes and binding fail closed | `node_registry_endpoints_require_scopes_binding_and_audit_attribution`; `heartbeat_and_instance_registry_endpoints_validate_identity_scope` |

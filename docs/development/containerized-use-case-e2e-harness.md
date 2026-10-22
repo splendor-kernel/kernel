@@ -81,7 +81,50 @@ Every mode must still run in containers unless it is explicitly a static reposit
 
 ## 3. Docker Compose topology skeleton
 
-The exact image names may change, but the service roles must remain stable.
+The exact image names may change, but the service roles must remain stable. The
+following is an architectural sketch, not a runnable copy. The executable source
+is `tests/e2e/use-cases/docker-compose.acceptance.yml`. In that composition the
+local daemon sets explicit `local_dev`, the manager sets explicit
+`local_acceptance` plus outbound signer/keyring/CA file paths, and resident nodes
+set explicit instance/trust/work-order/policy/TLS files. An initializer generates
+test-only material into separate untracked role volumes before those services
+start. Residents never mount the caller private key; each resident mounts only
+its own work-order v1 verifier secret, while the manager receives all issuer
+secrets and the runner receives only the fixture signing inputs it exercises.
+Local and resident roles use the dedicated unpublished acceptance-host image,
+which composes a closed adapter set around the generic daemon library. The
+production daemon image remains adapterless. The initializer generates four
+distinct owner-only request credentials for local, cloud, VPC, and edge hosts.
+Each credential is bound to one client/source instance, tenant A, the provider
+audience, a validity interval, request TTL, and the exact operation IDs selected
+from the checked-in v3 manifest. Applicable credentials also bind explicit
+artifact/data references or the one provisioned physical node. Hosts mount only
+their own credential and the provider receipt public key. The dedicated non-root provider image mounts the
+request keyring and provider-only Ed25519 private key. The runner mounts a
+separate short-lived evidence-reader credential and the public receipt key; it
+cannot authenticate `/actions` or sign a provider receipt.
+The effective root runner receives root-owned `0700`/`0600` evidence material.
+Its startup command performs an authenticated read and Ed25519 verification before
+running scenarios. Signed snapshots bind the reader key/principal, audience,
+method, path/query/view, timestamp, nonce, provider epoch, and monotonic sequence;
+reports retain the envelope and public verification material without secrets.
+This describes the configured topology, not completed runtime evidence. Static
+Compose validation never counts as a runtime pass. CORR-002B Docker scenarios
+remain `not_exercised` unless the runtime commands actually complete.
+Native S2 is a separately labeled `functional_only` fallback and does not prove
+container role or compromised-host isolation.
+Resident URLs use HTTPS, credentialed Python acceptance clients explicitly
+disable redirects while retaining CA/hostname verification, and no resident
+inherits local development keys. A resident 3xx is evidence of an error response,
+not permission to forward Authorization to a new origin or plaintext URL. Because
+work-order v1 uses keyed-BLAKE3 shared secrets, this fixture proves scoped sibling
+isolation, not asymmetric issuer/verifier separation.
+
+The executable harness runs `resident-auth-fixture` first through the explicit
+Compose `setup` profile and waits for success before starting the long-running
+topology. The subsequent `up --abort-on-container-exit` does not enable that
+one-shot profile, so fixture completion cannot abort the acceptance runner or
+resident services.
 
 ```yaml
 services:
@@ -96,7 +139,9 @@ services:
       SPLENDOR_DAEMON_URL: "http://splendor-daemon-local:8080"
       SPLENDOR_MANAGER_URL: "http://central-manager:8081"
       SPLENDOR_HTTP_FIXTURE_URL: "http://fake-http-service:8082"
-      SPLENDOR_ARTIFACT_FIXTURE_URL: "http://fake-artifact-store:8083"
+      SPLENDOR_ACTION_PROVIDER_URL: "http://acceptance-action-provider:8086"
+      SPLENDOR_ACCEPTANCE_EVIDENCE_CREDENTIAL_FILE: "/run/splendor-provider-evidence/action-provider-evidence-credential.json"
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: "/run/splendor-provider-evidence/receipt-public-key.raw"
       SPLENDOR_GOVERNANCE_FIXTURE_URL: "http://fake-governance-plane:8084"
       SPLENDOR_TELEMETRY_FIXTURE_URL: "http://fake-telemetry-sink:8085"
     depends_on:
@@ -105,24 +150,30 @@ services:
       - resident-cloud-node
       - resident-vpc-node
       - resident-edge-node
-      - device-sim
       - fake-http-service
-      - fake-artifact-store
+      - acceptance-action-provider
       - fake-governance-plane
       - fake-telemetry-sink
       - toxiproxy
     volumes:
       - ../..:/workspace
       - e2e-state:/workspace/target/splendor-e2e
+      - e2e-provider-runner-auth:/run/splendor-provider-evidence:ro
 
   splendor-daemon-local:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: ["splendor-daemon", "--config", "/fixtures/local-daemon.yaml"]
+      target: acceptance-action-host
+    command: ["splendor-acceptance-action-host"]
+    environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: "http://acceptance-action-provider:8086/actions"
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: "/run/splendor-provider-client/action-provider-request-credential.json"
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: "/run/splendor-provider-client/receipt-public-key.raw"
     volumes:
-      - ./fixtures:/fixtures:ro
       - e2e-state:/var/lib/splendor
+      - e2e-provider-local-auth:/run/splendor-provider-client:ro
 
   central-manager:
     build:
@@ -137,47 +188,67 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: ["splendor-daemon", "--resident-node", "--config", "/fixtures/cloud-node.yaml"]
+      target: acceptance-action-host
+    command: ["splendor-acceptance-action-host"]
+    environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: "http://acceptance-action-provider:8086/actions"
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: "/run/splendor-provider-client/action-provider-request-credential.json"
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: "/run/splendor-provider-client/receipt-public-key.raw"
     volumes:
-      - ./fixtures:/fixtures:ro
       - e2e-state:/var/lib/splendor
+      - e2e-provider-cloud-auth:/run/splendor-provider-client:ro
 
   resident-vpc-node:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: ["splendor-daemon", "--resident-node", "--config", "/fixtures/vpc-node.yaml"]
+      target: acceptance-action-host
+    command: ["splendor-acceptance-action-host"]
+    environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: "http://acceptance-action-provider:8086/actions"
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: "/run/splendor-provider-client/action-provider-request-credential.json"
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: "/run/splendor-provider-client/receipt-public-key.raw"
     volumes:
-      - ./fixtures:/fixtures:ro
       - e2e-state:/var/lib/splendor
+      - e2e-provider-vpc-auth:/run/splendor-provider-client:ro
 
   resident-edge-node:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: ["splendor-daemon", "--resident-node", "--config", "/fixtures/edge-node.yaml"]
+      target: acceptance-action-host
+    command: ["splendor-acceptance-action-host"]
+    environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: "http://acceptance-action-provider:8086/actions"
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: "/run/splendor-provider-client/action-provider-request-credential.json"
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: "/run/splendor-provider-client/receipt-public-key.raw"
     volumes:
-      - ./fixtures:/fixtures:ro
       - e2e-state:/var/lib/splendor
+      - e2e-provider-edge-auth:/run/splendor-provider-client:ro
 
-  device-sim:
-    image: python:3.12-slim
-    command: ["python", "/fixtures/device-sim/server.py"]
+  acceptance-action-provider:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: acceptance-action-provider
+    command: ["python3", "action_provider.py"]
+    environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_REQUEST_KEYRING_FILE: "/run/splendor-provider-auth/action-provider-request-keyring.json"
+      SPLENDOR_ACCEPTANCE_EVIDENCE_KEYRING_FILE: "/run/splendor-provider-auth/action-provider-evidence-keyring.json"
+      SPLENDOR_ACCEPTANCE_RECEIPT_SIGNING_KEY_FILE: "/run/splendor-provider-auth/receipt-signing-key.pk8"
+      SPLENDOR_ACCEPTANCE_SIGNER: "/usr/local/bin/resident_auth_key_tool"
     volumes:
-      - ./fixtures:/fixtures:ro
+      - e2e-action-provider-auth:/run/splendor-provider-auth:ro
 
   fake-http-service:
     image: python:3.12-slim
     command: ["python", "/fixtures/external-services/http_fixture.py"]
     volumes:
       - ./fixtures:/fixtures:ro
-
-  fake-artifact-store:
-    image: python:3.12-slim
-    command: ["python", "/fixtures/external-services/artifact_store.py"]
-    volumes:
-      - ./fixtures:/fixtures:ro
-      - e2e-state:/var/lib/splendor
 
   fake-governance-plane:
     image: python:3.12-slim
@@ -196,6 +267,12 @@ services:
     image: ghcr.io/shopify/toxiproxy:latest
 
 volumes:
+  e2e-action-provider-auth:
+  e2e-provider-runner-auth:
+  e2e-provider-local-auth:
+  e2e-provider-cloud-auth:
+  e2e-provider-vpc-auth:
+  e2e-provider-edge-auth:
   e2e-state:
 ```
 
@@ -212,6 +289,21 @@ The runner must execute phases in this order:
    - TypeScript package version
    - OpenAPI schema version
    - Docker image digest/topology hash
+   - source revision, dirty state, and deterministic source-tree digest
+
+The source-tree digest uses `splendor-e2e-source-tree-v1`: SHA-256 over
+domain-separated, length-prefixed fields containing the full `HEAD`, sorted
+staged entries as Git index path/mode/blob bytes, the sorted union of staged and
+unstaged tracked entries as current worktree path/type/Git mode/content (or
+deletion), and sorted untracked non-ignored path/type/Git mode/content. Ignored
+files and mtimes are excluded.
+The report exposes only the digest and change counts, not file contents.
+
+The host runner computes this identity before starting Compose and passes the
+digest with `SPLENDOR_E2E_SOURCE_TREE_DIGEST`; `SPLENDOR_E2E_SOURCE_REV` remains
+supported. A container without usable Git metadata requires both overrides to
+report a known identity. Missing or invalid metadata remains `unknown` and must
+not be represented as a clean tree.
 
 2. **Static anti-drift scan**
    - no scenario test claims E2E while importing private runtime helpers;
@@ -235,7 +327,7 @@ The runner must execute phases in this order:
    - central manager ready;
    - resident nodes registered or ready to register;
    - fake external services ready;
-   - device simulator ready;
+   - receipt-bearing action provider ready;
    - fault proxy ready.
 
 5. **Scenario execution**
@@ -271,7 +363,7 @@ Use the repository's real stack. The exact test frameworks may vary, but all lay
 | OpenAPI | Contract parse, operation coverage, request/response validation, schema evolution checks. |
 | CLI | `splendorctl` run/trace/state/replay and management workflows where applicable. |
 | Docker | Standard compose topology and report artifacts from clean environment. |
-| External fixtures | HTTP/artifact/governance/telemetry/device simulator beyond Splendor boundaries only. |
+| External fixtures | HTTP/action-provider/governance/telemetry fixtures beyond Splendor boundaries only; provider observations and fixture receipts support scenario assertions but are not kernel authority. |
 
 ---
 
@@ -326,6 +418,9 @@ redaction policy present for trace export
 message schema validated before delivery
 state handoff hash validated
 approval token scoped and expiry checked
+resident approval receipt bound to exact instance and run
+resident receipt revocation acknowledged before manager success
+retained evidence excludes bearer, raw JTI, and receipt-signature bytes
 safety verifier executed before physical action
 ```
 
@@ -356,6 +451,10 @@ message-causal-graph.json
 fleet-telemetry.json
 placement-explanation.json
 approval-flow.json
+approval-receipt-revocation-report.json
+manager-approval-auth.json
+resident-security.json
+physical-approval-node-binding.json
 device-safety-evidence.json
 trace-sync-report.json
 schema-migration-report.json
@@ -385,6 +484,10 @@ fault-injection-report.json
 | Stale node heartbeat | Placement denied or policy-degraded with explanation. |
 | State hash mismatch | Reject import/handoff/replay. |
 | Expired approval | Cannot resume/execute. |
+| Raw approval evidence on active run | Reject before gateway, trace, tick, state, or adapter mutation. |
+| Wrong-node approval receipt | Reject before claim; original target remains usable. |
+| Resident receipt revocation | Require exact-scope authenticated known acknowledgement; uncertainty is not success. |
+| Retained bearer/JTI/receipt signature | Fail evidence aggregation. |
 | Circuit breaker active | Matching action denied. |
 | Kill switch active | Matching run/action cancelled or blocked. |
 | Raw motor command | Reject at schema/adapter boundary. |
@@ -426,7 +529,7 @@ This job may be expensive compared with sprint-local tests, so it can be require
 
 A reviewer should be able to answer these from the report alone:
 
-- What source revision and container topology were tested?
+- What source revision, exact clean/dirty source-tree digest, and container topology were tested?
 - Which FRs and primitives were covered?
 - Which public API operations were exercised?
 - Which clients were used: CLI, Python, TypeScript, raw OpenAPI-validated HTTP?

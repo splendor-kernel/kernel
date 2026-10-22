@@ -7,8 +7,9 @@
 //! incompatibility.
 
 use crate::{
-    cloud_helper::validate_cloud_helper_work_order, AgentId, PlacementExecutionMode,
-    RevocationStatus, RunId, TenantId, WorkOrderId, WorkOrderSignature,
+    cloud_helper::validate_cloud_helper_work_order, AgentId, EffectCertainty, ErrorCategory,
+    ErrorTaxonomy, PlacementExecutionMode, ReasonCode, RetryClass, RevocationStatus, RunId,
+    TenantId, WorkOrderId, WorkOrderSignature,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -346,6 +347,93 @@ impl WorkOrderValidationError {
             Self::Incompatible { .. } => "incompatible_work_order",
         }
     }
+
+    /// Converts this validation failure into the canonical FND-004 taxonomy.
+    ///
+    /// Work-order validation happens before run admission or side effects, so
+    /// effect certainty is always `none`. Authority, expiry, revocation, and
+    /// incompatibility failures require a new signed/scoped authorization rather
+    /// than retrying the same request silently.
+    pub fn taxonomy(&self) -> ErrorTaxonomy {
+        let (category, reason_code, retry_class) = match self {
+            Self::Unsigned => (
+                ErrorCategory::Unauthenticated,
+                ReasonCode::from_static("unsigned_work_order"),
+                RetryClass::RetryWithNewAuthorization,
+            ),
+            Self::UnknownKey { .. } => (
+                ErrorCategory::Unauthenticated,
+                ReasonCode::from_static("unknown_signature_key"),
+                RetryClass::RetryWithNewAuthorization,
+            ),
+            Self::BadSignature => (
+                ErrorCategory::IntegrityFailure,
+                ReasonCode::from_static("bad_signature"),
+                RetryClass::RetryWithNewAuthorization,
+            ),
+            Self::Expired => (
+                ErrorCategory::Expired,
+                ReasonCode::from_static("expired_work_order"),
+                RetryClass::RetryWithNewAuthorization,
+            ),
+            Self::Revoked { .. } => (
+                ErrorCategory::Revoked,
+                ReasonCode::from_static("revoked_work_order"),
+                RetryClass::RetryWithNewAuthorization,
+            ),
+            Self::Malformed { reason } => malformed_work_order_taxonomy(reason),
+            Self::Incompatible { reason } => (
+                ErrorCategory::Unauthorized,
+                incompatible_work_order_reason_code(reason),
+                RetryClass::RetryWithNewAuthorization,
+            ),
+        };
+
+        ErrorTaxonomy::new(category, reason_code, retry_class, EffectCertainty::None)
+    }
+}
+
+fn malformed_work_order_taxonomy(reason: &str) -> (ErrorCategory, ReasonCode, RetryClass) {
+    if reason.starts_with("unsupported_schema_version") {
+        return (
+            ErrorCategory::IncompatibleSchema,
+            ReasonCode::from_static("unsupported_work_order_schema_version"),
+            RetryClass::NotRetryable,
+        );
+    }
+    if reason.starts_with("work_order_not_serializable") {
+        return (
+            ErrorCategory::InvalidInput,
+            ReasonCode::from_static("work_order_not_serializable"),
+            RetryClass::NotRetryable,
+        );
+    }
+    if matches!(
+        reason,
+        "cloud_helper_robotics_adapter_authority_denied"
+            | "cloud_helper_physical_action_authority_denied"
+    ) {
+        return (
+            ErrorCategory::Unsafe,
+            prefixed_or_fallback("", reason, "malformed_work_order"),
+            RetryClass::RetryWithNewAuthorization,
+        );
+    }
+
+    (
+        ErrorCategory::InvalidInput,
+        prefixed_or_fallback("work_order_", reason, "malformed_work_order"),
+        RetryClass::NotRetryable,
+    )
+}
+
+fn incompatible_work_order_reason_code(reason: &str) -> ReasonCode {
+    prefixed_or_fallback("work_order_", reason, "incompatible_work_order")
+}
+
+fn prefixed_or_fallback(prefix: &str, reason: &str, fallback: &'static str) -> ReasonCode {
+    ReasonCode::try_new(format!("{prefix}{reason}"))
+        .unwrap_or_else(|_| ReasonCode::from_static(fallback))
 }
 
 /// Validates a signed work order against the receiving runtime context.

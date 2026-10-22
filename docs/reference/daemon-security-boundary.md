@@ -1,9 +1,10 @@
 # Daemon Security Boundary Reference
 
-The daemon security boundary is the 0.02-S0 contract for communication between
-external apps and Splendor daemon/client surfaces. It is a Rust reference
-validator and documentation contract, not a daemon server, OAuth provider, PKI
-stack, or production transport implementation.
+The daemon security boundary began as the 0.02-S0 reference validator. Accepted
+[RFC 0011](../rfc/0011-resident-caller-auth-and-dispatch.md) now adds one
+production-real resident reference profile: TLS plus a closed Ed25519 caller
+bearer verifier. This is not an OAuth provider, general PKI stack, full Principal
+Registry, or proof that the central-manager inbound API is production-secure.
 
 ## Layered authorization
 
@@ -47,12 +48,51 @@ Every non-dev daemon request must include a `CallerCredential` with:
 
 Anonymous non-dev daemon calls fail closed.
 
+### Resident caller proof
+
+Resident requests require `Authorization: Bearer <token>` using the accepted
+`typ=splendor-caller+jwt`, `alg=Ed25519` profile. Verification is bound to an
+explicit trust snapshot, exact issuer, exact `urn:splendor:instance:<instance_id>`
+audience, tenant, endpoint scopes, 300-second maximum lifetime, active key, JTI
+revocation, and fresh trust state. Unknown fields/algorithms/keys, bad signatures,
+stale trust, clock rollback, and malformed or oversized tokens fail closed.
+Resident trust may omit an exact client-subject binding for compatibility. The
+central-manager approval verifier is stricter: its trust snapshot must name one
+exact `expected_client_principal_id`, and any other signed `sub` is rejected.
+Manager process composition also rejects approval trust containing the outbound
+manager-to-resident dispatch signing key. Approval-control-plane proof and
+resident-dispatch proof therefore use separate Ed25519 key pairs and subjects.
+The current file-backed verifier loads trust at resident startup. Operators apply
+an atomically replaced trust/revocation snapshot with a controlled restart; hot
+reload/watch propagation is not implemented, and an expired loaded snapshot
+denies requests.
+
+Mutating resident requests atomically consume the verified canonical JTI before
+handler mutation. Concurrent or subsequent reuse is denied with
+`caller_token_replayed`; read-only requests may reuse a token until expiry. The
+live consumed-JTI set retains entries through token expiry plus accepted clock
+leeway, then prunes them, and is bounded; inability to consult it fails closed.
+
+The daemon derives the authoritative `CallerCredential` from verified claims.
+Request-body credential/audit fields and `X-Splendor-Caller-Credential` remain
+deprecated compatibility mirrors. They cannot authenticate and must exactly match
+the verified principal, credential ID, binding, audience, scopes, expiry, and
+revocation projection when supplied. Resident middleware passes verified context
+through request extensions and supplies internal compatibility fields if they
+are absent. Missing or invalid proof returns `401` with
+`WWW-Authenticate: Bearer realm="splendor-resident", error="invalid_token"`;
+authenticated scope/binding/mirror failures return `403`. Tokens, signatures,
+and key bytes are never copied into errors or traces. The projected credential
+ID is a `sha256:`-prefixed domain-separated correlation digest rather than raw
+JTI.
+
 ## Transport modes
 
-Secure production communication should use authenticated transports or caller
-tokens appropriate to the deployment, such as mTLS, workload identity, signed
-service tokens, or OIDC/JWT access tokens. Transport security authenticates the
-channel; it does not authorize runs or actions.
+The implemented resident reference path uses Rustls TLS with an explicit
+certificate/private-key file and the accepted Ed25519 service token. Future mTLS,
+workload identity, OIDC, and hardware proof providers remain adapter work.
+Transport security authenticates the channel; it does not authorize runs or
+actions.
 
 The daemon must not expose unauthenticated TCP by default.
 
@@ -94,8 +134,17 @@ The reference `EndpointScope` values map to daemon operations:
 | `splendor.instances.register` | register an instance under a node |
 | `splendor.nodes.heartbeat` | record node health heartbeat |
 | `splendor.instances.heartbeat` | record instance health heartbeat |
+| `splendor.device.register` | register a physical/edge device profile |
+| `splendor.device.read` | read device status or policy-cache status only |
+| `splendor.device.trace_sync` | validate and acknowledge a reconnect trace batch mutation |
+| `splendor.operator.intervene` | request/grant/deny a scoped operator intervention |
 
 Missing endpoint scopes fail closed.
+
+`splendor.device.read` cannot authorize `POST
+/devices/{node_id}/trace-buffer/sync`. Trace sync is mutating, requires audit
+attribution, and consumes a resident caller JTI. A fresh exact-scope
+`splendor.device.trace_sync` bearer is required.
 
 Fleet-bound credentials are modeled for later fleet-facing endpoints. Tenant-run
 endpoints require an exact tenant binding and reject fleet-bound credentials so a
@@ -122,8 +171,9 @@ operations still require caller scope validation for non-dev calls and mutating
 operations still require audit attribution, but they do not replace the signed
 work-order requirement for create/resume.
 
-0.02-S0 checks signature metadata presence and scope. Cryptographic verification
-and remote work-order ingestion are future daemon/work-order implementation work.
+The current daemon cryptographically validates configured signed work orders.
+Resident caller proof remains a separate prerequisite and does not replace that
+work-order validation.
 
 ## Percept append
 
@@ -166,6 +216,18 @@ after gateway execution and is not accepted from daemon callers.
 not authority to execute side effects; side effects remain authorized only by the
 Action Gateway and its verifier chain.
 
+## Approval receipt revocation
+
+`POST /runs/{run_id}/approval-receipts/{receipt_id}/revoke` is a resident-only
+mutating boundary. It requires an authenticated caller, exact tenant/run binding,
+instance audience binding, server-owned audit attribution, and the dedicated
+`splendor.approval_receipts.revoke` scope. `splendor.approvals.manage` and
+`splendor.actions.submit` do not imply this scope. The closed request body is not
+rewritten into generic caller-credential mirrors; unknown fields fail decoding.
+Caller authentication authorizes access to the endpoint, while the retained
+signed receipt and resident ledger determine whether the exact revocation is
+valid and whether execution already claimed it.
+
 ## Node and instance registry endpoints
 
 0.03-S2 adds daemon-security contract coverage for registry mutations. These
@@ -191,6 +253,8 @@ Mutating calls must record caller attribution in trace/audit metadata. The
 reference validator requires `AuditAttribution` for run creation, run resume,
 percept append, and action submit. Attribution must match the authenticated
 credential when a credential is present.
+Resident middleware treats mirror timestamps as non-authoritative and rewrites
+them with a server-owned authentication timestamp before trace/audit recording.
 
 ## SDK/client fallback behavior
 
@@ -198,6 +262,10 @@ SDKs and clients must not silently fall back to insecure unauthenticated
 communication. `validate_client_connection_policy()` rejects
 `allow_unauthenticated_fallback = true` and accepts unauthenticated access only
 when explicit local dev mode passes its local-only warning checks.
+The TypeScript client also rejects remote HTTP, relative/unsupported schemes,
+URL credentials, query, and fragment. Plain HTTP is accepted only for exact
+loopback hosts (`localhost`, `127.0.0.1`, `[::1]`). Every credentialed Fetch call
+sets `redirect: "error"` so bearer headers are not forwarded automatically.
 
 ## Replay behavior
 
@@ -208,12 +276,15 @@ orders to re-execute actions.
 
 ## Non-goals
 
-- No production daemon transport or auth server is implemented by this security
-  validator. The 0.02-S5 local HTTP daemon calls this validator.
+- No generic production auth server, OAuth/OIDC issuer, dynamic key discovery,
+  fleet PKI manager, or full Principal Registry is implemented.
 - No OAuth/OIDC server.
 - No PKI or fleet mTLS rollout.
 - No node bootstrap protocol.
-- No remote fleet auth.
+- No production authentication claim for the current central-manager inbound
+  acceptance API. RFC 0011 secures manager outbound resident dispatch and the
+  four bounded local approval mutations only; it does not add general manager
+  authentication or manager TLS.
 - No governance approval workflow is implemented by this S0 security-boundary
   validator; approval enforcement is documented separately for 0.04-S2.
 - No broad runtime permission engine.

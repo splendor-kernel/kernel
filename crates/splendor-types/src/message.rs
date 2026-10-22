@@ -6,19 +6,26 @@
 //! changing the canonical message payload.
 
 use crate::{
-    validate_work_order, AgentId, MessageId, RoutePlanProposal, RunId, TenantId, TraceEventId,
-    TraceId, VerificationResult, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
-    WorkOrderValidationError, ROUTE_PLAN_PROPOSAL_SCHEMA,
+    validate_work_order, AgentId, CapabilityGrantId, MessageId, RoutePlanProposal, RunId, TenantId,
+    TraceEventId, TraceId, VerificationResult, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext, WorkOrderValidationError, ROUTE_PLAN_PROPOSAL_SCHEMA,
 };
 use serde::{de, Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-/// Canonical local task request schema used by 0.02-S4 local delegation.
-pub const TASK_REQUEST_SCHEMA: &str = "splendor.message.task_request.v1";
+/// Legacy non-authorizing local task request schema identifier retained for
+/// migration/replay classification; it is never accepted for live delegation.
+pub const TASK_REQUEST_SCHEMA_V1: &str = "splendor.message.task_request.v1";
+/// Canonical live local task request schema with a mandatory child grant ref.
+pub const TASK_REQUEST_SCHEMA: &str = "splendor.message.task_request.v2";
 
 /// Canonical local task response schema used by 0.02-S4 local delegation.
 pub const TASK_RESPONSE_SCHEMA: &str = "splendor.message.task_response.v1";
+
+/// Canonical schema for non-authorizing local delegation authority evidence.
+pub const LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION: &str =
+    "splendor.message.local_delegation_authority_evidence.v1";
 
 /// Canonical message payload schema version supported by the local message
 /// contract.
@@ -27,23 +34,26 @@ pub const TASK_RESPONSE_SCHEMA: &str = "splendor.message.task_response.v1";
 pub enum MessageSchemaVersion {
     /// Version 1 message payload schema suffix (`.v1`).
     V1,
+    /// Version 2 live delegated task request schema suffix (`.v2`).
+    V2,
 }
 
 impl MessageSchemaVersion {
     /// Latest schema version accepted by this crate.
-    pub const LATEST: Self = Self::V1;
+    pub const LATEST: Self = Self::V2;
 
     /// Returns the canonical schema suffix for this version.
     pub fn suffix(self) -> &'static str {
         match self {
             Self::V1 => "v1",
+            Self::V2 => "v2",
         }
     }
 
     /// Extracts and validates the message schema version from a schema string.
     ///
     /// The schema must be transport-neutral and end with a version suffix like
-    /// `splendor.message.task_request.v1`. Only `v1` is accepted in 0.02-S1;
+    /// `splendor.message.task_request.v2`. Versions `v1` and `v2` are recognized;
     /// unsupported versions fail closed before any router can handle them.
     pub fn from_schema(schema: &str) -> Result<Self, MessageValidationError> {
         validate_schema_name(schema)?;
@@ -66,6 +76,7 @@ impl MessageSchemaVersion {
         }
         match digits {
             "1" => Ok(Self::V1),
+            "2" => Ok(Self::V2),
             _ => Err(MessageValidationError::UnsupportedSchemaVersion {
                 version: version.to_string(),
             }),
@@ -134,6 +145,86 @@ pub struct DelegatedAuthority {
     pub allowed_adapters: Vec<String>,
     /// Permission tokens explicitly delegated to the child run.
     pub allowed_permissions: Vec<String>,
+}
+
+/// Trace/message-safe references proving which authority grants were used for a
+/// local delegation attempt.
+///
+/// This evidence is behavior-free and non-authorizing: callers and message
+/// payloads cannot use it to mint authority. Runtime code must still call the
+/// authority service with a trusted validated parent capability grant before
+/// creating a child run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalDelegationAuthorityEvidence {
+    /// Evidence schema version.
+    pub schema_version: String,
+    /// Parent grant that was narrowed for this delegation.
+    pub parent_capability_grant_id: CapabilityGrantId,
+    /// Child grant requested or issued for this delegation.
+    pub child_capability_grant_id: CapabilityGrantId,
+    /// Stable authority reason code when issuance failed or was denied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_reason: Option<String>,
+}
+
+impl LocalDelegationAuthorityEvidence {
+    /// Builds allow evidence for an authority-issued local child grant.
+    pub fn issued(
+        parent_capability_grant_id: CapabilityGrantId,
+        child_capability_grant_id: CapabilityGrantId,
+    ) -> Self {
+        Self {
+            schema_version: LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION.to_string(),
+            parent_capability_grant_id,
+            child_capability_grant_id,
+            authority_reason: None,
+        }
+    }
+
+    /// Returns a denied copy with a stable authority reason code.
+    pub fn denied(mut self, reason: impl Into<String>) -> Self {
+        self.authority_reason = Some(reason.into());
+        self
+    }
+
+    /// Validates evidence shape without treating the evidence as authority.
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.schema_version != LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "invalid local delegation authority evidence schema_version",
+            ));
+        }
+        if self.parent_capability_grant_id.is_nil() {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "parent_capability_grant_id is required",
+            ));
+        }
+        if self.child_capability_grant_id.is_nil() {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "child_capability_grant_id is required",
+            ));
+        }
+        if self.child_capability_grant_id == self.parent_capability_grant_id {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "child_capability_grant_id must differ from parent_capability_grant_id",
+            ));
+        }
+        if self
+            .authority_reason
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty() || reason.trim() != reason)
+        {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "authority_reason must be a non-empty stable reason code",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DelegatedAuthority {
@@ -223,7 +314,7 @@ impl DelegatedAuthority {
     }
 }
 
-/// Structured payload for `splendor.message.task_request.v1`.
+/// Structured payload for live `splendor.message.task_request.v2` delegation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskRequest {
     /// Parent run requesting delegated local work.
@@ -236,6 +327,13 @@ pub struct TaskRequest {
     pub objective: String,
     /// Explicit authority granted to the child run.
     pub delegated_authority: DelegatedAuthority,
+    /// Mandatory non-authorizing reference to the exact authority-owned child
+    /// grant. The manager validates this against owned state before routing.
+    pub capability_grant_id: CapabilityGrantId,
+    /// Non-authorizing authority evidence refs recorded by the runtime-local
+    /// authority-backed delegation path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_evidence: Option<LocalDelegationAuthorityEvidence>,
 }
 
 impl TaskRequest {
@@ -247,15 +345,50 @@ impl TaskRequest {
         objective: impl Into<String>,
         delegated_authority: DelegatedAuthority,
     ) -> Result<Self, MessageValidationError> {
+        Self::new_with_grant_ref(
+            parent_run_id,
+            child_run_id,
+            target_agent_id,
+            objective,
+            delegated_authority,
+            CapabilityGrantId::new(),
+        )
+    }
+
+    /// Builds a live delegated task request bound to an exact child grant ref.
+    pub fn new_with_grant_ref(
+        parent_run_id: RunId,
+        child_run_id: RunId,
+        target_agent_id: AgentId,
+        objective: impl Into<String>,
+        delegated_authority: DelegatedAuthority,
+        capability_grant_id: CapabilityGrantId,
+    ) -> Result<Self, MessageValidationError> {
         let request = Self {
             parent_run_id,
             child_run_id,
             target_agent_id,
             objective: objective.into(),
             delegated_authority,
+            capability_grant_id,
+            authority_evidence: None,
         };
         request.validate()?;
         Ok(request)
+    }
+
+    /// Attaches trace/message-safe authority evidence references. This does not
+    /// make the payload authoritative; the manager must already have received an
+    /// authority-issued child grant.
+    pub fn with_authority_evidence(
+        mut self,
+        authority_evidence: LocalDelegationAuthorityEvidence,
+    ) -> Result<Self, MessageValidationError> {
+        authority_evidence.validate()?;
+        self.capability_grant_id = authority_evidence.child_capability_grant_id.clone();
+        self.authority_evidence = Some(authority_evidence);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Decodes a task request from a JSON payload.
@@ -298,6 +431,21 @@ impl TaskRequest {
         }
         if self.objective.trim().is_empty() {
             return Err(payload_error(TASK_REQUEST_SCHEMA, "objective is required"));
+        }
+        if self.capability_grant_id.is_nil() {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "capability_grant_id is required",
+            ));
+        }
+        if let Some(authority_evidence) = &self.authority_evidence {
+            authority_evidence.validate()?;
+            if authority_evidence.child_capability_grant_id != self.capability_grant_id {
+                return Err(payload_error(
+                    TASK_REQUEST_SCHEMA,
+                    "capability_grant_id must match authority evidence",
+                ));
+            }
         }
         Ok(())
     }

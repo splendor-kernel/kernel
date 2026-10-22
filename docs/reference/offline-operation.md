@@ -7,8 +7,11 @@ connectivity is unavailable.
 ## Contract
 
 - Central policy authority remains `PolicyBundle` / `PolicyDistributionGateway`.
-- Offline state is explicit: `PolicyCache::set_disconnected_with_trace(...)`
-  returns `TraceEventKind::PolicyConnectivityChanged` for disconnect/reconnect.
+- Offline state is explicit: `PolicyCache::mark_disconnected_with_trace(...)`
+  records restrictive disconnection and returns
+  `TraceEventKind::PolicyConnectivityChanged`. Reconnect has no direct setter;
+  it commits only from a first/strictly newer validated policy plan after
+  required trace evidence is durable.
 - Low-risk operation is explicit: the cached bundle must list action names in
   `degraded_mode.disconnected_low_risk_actions`, and the action must be
   `SideEffectClass::ReadOnly`.

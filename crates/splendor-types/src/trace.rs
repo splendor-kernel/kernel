@@ -21,10 +21,11 @@
 
 use crate::{
     Action, AgentId, ApprovalTraceContext, AuditAttribution, CircuitBreakerTraceContext,
-    Constraint, ContentHash, EscalationContext, Feedback, GovernanceObjectKind, GovernanceScope,
-    GovernanceState, GovernanceTransition, GovernanceTransitionError,
-    GovernanceTransitionRejection, IdentityValidationError, MessageId, MessageTraceContext,
-    PolicyBundleId, PolicyBundleTraceContext, RemoteMessageTraceContext, Reward, RunId, SnapshotId,
+    Constraint, ContentHash, DelegationLedgerTraceSummary, EscalationContext, Feedback,
+    GovernanceObjectKind, GovernanceScope, GovernanceState, GovernanceTransition,
+    GovernanceTransitionError, GovernanceTransitionRejection, IdentityValidationError,
+    LocalDelegationAuthorityEvidence, MessageId, MessageTraceContext, PolicyBundleId,
+    PolicyBundleTraceContext, RemoteMessageTraceContext, Reward, RunId, SnapshotId,
     StateHandoffTraceContext, TaskFailure, TenantId, TickId, TraceEventId, TraceId,
     TraceIdentityContext, VerificationResult, WorkOrderId,
 };
@@ -934,7 +935,7 @@ pub enum GovernanceTraceEventKindError {
 }
 
 /// Trace context for local parent/child delegation events.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LocalDelegationTraceContext {
     /// Parent run that requested scoped local work.
     pub parent_run_id: RunId,
@@ -952,6 +953,13 @@ pub struct LocalDelegationTraceContext {
     pub target_agent_id: AgentId,
     /// Scoped child objective.
     pub objective: String,
+    /// Non-authorizing parent/child authority grant references captured before
+    /// local child-run routing or replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_evidence: Option<LocalDelegationAuthorityEvidence>,
+    /// Redacted authority-ledger chain and budget-reservation transition summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_ledger: Option<DelegationLedgerTraceSummary>,
 }
 
 impl LocalDelegationTraceContext {
@@ -970,6 +978,21 @@ impl LocalDelegationTraceContext {
     /// Returns a copy with the parent trace event that caused this delegation.
     pub fn with_parent_trace(mut self, trace_id: TraceId) -> Self {
         self.parent_trace_id = Some(trace_id);
+        self
+    }
+
+    /// Returns a copy with non-authorizing authority grant references.
+    pub fn with_authority_evidence(
+        mut self,
+        authority_evidence: LocalDelegationAuthorityEvidence,
+    ) -> Self {
+        self.authority_evidence = Some(authority_evidence);
+        self
+    }
+
+    /// Returns a copy with redacted authority-ledger trace evidence.
+    pub fn with_delegation_ledger(mut self, evidence: DelegationLedgerTraceSummary) -> Self {
+        self.delegation_ledger = Some(evidence);
         self
     }
 }

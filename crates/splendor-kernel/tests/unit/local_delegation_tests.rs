@@ -2,8 +2,19 @@ use super::*;
 use crate::{
     AgentIsolationPolicy, AgentRuntimeConfig, KernelRuntime, KernelRuntimeConfig, TraceSink,
 };
-use splendor_types::{TraceEvent, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use splendor_authority::{
+    grant_from_legacy_allowlists, grant_from_legacy_multi_scope_allowlists,
+    CompatibilityGrantContext, LegacyMultiScopeProfile, LegacyScopeProfile, RevocationSnapshot,
+    ValidatedCapabilityGrant, REASON_AUTHORITY_GRANT_REVOKED,
+    REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
+};
+use splendor_types::{
+    Action, AuthorityBudgetScope, AuthorityRevocationId, CapabilityGrantId,
+    DelegationReservationStatus, PrincipalId, QuotaUsage, RevocationRecord, RevocationStatus,
+    SideEffectClass, TraceEvent, REVOCATION_RECORD_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
+    TASK_RESPONSE_SCHEMA,
+};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::time::Duration as StdDuration;
 
 #[derive(Default)]
@@ -22,6 +33,10 @@ struct SimpleRecorder {
     run_id: RunId,
 }
 
+const AUTHORITY_AUDIENCE: &str = "daemon:local";
+const AUTHORITY_DIGEST: &str =
+    "blake3:1111111111111111111111111111111111111111111111111111111111111111";
+
 impl MessageTraceRecorder for SimpleRecorder {
     fn run_id(&self) -> &RunId {
         &self.run_id
@@ -29,6 +44,38 @@ impl MessageTraceRecorder for SimpleRecorder {
 
     fn record_message_event(&self, _kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
         Ok(TraceId::new())
+    }
+}
+
+struct FailingRecorder {
+    run_id: RunId,
+}
+
+struct DelegationRequestedFailingRecorder {
+    run_id: RunId,
+}
+
+impl MessageTraceRecorder for DelegationRequestedFailingRecorder {
+    fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    fn record_message_event(&self, kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
+        if matches!(kind, TraceEventKind::DelegationRequested { .. }) {
+            Err(MessageRouterError::StorageUnavailable)
+        } else {
+            Ok(TraceId::new())
+        }
+    }
+}
+
+impl MessageTraceRecorder for FailingRecorder {
+    fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    fn record_message_event(&self, _kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
+        Err(MessageRouterError::StorageUnavailable)
     }
 }
 
@@ -45,6 +92,32 @@ impl MessageTraceRecorder for BlockingDelegationRecorder {
 
     fn record_message_event(&self, kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
         if matches!(&kind, TraceEventKind::DelegationRequested { .. }) {
+            if let Some(sender) = self.entered.lock().expect("entered lock").take() {
+                let _ = sender.send(());
+            }
+            let (lock, cvar) = &*self.release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = cvar.wait(released).expect("release wait");
+            }
+        }
+        Ok(TraceId::new())
+    }
+}
+
+struct BlockingRevocationRecorder {
+    run_id: RunId,
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl MessageTraceRecorder for BlockingRevocationRecorder {
+    fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    fn record_message_event(&self, kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
+        if matches!(&kind, TraceEventKind::ChildRunFailed { .. }) {
             if let Some(sender) = self.entered.lock().expect("entered lock").take() {
                 let _ = sender.send(());
             }
@@ -82,13 +155,30 @@ fn setup_manager() -> (
     LocalDelegationManager,
     AgentContext,
     AgentContext,
+    PrincipalId,
+    PrincipalId,
     RunId,
     RunId,
 ) {
-    let manager = LocalDelegationManager::new();
+    setup_manager_for(LocalDelegationManager::new())
+}
+
+fn setup_manager_for(
+    manager: LocalDelegationManager,
+) -> (
+    LocalDelegationManager,
+    AgentContext,
+    AgentContext,
+    PrincipalId,
+    PrincipalId,
+    RunId,
+    RunId,
+) {
     let tenant_id = TenantId::new();
     let parent_id = AgentId::new();
     let child_id = AgentId::new();
+    let parent_principal = PrincipalId::new();
+    let child_principal = PrincipalId::new();
     let parent = AgentContext::new(
         parent_id.clone(),
         tenant_id.clone(),
@@ -114,8 +204,9 @@ fn setup_manager() -> (
         },
     );
     manager
-        .register_agent(
+        .register_agent_with_principal(
             parent.clone(),
+            parent_principal.clone(),
             authority(
                 &["query", "publish"],
                 &["sql", "artifact"],
@@ -124,8 +215,9 @@ fn setup_manager() -> (
         )
         .expect("parent registered");
     manager
-        .register_agent(
+        .register_agent_with_principal(
             child.clone(),
+            child_principal.clone(),
             authority(&["query"], &["sql"], &["finance.read"]),
         )
         .expect("child registered");
@@ -134,7 +226,15 @@ fn setup_manager() -> (
     manager
         .register_root_run(parent_run_id.clone(), parent.agent_id.clone())
         .expect("parent run registered");
-    (manager, parent, child, parent_run_id, child_run_id)
+    (
+        manager,
+        parent,
+        child,
+        parent_principal,
+        child_principal,
+        parent_run_id,
+        child_run_id,
+    )
 }
 
 fn delegation_request(
@@ -155,34 +255,1620 @@ fn delegation_request(
     request
 }
 
+fn parent_grant_for_request(
+    parent_principal: &PrincipalId,
+    request: &LocalDelegationRequest,
+    tenant_id: &TenantId,
+) -> ValidatedCapabilityGrant {
+    parent_grant_with_allowlists(
+        parent_principal,
+        request,
+        tenant_id,
+        &request.delegated_authority.allowed_actions,
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        AuthorityBudgetScope {
+            max_actions_per_tick: Some(4),
+            max_action_duration_ms: Some(1_000),
+            ..AuthorityBudgetScope::default()
+        },
+    )
+}
+
+fn parent_grant_with_allowlists(
+    parent_principal: &PrincipalId,
+    request: &LocalDelegationRequest,
+    tenant_id: &TenantId,
+    actions: &[String],
+    adapters: &[String],
+    permissions: &[String],
+    quotas: AuthorityBudgetScope,
+) -> ValidatedCapabilityGrant {
+    parent_grant_with_allowlists_and_window(
+        parent_principal,
+        request,
+        tenant_id,
+        actions,
+        adapters,
+        permissions,
+        quotas,
+        OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        OffsetDateTime::now_utc() + time::Duration::minutes(30),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parent_grant_with_allowlists_and_window(
+    parent_principal: &PrincipalId,
+    request: &LocalDelegationRequest,
+    tenant_id: &TenantId,
+    actions: &[String],
+    adapters: &[String],
+    permissions: &[String],
+    quotas: AuthorityBudgetScope,
+    not_before: OffsetDateTime,
+    expires_at: OffsetDateTime,
+) -> ValidatedCapabilityGrant {
+    grant_from_legacy_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: parent_principal.clone(),
+            audience: AUTHORITY_AUDIENCE.to_string(),
+            validation_digest: AUTHORITY_DIGEST.to_string(),
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: tenant_id.clone(),
+            agent_id: request.target_agent_id.clone(),
+            run_id: Some(request.child_run_id.clone()),
+            quotas,
+        },
+        actions,
+        adapters,
+        permissions,
+        not_before,
+        expires_at,
+        RevocationStatus::Active,
+        Some("local_delegation:test".to_string()),
+    )
+    .expect("parent capability grant")
+}
+
+fn parent_grant_for_requests(
+    parent_principal: &PrincipalId,
+    tenant_id: &TenantId,
+    requests: &[&LocalDelegationRequest],
+) -> ValidatedCapabilityGrant {
+    let first = requests.first().expect("at least one delegation request");
+    grant_from_legacy_multi_scope_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: parent_principal.clone(),
+            audience: AUTHORITY_AUDIENCE.to_string(),
+            validation_digest: AUTHORITY_DIGEST.to_string(),
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyMultiScopeProfile {
+            tenant_id: tenant_id.clone(),
+            agent_ids: requests
+                .iter()
+                .map(|request| request.target_agent_id.clone())
+                .collect(),
+            run_ids: requests
+                .iter()
+                .map(|request| request.child_run_id.clone())
+                .collect(),
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(4),
+                max_action_duration_ms: Some(1_000),
+                ..AuthorityBudgetScope::default()
+            },
+        },
+        &first.delegated_authority.allowed_actions,
+        &first.delegated_authority.allowed_adapters,
+        &first.delegated_authority.allowed_permissions,
+        OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        OffsetDateTime::now_utc() + time::Duration::minutes(30),
+        RevocationStatus::Active,
+        Some("local_delegation:multi-request-test".to_string()),
+    )
+    .expect("multi-request parent capability grant")
+}
+
+fn authority_input(
+    parent_principal: &PrincipalId,
+    child_principal: &PrincipalId,
+    parent: &AgentContext,
+    request: &LocalDelegationRequest,
+) -> LocalDelegationAuthority {
+    let parent_grant = parent_grant_for_request(parent_principal, request, &parent.tenant_id);
+    let mut authority = LocalDelegationAuthority::new(
+        parent_grant,
+        child_principal.clone(),
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 3;
+    authority
+}
+
+fn bind_parent_authority(
+    manager: &LocalDelegationManager,
+    parent_run_id: &RunId,
+    authority: &LocalDelegationAuthority,
+) {
+    manager
+        .bind_root_run_capability_grant(
+            parent_run_id,
+            authority
+                .parent_capability_grant
+                .as_ref()
+                .expect("legacy root grant"),
+        )
+        .expect("trusted parent grant bound to root run");
+}
+
+fn revocation_snapshot_for(grant_id: CapabilityGrantId) -> RevocationSnapshot {
+    let now = OffsetDateTime::now_utc();
+    RevocationSnapshot::with_max_age(
+        vec![RevocationRecord {
+            schema_version: REVOCATION_RECORD_SCHEMA_VERSION.to_string(),
+            revocation_id: AuthorityRevocationId::new(),
+            grant_id,
+            revocation_ref: Some("revocation:local-delegation-test".to_string()),
+            status: RevocationStatus::Revoked {
+                reason: "operator_revoked".to_string(),
+            },
+            revoked_at: Some(now),
+        }],
+        now,
+        time::Duration::minutes(30),
+    )
+    .expect("revocation snapshot")
+}
+
+fn stale_revocation_snapshot() -> RevocationSnapshot {
+    let refreshed_at = OffsetDateTime::now_utc() - time::Duration::minutes(10);
+    RevocationSnapshot::with_max_age(Vec::new(), refreshed_at, time::Duration::minutes(1))
+        .expect("stale revocation snapshot")
+}
+
+fn future_dated_revocation_snapshot() -> RevocationSnapshot {
+    let refreshed_at = OffsetDateTime::now_utc() + time::Duration::minutes(10);
+    RevocationSnapshot::with_max_age(Vec::new(), refreshed_at, time::Duration::minutes(30))
+        .expect("future-dated revocation snapshot")
+}
+
+fn fill_child_response_outbox(
+    manager: &LocalDelegationManager,
+    parent: &AgentContext,
+    child: &AgentContext,
+    parent_run_id: &RunId,
+    child_run_id: &RunId,
+) {
+    let recorder = SimpleRecorder {
+        run_id: parent_run_id.clone(),
+    };
+    for index in 0..1024 {
+        let response = TaskResponse::new(
+            parent_run_id.clone(),
+            child_run_id.clone(),
+            TaskResponseStatus::Completed,
+            Some(serde_json::json!({ "filler": index })),
+            None,
+        )
+        .expect("filler response");
+        let message = Message::new(
+            MessageId::new(),
+            child.agent_id.clone(),
+            parent.agent_id.clone(),
+            parent_run_id.clone(),
+            TASK_RESPONSE_SCHEMA,
+            serde_json::to_value(response).expect("filler response payload"),
+            None,
+            false,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("filler message");
+        manager
+            .router()
+            .send(
+                &recorder,
+                MessageEnvelope::new(message).expect("filler envelope"),
+            )
+            .expect("filler message routed");
+    }
+}
+
+struct CreatedDelegation {
+    manager: LocalDelegationManager,
+    parent: AgentContext,
+    child: AgentContext,
+    parent_run_id: RunId,
+    child_run_id: RunId,
+    parent_runtime: KernelRuntime,
+    child_runtime: KernelRuntime,
+    parent_events: Arc<Mutex<Vec<TraceEvent>>>,
+    child_events: Arc<Mutex<Vec<TraceEvent>>>,
+    authority_evidence: LocalDelegationAuthorityEvidence,
+}
+
+struct CreatedNestedDelegation {
+    manager: LocalDelegationManager,
+    parent_runtime: KernelRuntime,
+    child_runtime: KernelRuntime,
+    grandchild_runtime: KernelRuntime,
+    parent_events: Arc<Mutex<Vec<TraceEvent>>>,
+    child_events: Arc<Mutex<Vec<TraceEvent>>>,
+    grandchild_events: Arc<Mutex<Vec<TraceEvent>>>,
+    root_grant: ValidatedCapabilityGrant,
+    first: LocalChildRun,
+    second: LocalChildRun,
+}
+
+fn create_nested_delegation() -> CreatedNestedDelegation {
+    let (
+        manager,
+        parent,
+        mut child,
+        parent_principal,
+        child_principal,
+        parent_run_id,
+        child_run_id,
+    ) = setup_manager();
+    let grandchild_id = AgentId::new();
+    let grandchild_principal = PrincipalId::new();
+    let grandchild_run_id = RunId::new();
+    child.config.isolation = AgentIsolationPolicy {
+        allowed_message_schemas: vec![
+            TASK_REQUEST_SCHEMA.to_string(),
+            TASK_RESPONSE_SCHEMA.to_string(),
+        ],
+        allowed_message_recipients: vec![parent.agent_id.clone(), grandchild_id.clone()],
+        ..AgentIsolationPolicy::default()
+    };
+    manager
+        .register_agent_with_principal(
+            child.clone(),
+            child_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("child delegation policy registered");
+    let grandchild = AgentContext::new(
+        grandchild_id,
+        parent.tenant_id.clone(),
+        AgentRuntimeConfig {
+            isolation: AgentIsolationPolicy {
+                allowed_message_schemas: vec![TASK_RESPONSE_SCHEMA.to_string()],
+                allowed_message_recipients: vec![child.agent_id.clone()],
+                ..AgentIsolationPolicy::default()
+            },
+            ..AgentRuntimeConfig::default()
+        },
+    );
+    manager
+        .register_agent_with_principal(
+            grandchild.clone(),
+            grandchild_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("grandchild registered");
+
+    let first_request =
+        delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let second_request = delegation_request(
+        &child,
+        &grandchild,
+        child_run_id.clone(),
+        grandchild_run_id.clone(),
+    );
+    let root_grant = parent_grant_for_requests(
+        &parent_principal,
+        &parent.tenant_id,
+        &[&first_request, &second_request],
+    );
+    manager
+        .bind_root_run_capability_grant_with_edges(
+            &parent_run_id,
+            &root_grant,
+            vec![
+                LocalDelegationRuntimeEdge::new(
+                    parent.agent_id.clone(),
+                    parent_run_id.clone(),
+                    child.agent_id.clone(),
+                    child_run_id.clone(),
+                ),
+                LocalDelegationRuntimeEdge::new(
+                    child.agent_id.clone(),
+                    child_run_id.clone(),
+                    grandchild.agent_id.clone(),
+                    grandchild_run_id.clone(),
+                ),
+            ],
+        )
+        .expect("nested root authority bound");
+
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id);
+    let (child_runtime, child_events) = runtime_for(child_run_id);
+    let (grandchild_runtime, grandchild_events) = runtime_for(grandchild_run_id);
+    let mut first_authority = LocalDelegationAuthority::new(
+        root_grant.clone(),
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    first_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
+    first_authority.max_fan_out = u32::MAX;
+    let first = manager
+        .create_child_run(
+            &parent_runtime,
+            &child_runtime,
+            first_request,
+            first_authority,
+        )
+        .expect("first nested edge created");
+
+    let mut second_authority = manager
+        .child_authority_for_run(
+            &first.run.run_id,
+            grandchild_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("nested child authority");
+    second_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(1),
+        max_action_duration_ms: Some(250),
+        ..AuthorityBudgetScope::default()
+    };
+    second_authority.max_fan_out = 1;
+    let second = manager
+        .create_child_run(
+            &child_runtime,
+            &grandchild_runtime,
+            second_request,
+            second_authority,
+        )
+        .expect("second nested edge created");
+
+    CreatedNestedDelegation {
+        manager,
+        parent_runtime,
+        child_runtime,
+        grandchild_runtime,
+        parent_events,
+        child_events,
+        grandchild_events,
+        root_grant,
+        first,
+        second,
+    }
+}
+
+fn create_delegation_for_revocation() -> CreatedDelegation {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let child_run = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect("child run created");
+    let authority_evidence = child_run
+        .run
+        .authority_evidence
+        .clone()
+        .expect("authority evidence");
+    CreatedDelegation {
+        manager,
+        parent,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        parent_events,
+        child_events,
+        authority_evidence,
+    }
+}
+
 fn count_events(events: &[TraceEvent], predicate: impl Fn(&TraceEventKind) -> bool) -> usize {
     events.iter().filter(|event| predicate(&event.kind)).count()
 }
 
+fn assert_run_record_unchanged(before: &LocalRunRecord, after: &LocalRunRecord) {
+    assert_eq!(after.run_id, before.run_id);
+    assert_eq!(after.agent_id, before.agent_id);
+    assert_eq!(after.principal_id, before.principal_id);
+    assert_eq!(after.tenant_id, before.tenant_id);
+    assert_eq!(after.parent_run_id, before.parent_run_id);
+    assert_eq!(after.child_run_ids, before.child_run_ids);
+    assert_eq!(after.authority, before.authority);
+    assert_eq!(after.capability_grant_id, before.capability_grant_id);
+    assert_eq!(after.authority_evidence, before.authority_evidence);
+    assert_eq!(after.objective, before.objective);
+    assert_eq!(after.parent_trace_id, before.parent_trace_id);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.request_message_id, before.request_message_id);
+    assert_eq!(after.response_message_id, before.response_message_id);
+}
+
+struct DeniedDelegationEffects<'a> {
+    manager: &'a LocalDelegationManager,
+    parent: &'a AgentContext,
+    child: &'a AgentContext,
+    parent_run_id: &'a RunId,
+    child_run_id: &'a RunId,
+    parent_before: &'a LocalRunRecord,
+    parent_events: &'a Arc<Mutex<Vec<TraceEvent>>>,
+    child_events: &'a Arc<Mutex<Vec<TraceEvent>>>,
+    expected_reason: &'a str,
+}
+
+fn assert_delegation_rejected_without_effects(input: DeniedDelegationEffects<'_>) {
+    let parent_after = input
+        .manager
+        .run(input.parent_run_id)
+        .expect("parent remains registered");
+    assert_run_record_unchanged(input.parent_before, &parent_after);
+    assert!(
+        input.manager.run(input.child_run_id).is_err(),
+        "child record not inserted"
+    );
+    assert!(input
+        .manager
+        .router()
+        .outbox(&input.parent.agent_id, input.parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(input
+        .manager
+        .router()
+        .inbox(&input.child.agent_id, input.parent_run_id)
+        .expect("child inbox")
+        .is_empty());
+    assert!(input.child_events.lock().expect("child events").is_empty());
+    let parent_events = input.parent_events.lock().expect("parent events");
+    assert_eq!(parent_events.len(), 1, "only one rejection is recorded");
+    assert!(matches!(
+        &parent_events[0].kind,
+        TraceEventKind::DelegationRejected { reason, .. } if reason == input.expected_reason
+    ));
+    let replay = replay_local_delegations(&parent_events);
+    assert_eq!(replay.delegations.len(), 1);
+    assert!(replay.messages.is_empty());
+    assert!(replay.failures.is_empty());
+    assert_eq!(replay.rejections.len(), 1);
+    assert_eq!(replay.rejections[0].reason, input.expected_reason);
+    assert_eq!(
+        replay.rejections[0].delegation.parent_run_id,
+        *input.parent_run_id
+    );
+    assert_eq!(
+        replay.rejections[0].delegation.child_run_id,
+        *input.child_run_id
+    );
+    assert_eq!(
+        replay.rejections[0].delegation.source_agent_id,
+        input.parent.agent_id
+    );
+    assert_eq!(
+        replay.rejections[0].delegation.target_agent_id,
+        input.child.agent_id
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ParentGrantReplayCase {
+    DifferentTenant,
+    DifferentParentAgentSharedPrincipal,
+    DifferentParentPrincipal,
+    DifferentParentRun,
+    DifferentChildAgent,
+    DifferentChildRun,
+    DifferentAudience,
+    UnrelatedTrustedGrant,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SameIdParentGrantMutationCase {
+    Operation,
+    Tenant,
+    Agent,
+    Run,
+    Audience,
+    Budget,
+    NotBefore,
+    Expiry,
+    Revocation,
+    ValidationDigest,
+}
+
+fn parent_grant_with_same_id_mutation(
+    grant_id: CapabilityGrantId,
+    issuer: &PrincipalId,
+    parent_principal: &PrincipalId,
+    request: &LocalDelegationRequest,
+    tenant_id: &TenantId,
+    now: OffsetDateTime,
+    mutation: Option<SameIdParentGrantMutationCase>,
+) -> ValidatedCapabilityGrant {
+    let mut actions = request.delegated_authority.allowed_actions.clone();
+    let mut profile_tenant = tenant_id.clone();
+    let mut profile_agent = request.target_agent_id.clone();
+    let mut profile_run = request.child_run_id.clone();
+    let mut audience = AUTHORITY_AUDIENCE.to_string();
+    let mut quotas = AuthorityBudgetScope {
+        max_actions_per_tick: Some(4),
+        max_action_duration_ms: Some(1_000),
+        ..AuthorityBudgetScope::default()
+    };
+    let mut not_before = now - time::Duration::minutes(1);
+    let mut expires_at = now + time::Duration::minutes(30);
+    let mut revocation = RevocationStatus::Active;
+    let mut validation_digest = AUTHORITY_DIGEST.to_string();
+
+    match mutation {
+        None => {}
+        Some(SameIdParentGrantMutationCase::Operation) => {
+            actions.push("publish".to_string());
+        }
+        Some(SameIdParentGrantMutationCase::Tenant) => profile_tenant = TenantId::new(),
+        Some(SameIdParentGrantMutationCase::Agent) => profile_agent = AgentId::new(),
+        Some(SameIdParentGrantMutationCase::Run) => profile_run = RunId::new(),
+        Some(SameIdParentGrantMutationCase::Audience) => {
+            audience = "daemon:other".to_string();
+        }
+        Some(SameIdParentGrantMutationCase::Budget) => {
+            quotas.max_actions_per_tick = Some(3);
+        }
+        Some(SameIdParentGrantMutationCase::NotBefore) => {
+            not_before -= time::Duration::minutes(1);
+        }
+        Some(SameIdParentGrantMutationCase::Expiry) => {
+            expires_at -= time::Duration::minutes(1);
+        }
+        Some(SameIdParentGrantMutationCase::Revocation) => {
+            revocation = RevocationStatus::Revoked {
+                reason: "same_id_mutation".to_string(),
+            };
+        }
+        Some(SameIdParentGrantMutationCase::ValidationDigest) => {
+            validation_digest =
+                "blake3:9999999999999999999999999999999999999999999999999999999999999999"
+                    .to_string();
+        }
+    }
+
+    grant_from_legacy_allowlists(
+        CompatibilityGrantContext {
+            grant_id,
+            issuer: issuer.clone(),
+            subject: parent_principal.clone(),
+            audience,
+            validation_digest,
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: profile_tenant,
+            agent_id: profile_agent,
+            run_id: Some(profile_run),
+            quotas,
+        },
+        &actions,
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        not_before,
+        expires_at,
+        revocation,
+        Some("local_delegation:same-id-mutation".to_string()),
+    )
+    .expect("same-ID validated grant mutation")
+}
+
 #[test]
-fn parent_creates_child_with_explicit_target_objective_and_trace_links() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+fn root_run_grant_binding_is_idempotent_unique_and_subject_bound() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id);
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    let grant_id = authority
+        .parent_capability_grant
+        .as_ref()
+        .expect("legacy root grant")
+        .grant()
+        .grant_id
+        .clone();
+
+    let first = manager
+        .bind_root_run_capability_grant(
+            &parent_run_id,
+            authority
+                .parent_capability_grant
+                .as_ref()
+                .expect("legacy root grant"),
+        )
+        .expect("first trusted binding succeeds");
+    let retry = manager
+        .bind_root_run_capability_grant(
+            &parent_run_id,
+            authority
+                .parent_capability_grant
+                .as_ref()
+                .expect("legacy root grant"),
+        )
+        .expect("same run and grant binding is idempotent");
+    assert_eq!(first.capability_grant_id, Some(grant_id.clone()));
+    assert_eq!(retry.capability_grant_id, first.capability_grant_id);
+    let manager_debug = format!("{manager:?}");
+    assert!(manager_debug.contains("<redacted trusted grant bindings>"));
+    assert!(!manager_debug.contains(&grant_id.to_string()));
+
+    let other_grant = parent_grant_for_request(&parent_principal, &request, &parent.tenant_id);
+    let error = manager
+        .bind_root_run_capability_grant(&parent_run_id, &other_grant)
+        .expect_err("different grant cannot replace root binding");
+    assert!(matches!(
+        error,
+        LocalDelegationError::ParentRunGrantBindingConflict {
+            run_id,
+            bound_grant_id,
+            supplied_grant_id,
+        } if run_id == parent_run_id
+            && bound_grant_id == grant_id
+            && supplied_grant_id == other_grant.grant().grant_id
+    ));
+
+    let other_run_id = RunId::new();
+    manager
+        .register_root_run(other_run_id.clone(), parent.agent_id.clone())
+        .expect("second root registered");
+    let error = manager
+        .bind_root_run_capability_grant(
+            &other_run_id,
+            authority
+                .parent_capability_grant
+                .as_ref()
+                .expect("legacy root grant"),
+        )
+        .expect_err("same grant cannot bind another root run");
+    assert!(matches!(
+        error,
+        LocalDelegationError::CapabilityGrantRunBindingConflict {
+            grant_id: conflict_grant_id,
+            bound_run_id,
+            requested_run_id,
+        } if conflict_grant_id == grant_id
+            && bound_run_id == parent_run_id
+            && requested_run_id == other_run_id
+    ));
+
+    let wrong_subject_grant =
+        parent_grant_for_request(&PrincipalId::new(), &request, &parent.tenant_id);
+    let error = manager
+        .bind_root_run_capability_grant(&other_run_id, &wrong_subject_grant)
+        .expect_err("grant subject must match root principal snapshot");
+    assert!(matches!(
+        error,
+        LocalDelegationError::ParentRunGrantSubjectMismatch { run_id, .. }
+            if run_id == other_run_id
+    ));
+    assert!(manager
+        .run(&other_run_id)
+        .expect("other root remains unbound")
+        .capability_grant_id
+        .is_none());
+
+    let (parent_runtime, _) = runtime_for(parent_run_id.clone());
+    let (child_runtime, _) = runtime_for(request.child_run_id.clone());
+    let created = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority.clone())
+        .expect("bound root creates child");
+    let child_grant_id = created
+        .run
+        .authority_evidence
+        .as_ref()
+        .expect("child authority evidence")
+        .child_capability_grant_id
+        .clone();
+    assert_eq!(
+        created.run.capability_grant_id.as_ref(),
+        Some(&child_grant_id)
+    );
+    let error = manager
+        .bind_root_run_capability_grant(
+            &created.run.run_id,
+            authority
+                .parent_capability_grant
+                .as_ref()
+                .expect("legacy root grant"),
+        )
+        .expect_err("child is auto-bound evidence state, not an explicit root binding target");
+    assert!(matches!(
+        error,
+        LocalDelegationError::ParentGrantBindingRequiresRootRun(run_id)
+            if run_id == created.run.run_id
+    ));
+}
+
+#[test]
+fn same_id_different_validated_parent_grant_content_denies_before_effects() {
+    for mutation in [
+        SameIdParentGrantMutationCase::Operation,
+        SameIdParentGrantMutationCase::Tenant,
+        SameIdParentGrantMutationCase::Agent,
+        SameIdParentGrantMutationCase::Run,
+        SameIdParentGrantMutationCase::Audience,
+        SameIdParentGrantMutationCase::Budget,
+        SameIdParentGrantMutationCase::NotBefore,
+        SameIdParentGrantMutationCase::Expiry,
+        SameIdParentGrantMutationCase::Revocation,
+        SameIdParentGrantMutationCase::ValidationDigest,
+    ] {
+        let (
+            manager,
+            parent,
+            child,
+            parent_principal,
+            child_principal,
+            parent_run_id,
+            child_run_id,
+        ) = setup_manager();
+        let request =
+            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+        let grant_id = CapabilityGrantId::new();
+        let issuer = PrincipalId::new();
+        let now = OffsetDateTime::now_utc();
+        let bound_grant = parent_grant_with_same_id_mutation(
+            grant_id.clone(),
+            &issuer,
+            &parent_principal,
+            &request,
+            &parent.tenant_id,
+            now,
+            None,
+        );
+        manager
+            .bind_root_run_capability_grant(&parent_run_id, &bound_grant)
+            .expect("exact parent grant bound");
+        let mutated_grant = parent_grant_with_same_id_mutation(
+            grant_id,
+            &issuer,
+            &parent_principal,
+            &request,
+            &parent.tenant_id,
+            now,
+            Some(mutation),
+        );
+        assert_ne!(bound_grant, mutated_grant, "case {mutation:?}");
+        let bind_error = manager
+            .bind_root_run_capability_grant(&parent_run_id, &mutated_grant)
+            .expect_err("same ID with different validated content is not idempotent");
+        assert!(matches!(
+            bind_error,
+            LocalDelegationError::ParentRunGrantBindingConflict {
+                bound_grant_id,
+                supplied_grant_id,
+                ..
+            } if bound_grant_id == supplied_grant_id
+        ));
+        let mut mutated_authority = LocalDelegationAuthority::new(
+            mutated_grant,
+            child_principal.clone(),
+            AUTHORITY_AUDIENCE,
+            now,
+        );
+        mutated_authority.max_fan_out = 3;
+        let parent_before = manager.run(&parent_run_id).expect("bound parent");
+        let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+        let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+
+        let error = manager
+            .create_child_run(&parent_runtime, &child_runtime, request, mutated_authority)
+            .expect_err("same ID with different validated content must deny");
+        assert!(matches!(
+            error,
+            LocalDelegationError::AuthorityDenied { reason }
+                if reason == REASON_PARENT_RUN_GRANT_MISMATCH
+        ));
+        assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+            manager: &manager,
+            parent: &parent,
+            child: &child,
+            parent_run_id: &parent_run_id,
+            child_run_id: &child_run_id,
+            parent_before: &parent_before,
+            parent_events: &parent_events,
+            child_events: &child_events,
+            expected_reason: REASON_PARENT_RUN_GRANT_MISMATCH,
+        });
+    }
+}
+
+#[test]
+fn missing_parent_run_grant_binding_denies_once_without_downstream_effects() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    let parent_before = manager.run(&parent_run_id).expect("unbound parent");
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, child_events) = runtime_for(child_run_id.clone());
 
-    let child_run = manager
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("unbound root cannot delegate");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason }
+            if reason == REASON_MISSING_PARENT_RUN_GRANT_BINDING
+    ));
+    assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+        manager: &manager,
+        parent: &parent,
+        child: &child,
+        parent_run_id: &parent_run_id,
+        child_run_id: &child_run_id,
+        parent_before: &parent_before,
+        parent_events: &parent_events,
+        child_events: &child_events,
+        expected_reason: REASON_MISSING_PARENT_RUN_GRANT_BINDING,
+    });
+}
+
+#[test]
+fn caller_supplied_child_grant_id_cannot_collide_with_root_binding() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let mut authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    authority
+        .authority_evidence
+        .as_mut()
+        .expect("authority evidence")
+        .child_capability_grant_id = authority
+        .parent_capability_grant
+        .as_ref()
+        .expect("legacy root grant")
+        .grant()
+        .grant_id
+        .clone();
+    let forged_id = authority
+        .authority_evidence
+        .as_ref()
+        .expect("test evidence")
+        .child_capability_grant_id
+        .clone();
+    let (parent_runtime, _) = runtime_for(parent_run_id.clone());
+    let (child_runtime, _) = runtime_for(child_run_id.clone());
+    let created = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect("manager ignores caller-supplied child grant IDs");
+    assert_ne!(created.run.capability_grant_id, Some(forged_id));
+}
+
+#[test]
+fn sibling_cannot_choose_an_existing_child_grant_id() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, first_run_id) =
+        setup_manager();
+    let second_run_id = RunId::new();
+    let first_request =
+        delegation_request(&parent, &child, parent_run_id.clone(), first_run_id.clone());
+    let second_request = delegation_request(
+        &parent,
+        &child,
+        parent_run_id.clone(),
+        second_run_id.clone(),
+    );
+    let parent_grant = parent_grant_for_requests(
+        &parent_principal,
+        &parent.tenant_id,
+        &[&first_request, &second_request],
+    );
+    manager
+        .bind_root_run_capability_grant(&parent_run_id, &parent_grant)
+        .expect("multi-scope parent grant bound once");
+    let mut first_authority = LocalDelegationAuthority::new(
+        parent_grant.clone(),
+        child_principal.clone(),
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    first_authority.max_fan_out = 3;
+    first_authority.budget.max_actions_per_tick = Some(2);
+    first_authority.budget.max_action_duration_ms = Some(500);
+    let (parent_runtime, _) = runtime_for(parent_run_id.clone());
+    let (first_runtime, _) = runtime_for(first_run_id.clone());
+    let first_child = manager
+        .create_child_run(
+            &parent_runtime,
+            &first_runtime,
+            first_request,
+            first_authority,
+        )
+        .expect("first sibling child created");
+    let issued_child_grant_id = first_child
+        .run
+        .capability_grant_id
+        .clone()
+        .expect("first child grant ID");
+
+    let mut second_authority = LocalDelegationAuthority::new(
+        parent_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    second_authority.max_fan_out = 3;
+    second_authority.budget.max_actions_per_tick = Some(2);
+    second_authority.budget.max_action_duration_ms = Some(500);
+    second_authority
+        .authority_evidence
+        .as_mut()
+        .expect("second authority evidence")
+        .child_capability_grant_id = issued_child_grant_id;
+    let forged_id = second_authority
+        .authority_evidence
+        .as_ref()
+        .expect("test evidence")
+        .child_capability_grant_id
+        .clone();
+    let (collision_parent_runtime, _) = runtime_for(parent_run_id.clone());
+    let (second_runtime, _) = runtime_for(second_run_id.clone());
+    let created = manager
+        .create_child_run(
+            &collision_parent_runtime,
+            &second_runtime,
+            second_request,
+            second_authority,
+        )
+        .expect("manager allocates a fresh child grant ID");
+    assert_ne!(created.run.capability_grant_id, Some(forged_id));
+}
+
+#[test]
+fn multi_scope_root_denies_cartesian_agent_run_substitution() {
+    let (
+        manager,
+        parent,
+        first_child,
+        parent_principal,
+        first_child_principal,
+        parent_run_id,
+        first_run_id,
+    ) = setup_manager();
+    let second_child = AgentContext::new(
+        AgentId::new(),
+        parent.tenant_id.clone(),
+        AgentRuntimeConfig::default(),
+    );
+    let second_child_principal = PrincipalId::new();
+    manager
+        .register_agent_with_principal(
+            second_child.clone(),
+            second_child_principal,
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("second child registered");
+    let second_run_id = RunId::new();
+    let first_request =
+        delegation_request(&parent, &first_child, parent_run_id.clone(), first_run_id);
+    let second_request = delegation_request(
+        &parent,
+        &second_child,
+        parent_run_id.clone(),
+        second_run_id.clone(),
+    );
+    let root_grant = parent_grant_for_requests(
+        &parent_principal,
+        &parent.tenant_id,
+        &[&first_request, &second_request],
+    );
+    manager
+        .bind_root_run_capability_grant(&parent_run_id, &root_grant)
+        .expect("exact child bindings registered");
+
+    let substituted_request = delegation_request(
+        &parent,
+        &first_child,
+        parent_run_id.clone(),
+        second_run_id.clone(),
+    );
+    let substituted_authority = LocalDelegationAuthority::new(
+        root_grant,
+        first_child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    let (parent_runtime, _) = runtime_for(parent_run_id);
+    let (child_runtime, _) = runtime_for(second_run_id.clone());
+    let error = manager
         .create_child_run(
             &parent_runtime,
             &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
+            substituted_request,
+            substituted_authority,
         )
+        .expect_err("listed identities cannot be recombined into an unbound pair");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { ref reason }
+            if reason == "delegation_child_runtime_binding_denied"
+    ));
+    assert!(matches!(
+        manager.run(&second_run_id),
+        Err(LocalDelegationError::UnknownChildRun(ref run_id)) if run_id == &second_run_id
+    ));
+}
+
+#[test]
+fn cross_tenant_caller_cannot_choose_an_existing_child_grant_id() {
+    let (manager, parent_a, child_a, principal_a, child_principal_a, run_a, child_run_a) =
+        setup_manager();
+    let request_a = delegation_request(&parent_a, &child_a, run_a.clone(), child_run_a.clone());
+    let authority_a = authority_input(&principal_a, &child_principal_a, &parent_a, &request_a);
+    bind_parent_authority(&manager, &run_a, &authority_a);
+    let (runtime_a, _) = runtime_for(run_a);
+    let (child_runtime_a, _) = runtime_for(child_run_a);
+    let created_a = manager
+        .create_child_run(&runtime_a, &child_runtime_a, request_a, authority_a)
+        .expect("tenant A child created");
+    let issued_child_grant_id = created_a
+        .run
+        .capability_grant_id
+        .expect("tenant A child grant ID");
+
+    let tenant_b = TenantId::new();
+    let parent_b_principal = PrincipalId::new();
+    let child_b_principal = PrincipalId::new();
+    let child_b_id = AgentId::new();
+    let parent_b = AgentContext::new(
+        AgentId::new(),
+        tenant_b.clone(),
+        AgentRuntimeConfig {
+            isolation: AgentIsolationPolicy {
+                allowed_message_schemas: vec![TASK_REQUEST_SCHEMA.to_string()],
+                allowed_message_recipients: vec![child_b_id.clone()],
+                ..AgentIsolationPolicy::default()
+            },
+            ..AgentRuntimeConfig::default()
+        },
+    );
+    let child_b = AgentContext::new(child_b_id, tenant_b, AgentRuntimeConfig::default());
+    manager
+        .register_agent_with_principal(
+            parent_b.clone(),
+            parent_b_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("tenant B parent registered");
+    manager
+        .register_agent_with_principal(
+            child_b.clone(),
+            child_b_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("tenant B child registered");
+    let run_b = RunId::new();
+    let child_run_b = RunId::new();
+    manager
+        .register_root_run(run_b.clone(), parent_b.agent_id.clone())
+        .expect("tenant B root registered");
+    let request_b = delegation_request(&parent_b, &child_b, run_b.clone(), child_run_b.clone());
+    let mut authority_b = authority_input(
+        &parent_b_principal,
+        &child_b_principal,
+        &parent_b,
+        &request_b,
+    );
+    bind_parent_authority(&manager, &run_b, &authority_b);
+    authority_b
+        .authority_evidence
+        .as_mut()
+        .expect("tenant B authority evidence")
+        .child_capability_grant_id = issued_child_grant_id;
+    let forged_id = authority_b
+        .authority_evidence
+        .as_ref()
+        .expect("test evidence")
+        .child_capability_grant_id
+        .clone();
+    let (parent_runtime_b, _) = runtime_for(run_b.clone());
+    let (child_runtime_b, _) = runtime_for(child_run_b.clone());
+    let created = manager
+        .create_child_run(&parent_runtime_b, &child_runtime_b, request_b, authority_b)
+        .expect("manager allocates a tenant-bound fresh child grant ID");
+    assert_ne!(created.run.capability_grant_id, Some(forged_id));
+}
+
+#[test]
+fn recursive_local_delegation_rejects_broader_replacement_grant_before_effects() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let child_request =
+        delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let child_authority =
+        authority_input(&parent_principal, &child_principal, &parent, &child_request);
+    bind_parent_authority(&manager, &parent_run_id, &child_authority);
+    let (parent_runtime, _) = runtime_for(parent_run_id);
+    let (child_runtime, _) = runtime_for(child_run_id.clone());
+    manager
+        .create_child_run(
+            &parent_runtime,
+            &child_runtime,
+            child_request,
+            child_authority,
+        )
+        .expect("child run created and auto-bound to issued grant ID");
+
+    let grandchild_principal = PrincipalId::new();
+    let grandchild = AgentContext::new(
+        AgentId::new(),
+        child.tenant_id.clone(),
+        AgentRuntimeConfig::default(),
+    );
+    manager
+        .register_agent_with_principal(
+            grandchild.clone(),
+            grandchild_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("grandchild registered");
+    let grandchild_run_id = RunId::new();
+    let grandchild_request = delegation_request(
+        &child,
+        &grandchild,
+        child_run_id.clone(),
+        grandchild_run_id.clone(),
+    );
+    let replacement_authority = authority_input(
+        &child_principal,
+        &grandchild_principal,
+        &child,
+        &grandchild_request,
+    );
+    let child_before = manager.run(&child_run_id).expect("auto-bound child record");
+    let (child_parent_runtime, child_parent_events) = runtime_for(child_run_id.clone());
+    let (grandchild_runtime, grandchild_events) = runtime_for(grandchild_run_id.clone());
+
+    let error = manager
+        .create_child_run(
+            &child_parent_runtime,
+            &grandchild_runtime,
+            grandchild_request,
+            replacement_authority,
+        )
+        .expect_err("a broader replacement grant cannot authorize recursive delegation");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason }
+            if reason == REASON_PARENT_RUN_GRANT_MISMATCH
+    ));
+    assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+        manager: &manager,
+        parent: &child,
+        child: &grandchild,
+        parent_run_id: &child_run_id,
+        child_run_id: &grandchild_run_id,
+        parent_before: &child_before,
+        parent_events: &child_parent_events,
+        child_events: &grandchild_events,
+        expected_reason: REASON_PARENT_RUN_GRANT_MISMATCH,
+    });
+}
+
+#[test]
+fn reused_parent_capability_grant_confused_deputy_replay_matrix() {
+    {
+        let (
+            manager,
+            parent,
+            child,
+            parent_principal,
+            child_principal,
+            parent_run_id,
+            child_run_id,
+        ) = setup_manager();
+        let request =
+            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+        let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+        bind_parent_authority(&manager, &parent_run_id, &authority);
+        let (parent_runtime, _) = runtime_for(parent_run_id);
+        let (child_runtime, _) = runtime_for(child_run_id.clone());
+
+        let created = manager
+            .create_child_run(&parent_runtime, &child_runtime, request, authority)
+            .expect("intended bound context creates exactly one child");
+        assert_eq!(created.run.run_id, child_run_id);
+        let issued_grant_id = created
+            .run
+            .authority_evidence
+            .as_ref()
+            .expect("child authority evidence")
+            .child_capability_grant_id
+            .clone();
+        assert_eq!(
+            created.run.capability_grant_id.as_ref(),
+            Some(&issued_grant_id)
+        );
+        assert_eq!(created.run.principal_id, child_principal);
+    }
+
+    for case in [
+        ParentGrantReplayCase::DifferentTenant,
+        ParentGrantReplayCase::DifferentParentAgentSharedPrincipal,
+        ParentGrantReplayCase::DifferentParentPrincipal,
+        ParentGrantReplayCase::DifferentParentRun,
+        ParentGrantReplayCase::DifferentChildAgent,
+        ParentGrantReplayCase::DifferentChildRun,
+        ParentGrantReplayCase::DifferentAudience,
+        ParentGrantReplayCase::UnrelatedTrustedGrant,
+    ] {
+        let (
+            manager,
+            mut parent,
+            mut child,
+            parent_principal,
+            mut child_principal,
+            intended_parent_run_id,
+            intended_child_run_id,
+        ) = setup_manager();
+        let intended_request = delegation_request(
+            &parent,
+            &child,
+            intended_parent_run_id.clone(),
+            intended_child_run_id.clone(),
+        );
+        let intended_authority = authority_input(
+            &parent_principal,
+            &child_principal,
+            &parent,
+            &intended_request,
+        );
+        manager
+            .bind_root_run_capability_grant(
+                &intended_parent_run_id,
+                intended_authority
+                    .parent_capability_grant
+                    .as_ref()
+                    .expect("legacy root grant"),
+            )
+            .expect("intended root binding");
+
+        let mut parent_run_id = intended_parent_run_id.clone();
+        let mut child_run_id = intended_child_run_id.clone();
+        let mut request = intended_request;
+        let mut delegation_authority = intended_authority;
+        let expected_reason = match case {
+            ParentGrantReplayCase::DifferentTenant => {
+                // Grant-ID uniqueness is intentionally manager-local. This
+                // isolated manager exercises only the trusted grant's tenant
+                // scope; it is not cross-manager or cross-instance binding proof.
+                let other_tenant = TenantId::new();
+                parent.tenant_id = other_tenant.clone();
+                child.tenant_id = other_tenant;
+                let isolated_manager = LocalDelegationManager::new();
+                isolated_manager
+                    .register_agent_with_principal(
+                        parent.clone(),
+                        parent_principal.clone(),
+                        authority(
+                            &["query", "publish"],
+                            &["sql", "artifact"],
+                            &["finance.read", "artifact.publish"],
+                        ),
+                    )
+                    .expect("other-tenant parent registered");
+                isolated_manager
+                    .register_agent_with_principal(
+                        child.clone(),
+                        child_principal.clone(),
+                        authority(&["query"], &["sql"], &["finance.read"]),
+                    )
+                    .expect("other-tenant child registered");
+                isolated_manager
+                    .register_root_run(parent_run_id.clone(), parent.agent_id.clone())
+                    .expect("other-tenant root registered");
+                isolated_manager
+                    .bind_root_run_capability_grant(
+                        &parent_run_id,
+                        delegation_authority
+                            .parent_capability_grant
+                            .as_ref()
+                            .expect("legacy root grant"),
+                    )
+                    .expect("trusted grant explicitly bound in isolated manager");
+                request = delegation_request(
+                    &parent,
+                    &child,
+                    parent_run_id.clone(),
+                    child_run_id.clone(),
+                );
+                let parent_before = isolated_manager.run(&parent_run_id).expect("bound parent");
+                let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+                let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+                let error = isolated_manager
+                    .create_child_run(
+                        &parent_runtime,
+                        &child_runtime,
+                        request,
+                        delegation_authority,
+                    )
+                    .expect_err("tenant replay denied");
+                assert!(matches!(
+                    error,
+                    LocalDelegationError::AuthorityDenied { reason } if reason == "overbroad_scope"
+                ));
+                assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+                    manager: &isolated_manager,
+                    parent: &parent,
+                    child: &child,
+                    parent_run_id: &parent_run_id,
+                    child_run_id: &child_run_id,
+                    parent_before: &parent_before,
+                    parent_events: &parent_events,
+                    child_events: &child_events,
+                    expected_reason: "overbroad_scope",
+                });
+                continue;
+            }
+            ParentGrantReplayCase::DifferentParentAgentSharedPrincipal => {
+                let different_parent = AgentContext::new(
+                    AgentId::new(),
+                    parent.tenant_id.clone(),
+                    AgentRuntimeConfig {
+                        isolation: AgentIsolationPolicy {
+                            allowed_message_schemas: vec![TASK_REQUEST_SCHEMA.to_string()],
+                            allowed_message_recipients: vec![child.agent_id.clone()],
+                            ..AgentIsolationPolicy::default()
+                        },
+                        ..AgentRuntimeConfig::default()
+                    },
+                );
+                manager
+                    .register_agent_with_principal(
+                        different_parent.clone(),
+                        parent_principal.clone(),
+                        authority(
+                            &["query", "publish"],
+                            &["sql", "artifact"],
+                            &["finance.read", "artifact.publish"],
+                        ),
+                    )
+                    .expect("shared-principal parent registered");
+                parent = different_parent;
+                parent_run_id = RunId::new();
+                manager
+                    .register_root_run(parent_run_id.clone(), parent.agent_id.clone())
+                    .expect("shared-principal root registered");
+                let bind_error = manager
+                    .bind_root_run_capability_grant(
+                        &parent_run_id,
+                        delegation_authority
+                            .parent_capability_grant
+                            .as_ref()
+                            .expect("legacy root grant"),
+                    )
+                    .expect_err("grant ID is already bound to intended root");
+                assert!(matches!(
+                    bind_error,
+                    LocalDelegationError::CapabilityGrantRunBindingConflict { .. }
+                ));
+                request = delegation_request(
+                    &parent,
+                    &child,
+                    parent_run_id.clone(),
+                    child_run_id.clone(),
+                );
+                REASON_MISSING_PARENT_RUN_GRANT_BINDING
+            }
+            ParentGrantReplayCase::DifferentParentPrincipal => {
+                let different_principal = PrincipalId::new();
+                parent_run_id = RunId::new();
+                manager
+                    .register_agent_with_principal(
+                        parent.clone(),
+                        different_principal,
+                        authority(
+                            &["query", "publish"],
+                            &["sql", "artifact"],
+                            &["finance.read", "artifact.publish"],
+                        ),
+                    )
+                    .expect("future runs use different principal");
+                manager
+                    .register_root_run(parent_run_id.clone(), parent.agent_id.clone())
+                    .expect("different-principal root registered");
+                let bind_error = manager
+                    .bind_root_run_capability_grant(
+                        &parent_run_id,
+                        delegation_authority
+                            .parent_capability_grant
+                            .as_ref()
+                            .expect("legacy root grant"),
+                    )
+                    .expect_err("grant subject does not match different-principal root");
+                assert!(matches!(
+                    bind_error,
+                    LocalDelegationError::ParentRunGrantSubjectMismatch { .. }
+                ));
+                request = delegation_request(
+                    &parent,
+                    &child,
+                    parent_run_id.clone(),
+                    child_run_id.clone(),
+                );
+                REASON_MISSING_PARENT_RUN_GRANT_BINDING
+            }
+            ParentGrantReplayCase::DifferentParentRun => {
+                parent_run_id = RunId::new();
+                manager
+                    .register_root_run(parent_run_id.clone(), parent.agent_id.clone())
+                    .expect("different parent run registered");
+                let bind_error = manager
+                    .bind_root_run_capability_grant(
+                        &parent_run_id,
+                        delegation_authority
+                            .parent_capability_grant
+                            .as_ref()
+                            .expect("legacy root grant"),
+                    )
+                    .expect_err("grant ID cannot move to different parent run");
+                assert!(matches!(
+                    bind_error,
+                    LocalDelegationError::CapabilityGrantRunBindingConflict { .. }
+                ));
+                request = delegation_request(
+                    &parent,
+                    &child,
+                    parent_run_id.clone(),
+                    child_run_id.clone(),
+                );
+                REASON_MISSING_PARENT_RUN_GRANT_BINDING
+            }
+            ParentGrantReplayCase::DifferentChildAgent => {
+                let different_child = AgentContext::new(
+                    AgentId::new(),
+                    child.tenant_id.clone(),
+                    AgentRuntimeConfig::default(),
+                );
+                child_principal = PrincipalId::new();
+                manager
+                    .register_agent_with_principal(
+                        different_child.clone(),
+                        child_principal.clone(),
+                        authority(&["query"], &["sql"], &["finance.read"]),
+                    )
+                    .expect("different child registered");
+                child = different_child;
+                request = delegation_request(
+                    &parent,
+                    &child,
+                    parent_run_id.clone(),
+                    child_run_id.clone(),
+                );
+                delegation_authority.child_subject = child_principal;
+                "delegation_child_runtime_binding_denied"
+            }
+            ParentGrantReplayCase::DifferentChildRun => {
+                child_run_id = RunId::new();
+                request = delegation_request(
+                    &parent,
+                    &child,
+                    parent_run_id.clone(),
+                    child_run_id.clone(),
+                );
+                "delegation_child_runtime_binding_denied"
+            }
+            ParentGrantReplayCase::DifferentAudience => {
+                delegation_authority.audience = "daemon:other".to_string();
+                "overbroad_audience"
+            }
+            ParentGrantReplayCase::UnrelatedTrustedGrant => {
+                delegation_authority.parent_capability_grant = Some(parent_grant_for_request(
+                    &parent_principal,
+                    &request,
+                    &parent.tenant_id,
+                ));
+                delegation_authority.authority_evidence =
+                    Some(LocalDelegationAuthorityEvidence::issued(
+                        delegation_authority
+                            .parent_capability_grant
+                            .as_ref()
+                            .expect("legacy root grant")
+                            .grant()
+                            .grant_id
+                            .clone(),
+                        CapabilityGrantId::new(),
+                    ));
+                REASON_PARENT_RUN_GRANT_MISMATCH
+            }
+        };
+
+        let parent_before = manager.run(&parent_run_id).expect("attempt parent");
+        let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+        let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+        let error = manager
+            .create_child_run(
+                &parent_runtime,
+                &child_runtime,
+                request,
+                delegation_authority,
+            )
+            .unwrap_err();
+        let actual_reason = match &error {
+            LocalDelegationError::AuthorityDenied { reason }
+            | LocalDelegationError::AuthorityEvidenceDenied { reason } => reason.as_str(),
+            other => panic!("{case:?} returned unexpected error: {other:?}"),
+        };
+        assert_eq!(actual_reason, expected_reason, "case {case:?}");
+        assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+            manager: &manager,
+            parent: &parent,
+            child: &child,
+            parent_run_id: &parent_run_id,
+            child_run_id: &child_run_id,
+            parent_before: &parent_before,
+            parent_events: &parent_events,
+            child_events: &child_events,
+            expected_reason,
+        });
+    }
+}
+
+#[test]
+fn parent_creates_child_with_explicit_target_objective_and_trace_links() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let child_authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &child_authority);
+
+    let child_run = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, child_authority)
         .expect("child run created");
 
     assert_eq!(child_run.run.parent_run_id, Some(parent_run_id.clone()));
     assert_eq!(child_run.run.agent_id, child.agent_id);
+    assert_eq!(child_run.run.principal_id, child_principal);
     assert_eq!(child_run.run.status, LocalRunStatus::Running);
+    let authority_evidence = child_run
+        .run
+        .authority_evidence
+        .clone()
+        .expect("child run records authority evidence");
     assert_eq!(
-        child_run.child_agent.delegated_authority,
-        Some(authority(&["query"], &["sql"], &["finance.read"]))
+        child_run.run.capability_grant_id,
+        Some(authority_evidence.child_capability_grant_id.clone())
+    );
+    assert_eq!(
+        child_run.child_agent.delegated_authority(),
+        Some(&authority(&["query"], &["sql"], &["finance.read"]))
     );
     assert_eq!(
         child_run.request_message.message.payload["objective"].as_str(),
         Some("summarize receivables")
+    );
+    let task_request = TaskRequest::from_payload(&child_run.request_message.message.payload)
+        .expect("task request payload decodes");
+    assert_eq!(
+        task_request.authority_evidence,
+        Some(authority_evidence.clone())
     );
 
     let parent_record = manager.run(&parent_run_id).expect("parent record");
@@ -210,6 +1896,7 @@ fn parent_creates_child_with_explicit_target_objective_and_trace_links() {
             assert_eq!(delegation.child_run_id, child_run_id);
             assert!(delegation.parent_trace_id.is_some());
             assert!(delegation.request_message_id.is_some());
+            assert_eq!(delegation.authority_evidence, Some(authority_evidence));
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -217,17 +1904,20 @@ fn parent_creates_child_with_explicit_target_objective_and_trace_links() {
 
 #[test]
 fn delegated_scope_cannot_exceed_parent_or_target_authority() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, _parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, _child_events) = runtime_for(child_run_id.clone());
-    let mut request = delegation_request(&parent, &child, parent_run_id, child_run_id);
+    let mut request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id);
     request
         .delegated_authority
         .allowed_actions
         .push("publish".to_string());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
 
     let error = manager
-        .create_child_run(&parent_runtime, &child_runtime, request)
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect_err("target cannot receive publish authority");
 
     assert!(matches!(
@@ -237,16 +1927,415 @@ fn delegated_scope_cannot_exceed_parent_or_target_authority() {
 }
 
 #[test]
+fn authority_denial_rejects_before_delegation_requested_routing_or_child_insert() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let limited_parent_grant = parent_grant_with_allowlists(
+        &parent_principal,
+        &request,
+        &parent.tenant_id,
+        &["other.query".to_string()],
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        AuthorityBudgetScope {
+            max_actions_per_tick: Some(4),
+            max_action_duration_ms: Some(1_000),
+            ..AuthorityBudgetScope::default()
+        },
+    );
+    let mut authority = LocalDelegationAuthority::new(
+        limited_parent_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 3;
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("authority denies overbroad child grant");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason } if reason == "overbroad_operation"
+    ));
+    assert!(
+        manager.run(&child_run_id).is_err(),
+        "child record not inserted"
+    );
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(manager
+        .router()
+        .inbox(&child.agent_id, &parent_run_id)
+        .expect("child inbox")
+        .is_empty());
+    assert!(child_events.lock().expect("child events").is_empty());
+    let parent_events = parent_events.lock().expect("parent events");
+    assert_eq!(
+        count_events(&parent_events, |kind| matches!(
+            kind,
+            TraceEventKind::DelegationRequested { .. }
+        )),
+        0
+    );
+    assert!(parent_events.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::DelegationRejected { reason, delegation }
+            if reason == "overbroad_operation"
+                && delegation.authority_evidence.as_ref().is_some_and(|evidence|
+                    evidence.authority_reason.as_deref() == Some("overbroad_operation"))
+    )));
+}
+
+#[test]
+fn unrelated_parent_grant_denies_before_routing_or_child_insert() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let bound_authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &bound_authority);
+    let wrong_parent_grant =
+        parent_grant_for_request(&PrincipalId::new(), &request, &parent.tenant_id);
+    let mut authority = LocalDelegationAuthority::new(
+        wrong_parent_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 3;
+
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("wrong parent principal grant denied");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason }
+            if reason == REASON_PARENT_RUN_GRANT_MISMATCH
+    ));
+    assert!(
+        manager.run(&child_run_id).is_err(),
+        "child record not inserted"
+    );
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(manager
+        .router()
+        .inbox(&child.agent_id, &parent_run_id)
+        .expect("child inbox")
+        .is_empty());
+    assert!(child_events.lock().expect("child events").is_empty());
+    let parent_events = parent_events.lock().expect("parent events");
+    assert_eq!(
+        count_events(&parent_events, |kind| matches!(
+            kind,
+            TraceEventKind::DelegationRequested { .. }
+        )),
+        0
+    );
+    assert!(parent_events.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::DelegationRejected { reason, .. }
+            if reason == REASON_PARENT_RUN_GRANT_MISMATCH
+    )));
+}
+
+#[test]
+fn parent_run_principal_binding_survives_agent_reregistration() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let replacement_parent_principal = PrincipalId::new();
+    manager
+        .register_agent_with_principal(
+            parent.clone(),
+            replacement_parent_principal.clone(),
+            authority(
+                &["query", "publish"],
+                &["sql", "artifact"],
+                &["finance.read", "artifact.publish"],
+            ),
+        )
+        .expect("parent can be re-registered for future runs");
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let original_parent_grant =
+        parent_grant_for_request(&parent_principal, &request, &parent.tenant_id);
+    manager
+        .bind_root_run_capability_grant(&parent_run_id, &original_parent_grant)
+        .expect("root run retains original principal grant binding");
+    let replacement_parent_grant =
+        parent_grant_for_request(&replacement_parent_principal, &request, &parent.tenant_id);
+    let mut authority = LocalDelegationAuthority::new(
+        replacement_parent_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 3;
+
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("existing parent run keeps its original principal binding");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason }
+            if reason == REASON_PARENT_RUN_GRANT_MISMATCH
+    ));
+    assert!(manager.run(&child_run_id).is_err());
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(child_events.lock().expect("child events").is_empty());
+    let parent_events = parent_events.lock().expect("parent events");
+    assert_eq!(
+        count_events(&parent_events, |kind| matches!(
+            kind,
+            TraceEventKind::DelegationRequested { .. }
+        )),
+        0
+    );
+}
+
+#[test]
+fn not_yet_valid_parent_grant_denies_at_actual_decision_time() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let future_not_before = OffsetDateTime::now_utc() + time::Duration::minutes(10);
+    let future_parent_grant = parent_grant_with_allowlists_and_window(
+        &parent_principal,
+        &request,
+        &parent.tenant_id,
+        &request.delegated_authority.allowed_actions,
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        AuthorityBudgetScope {
+            max_actions_per_tick: Some(4),
+            max_action_duration_ms: Some(1_000),
+            ..AuthorityBudgetScope::default()
+        },
+        future_not_before,
+        future_not_before + time::Duration::minutes(30),
+    );
+    let mut authority = LocalDelegationAuthority::new(
+        future_parent_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 3;
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("future parent grant is not valid yet");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason }
+            if reason == "parent_not_yet_valid"
+    ));
+    assert!(manager.run(&child_run_id).is_err());
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(child_events.lock().expect("child events").is_empty());
+    let parent_events = parent_events.lock().expect("parent events");
+    assert_eq!(
+        count_events(&parent_events, |kind| matches!(
+            kind,
+            TraceEventKind::DelegationRequested { .. }
+        )),
+        0
+    );
+    assert!(parent_events.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::DelegationRejected { reason, .. } if reason == "parent_not_yet_valid"
+    )));
+}
+
+#[test]
+fn expired_parent_grant_denies_at_actual_decision_time() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let expired_at = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    let expired_parent_grant = parent_grant_with_allowlists_and_window(
+        &parent_principal,
+        &request,
+        &parent.tenant_id,
+        &request.delegated_authority.allowed_actions,
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        AuthorityBudgetScope {
+            max_actions_per_tick: Some(4),
+            max_action_duration_ms: Some(1_000),
+            ..AuthorityBudgetScope::default()
+        },
+        expired_at - time::Duration::minutes(30),
+        expired_at,
+    );
+    let mut authority = LocalDelegationAuthority::new(
+        expired_parent_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 3;
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("expired parent grant is denied");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason } if reason == "parent_expired"
+    ));
+    assert!(manager.run(&child_run_id).is_err());
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(child_events.lock().expect("child events").is_empty());
+    let parent_events = parent_events.lock().expect("parent events");
+    assert_eq!(
+        count_events(&parent_events, |kind| matches!(
+            kind,
+            TraceEventKind::DelegationRequested { .. }
+        )),
+        0
+    );
+    assert!(parent_events.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::DelegationRejected { reason, .. } if reason == "parent_expired"
+    )));
+}
+
+#[test]
+fn future_child_grant_window_denies_before_routing_or_child_insert() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let mut authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    authority.not_before = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+
+    let error = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("future child grant must not start immediately");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { reason }
+            if reason == "child_grant_not_yet_valid"
+    ));
+    assert!(manager.run(&child_run_id).is_err());
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("parent outbox")
+        .is_empty());
+    assert!(manager
+        .router()
+        .inbox(&child.agent_id, &parent_run_id)
+        .expect("child inbox")
+        .is_empty());
+    assert!(child_events.lock().expect("child events").is_empty());
+    let parent_events = parent_events.lock().expect("parent events");
+    assert_eq!(
+        count_events(&parent_events, |kind| matches!(
+            kind,
+            TraceEventKind::DelegationRequested { .. }
+        )),
+        0
+    );
+    assert!(parent_events.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::DelegationRejected { reason, delegation }
+            if reason == "child_grant_not_yet_valid"
+                && delegation.authority_evidence.as_ref().is_some_and(|evidence|
+                    evidence.authority_reason.as_deref() == Some("child_grant_not_yet_valid"))
+    )));
+}
+
+#[test]
+fn missing_authority_evidence_is_not_replaced_by_task_payload_authority() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let mut forged_task_request = TaskRequest::new(
+        parent_run_id.clone(),
+        child_run_id.clone(),
+        child.agent_id.clone(),
+        "summarize receivables",
+        request.delegated_authority.clone(),
+    )
+    .expect("task request can be forged as data");
+    forged_task_request.authority_evidence = Some(LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::new(),
+        CapabilityGrantId::new(),
+    ));
+    assert!(
+        forged_task_request.validate().is_err(),
+        "wrong grant ref fails before routing"
+    );
+
+    let mut authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    authority.authority_evidence = None;
+    let created = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect("manager-owned caller, not payload evidence, authorizes creation");
+    let routed = TaskRequest::from_payload(&created.request_message.message.payload)
+        .expect("manager-built v2 task request");
+    assert_eq!(
+        Some(routed.capability_grant_id),
+        created.run.capability_grant_id
+    );
+    assert!(!parent_events.lock().expect("parent events").is_empty());
+    assert!(!child_events.lock().expect("child events").is_empty());
+}
+
+#[test]
 fn duplicate_child_run_id_is_rejected_before_task_message_or_state_mutation() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, _child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("first child run created");
 
     let parent_outbox_len = manager
@@ -260,11 +2349,20 @@ fn duplicate_child_run_id_is_rejected_before_task_message_or_state_mutation() {
         .expect("child inbox")
         .len();
     let (duplicate_child_runtime, duplicate_child_events) = runtime_for(child_run_id.clone());
+    let duplicate_request =
+        delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let duplicate_authority = authority_input(
+        &parent_principal,
+        &child_principal,
+        &parent,
+        &duplicate_request,
+    );
     let error = manager
         .create_child_run(
             &parent_runtime,
             &duplicate_child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
+            duplicate_request,
+            duplicate_authority,
         )
         .expect_err("duplicate child run ID rejected");
 
@@ -312,16 +2410,90 @@ fn duplicate_child_run_id_is_rejected_before_task_message_or_state_mutation() {
 }
 
 #[test]
-fn failed_child_run_returns_structured_task_response_and_replays_causality() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
-    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
-    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+fn active_child_run_id_cannot_be_registered_as_root() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        child_run_id,
+        ..
+    } = create_delegation_for_revocation();
+    let before = manager.run(&child_run_id).expect("active child record");
+
+    let error = manager
+        .register_root_run(child_run_id.clone(), parent.agent_id)
+        .expect_err("active child cannot be replaced by broader root authority");
+
+    assert!(matches!(error, LocalDelegationError::DuplicateRun(id) if id == child_run_id));
+    let after = manager.run(&child_run_id).expect("active child preserved");
+    assert_run_record_unchanged(&before, &after);
+    assert_eq!(after.status, LocalRunStatus::Running);
+    assert!(after.parent_run_id.is_some());
+    assert!(after.authority_evidence.is_some());
+}
+
+#[test]
+fn cancelled_child_run_id_cannot_be_reregistered_or_resurrected() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
     manager
-        .create_child_run(
+        .cancel_child_if_authority_revoked(
             &parent_runtime,
             &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
+            &child_run_id,
+            &revocations,
         )
+        .expect("revocation cancellation succeeds")
+        .expect("child cancelled");
+    let before = manager.run(&child_run_id).expect("cancelled child record");
+
+    let error = manager
+        .register_root_run(child_run_id.clone(), parent.agent_id)
+        .expect_err("cancelled child cannot be resurrected as root");
+
+    assert!(matches!(error, LocalDelegationError::DuplicateRun(id) if id == child_run_id));
+    let after = manager
+        .run(&child_run_id)
+        .expect("cancelled child preserved");
+    assert_run_record_unchanged(&before, &after);
+    assert_eq!(after.status, LocalRunStatus::Cancelled);
+}
+
+#[test]
+fn duplicate_root_run_registration_is_rejected_without_mutation() {
+    let (manager, _parent, child, _, _, parent_run_id, _) = setup_manager();
+    let before = manager.run(&parent_run_id).expect("root record");
+
+    let error = manager
+        .register_root_run(parent_run_id.clone(), child.agent_id)
+        .expect_err("existing root cannot be replaced");
+
+    assert!(matches!(error, LocalDelegationError::DuplicateRun(id) if id == parent_run_id));
+    let after = manager.run(&parent_run_id).expect("root preserved");
+    assert_run_record_unchanged(&before, &after);
+    assert_eq!(after.status, LocalRunStatus::Running);
+    assert!(after.parent_run_id.is_none());
+    assert!(after.authority_evidence.is_none());
+}
+
+#[test]
+fn failed_child_run_returns_structured_task_response_and_replays_causality() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("child run created");
 
     let failure = TaskFailure::new("specialist_failed", "specialist policy failed", false);
@@ -353,20 +2525,552 @@ fn failed_child_run_returns_structured_task_response_and_replays_causality() {
 }
 
 #[test]
+fn revoked_child_grant_cancels_active_child_and_replays_failure() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        parent_events,
+        child_events,
+        authority_evidence,
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("revocation check succeeds")
+        .expect("child grant revocation cancels child run");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("cancellation failure");
+    assert_eq!(failure.code, REASON_AUTHORITY_GRANT_REVOKED);
+    assert!(!failure.retryable);
+    assert!(failure.trace_id.is_some());
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+    assert!(manager
+        .router()
+        .outbox(&child.agent_id, &parent_run_id)
+        .expect("child response outbox")
+        .iter()
+        .any(|envelope| envelope.message.schema == TASK_RESPONSE_SCHEMA));
+    assert!(manager
+        .router()
+        .inbox(&parent.agent_id, &parent_run_id)
+        .expect("parent response inbox")
+        .iter()
+        .any(|envelope| envelope.message.schema == TASK_RESPONSE_SCHEMA));
+
+    let mut events = parent_events.lock().expect("parent events").clone();
+    events.extend(child_events.lock().expect("child events").clone());
+    let replay = replay_local_delegations(&events);
+    assert_eq!(replay.delegations.len(), 1);
+    assert_eq!(replay.failures.len(), 2, "child and parent failure traces");
+    assert!(replay
+        .failures
+        .iter()
+        .all(|failure| failure.code == REASON_AUTHORITY_GRANT_REVOKED && !failure.retryable));
+}
+
+#[test]
+fn revoked_parent_grant_cancels_active_child() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.parent_capability_grant_id);
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("revocation check succeeds")
+        .expect("parent grant revocation cancels child run");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("cancellation failure");
+    assert_eq!(failure.code, REASON_AUTHORITY_GRANT_REVOKED);
+    assert!(!failure.retryable);
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+}
+
+#[test]
+fn stale_revocation_snapshot_cancels_active_child_fail_closed() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = stale_revocation_snapshot();
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("stale snapshot cancellation finishes")
+        .expect("stale snapshot cancels active child");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("stale snapshot failure");
+    assert_eq!(failure.code, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE);
+    assert!(!failure.retryable);
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+}
+
+#[test]
+fn future_dated_revocation_snapshot_cancels_active_child_fail_closed() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = future_dated_revocation_snapshot();
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("future snapshot cancellation finishes")
+        .expect("future snapshot cancels active child");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("future snapshot failure");
+    assert_eq!(
+        failure.code,
+        REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED
+    );
+    assert!(!failure.retryable);
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+}
+
+#[test]
+fn missing_authority_evidence_on_known_child_cancels_fail_closed() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        ..
+    } = create_delegation_for_revocation();
+    {
+        let mut state = manager.lock_state().expect("delegation state");
+        let child = state
+            .runs
+            .get_mut(&child_run_id)
+            .expect("known child record");
+        assert!(child.parent_run_id.is_some());
+        child.authority_evidence = None;
+    }
+    let now = OffsetDateTime::now_utc();
+    let revocations =
+        RevocationSnapshot::with_max_age(Vec::new(), now, time::Duration::minutes(30))
+            .expect("live revocation snapshot");
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("missing evidence cancellation finishes")
+        .expect("known child with missing evidence cancels");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("missing evidence failure");
+    assert_eq!(failure.code, "missing_authority_evidence");
+    assert!(!failure.retryable);
+    let child = manager.run(&child_run_id).expect("cancelled child record");
+    assert_eq!(child.status, LocalRunStatus::Cancelled);
+    assert!(child.parent_run_id.is_some());
+    assert!(child.authority_evidence.is_none());
+}
+
+#[test]
+fn revocation_trace_failure_still_marks_child_cancelled() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+    let failing_child_recorder = FailingRecorder {
+        run_id: child_run_id.clone(),
+    };
+
+    let error = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &failing_child_recorder,
+            &child_run_id,
+            &revocations,
+        )
+        .expect_err("child trace failure surfaces");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::Router(MessageRouterError::StorageUnavailable)
+    ));
+    let child_record = manager.run(&child_run_id).expect("child record");
+    assert_eq!(child_record.status, LocalRunStatus::Cancelled);
+    assert!(child_record.response_message_id.is_none());
+}
+
+#[test]
+fn concurrent_root_registration_and_revocation_cannot_leave_child_running() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        parent_run_id,
+        child_run_id,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    let manager = Arc::new(manager);
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+    let parent_recorder = Arc::new(SimpleRecorder {
+        run_id: parent_run_id,
+    });
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let child_recorder = Arc::new(BlockingRevocationRecorder {
+        run_id: child_run_id.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Arc::clone(&release),
+    });
+
+    let cancel_manager = Arc::clone(&manager);
+    let cancel_child_id = child_run_id.clone();
+    let cancel_parent_recorder = Arc::clone(&parent_recorder);
+    let cancel_child_recorder = Arc::clone(&child_recorder);
+    let cancel_handle = std::thread::spawn(move || {
+        cancel_manager.cancel_child_if_authority_revoked(
+            cancel_parent_recorder.as_ref(),
+            cancel_child_recorder.as_ref(),
+            &cancel_child_id,
+            &revocations,
+        )
+    });
+
+    entered_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .expect("revocation marked child cancelled and reached trace recording");
+
+    let register_manager = Arc::clone(&manager);
+    let register_child_id = child_run_id.clone();
+    let register_agent_id = parent.agent_id;
+    let (register_tx, register_rx) = mpsc::channel();
+    let register_handle = std::thread::spawn(move || {
+        let result =
+            register_manager.register_root_run(register_child_id.clone(), register_agent_id);
+        let duplicate_rejected = matches!(
+            result,
+            Err(LocalDelegationError::DuplicateRun(id)) if id == register_child_id
+        );
+        register_tx
+            .send(duplicate_rejected)
+            .expect("register result sent");
+    });
+
+    assert!(
+        register_rx
+            .recv_timeout(StdDuration::from_millis(50))
+            .is_err(),
+        "root registration must wait for revocation lifecycle"
+    );
+
+    let (lock, cvar) = &*release;
+    *lock.lock().expect("release lock") = true;
+    cvar.notify_all();
+
+    cancel_handle
+        .join()
+        .expect("cancel thread")
+        .expect("revocation cancellation succeeds")
+        .expect("child cancelled");
+    assert!(
+        register_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("register result received"),
+        "root registration rejects existing child ID"
+    );
+    register_handle.join().expect("register thread");
+
+    let child = manager.run(&child_run_id).expect("child record preserved");
+    assert_eq!(child.status, LocalRunStatus::Cancelled);
+    assert!(child.parent_run_id.is_some());
+    assert!(child.authority_evidence.is_some());
+}
+
+#[test]
+fn revocation_response_routing_failure_still_marks_child_cancelled() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    fill_child_response_outbox(&manager, &parent, &child, &parent_run_id, &child_run_id);
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+
+    let error = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect_err("response routing failure surfaces");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::Router(MessageRouterError::OutboxFull { .. })
+    ));
+    let child_record = manager.run(&child_run_id).expect("child record");
+    assert_eq!(child_record.status, LocalRunStatus::Cancelled);
+    assert!(child_record.response_message_id.is_none());
+}
+
+#[test]
+fn unrelated_revocation_is_noop_and_child_remains_running() {
+    let CreatedDelegation {
+        manager,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        parent_events,
+        child_events,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(CapabilityGrantId::new());
+    let parent_failure_count =
+        count_events(&parent_events.lock().expect("parent events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { .. })
+        });
+    let child_failure_count = count_events(&child_events.lock().expect("child events"), |kind| {
+        matches!(kind, TraceEventKind::ChildRunFailed { .. })
+    });
+    let response_outbox_len = manager
+        .router()
+        .outbox(&child.agent_id, &parent_run_id)
+        .expect("child response outbox")
+        .len();
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("revocation check succeeds");
+
+    assert!(response.is_none());
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Running
+    );
+    assert_eq!(
+        manager
+            .router()
+            .outbox(&child.agent_id, &parent_run_id)
+            .expect("child response outbox")
+            .len(),
+        response_outbox_len
+    );
+    assert_eq!(
+        count_events(&parent_events.lock().expect("parent events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { .. })
+        }),
+        parent_failure_count
+    );
+    assert_eq!(
+        count_events(&child_events.lock().expect("child events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { .. })
+        }),
+        child_failure_count
+    );
+}
+
+#[test]
+fn terminal_children_are_not_cancelled_again_by_revocation_snapshot() {
+    fn assert_terminal_noop(
+        terminalize: impl FnOnce(&LocalDelegationManager, &KernelRuntime, &KernelRuntime, &RunId),
+        expected_status: LocalRunStatus,
+    ) {
+        let CreatedDelegation {
+            manager,
+            child,
+            parent_run_id,
+            child_run_id,
+            parent_runtime,
+            child_runtime,
+            parent_events,
+            child_events,
+            authority_evidence,
+            ..
+        } = create_delegation_for_revocation();
+        terminalize(&manager, &parent_runtime, &child_runtime, &child_run_id);
+        let parent_failure_count =
+            count_events(&parent_events.lock().expect("parent events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            });
+        let child_failure_count =
+            count_events(&child_events.lock().expect("child events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            });
+        let response_outbox_len = manager
+            .router()
+            .outbox(&child.agent_id, &parent_run_id)
+            .expect("child response outbox")
+            .len();
+        let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+
+        let response = manager
+            .cancel_child_if_authority_revoked(
+                &parent_runtime,
+                &child_runtime,
+                &child_run_id,
+                &revocations,
+            )
+            .expect("terminal child revocation check is a no-op");
+
+        assert!(response.is_none());
+        assert_eq!(
+            manager.run(&child_run_id).expect("child record").status,
+            expected_status
+        );
+        assert_eq!(
+            manager
+                .router()
+                .outbox(&child.agent_id, &parent_run_id)
+                .expect("child response outbox")
+                .len(),
+            response_outbox_len
+        );
+        assert_eq!(
+            count_events(&parent_events.lock().expect("parent events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            }),
+            parent_failure_count
+        );
+        assert_eq!(
+            count_events(&child_events.lock().expect("child events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            }),
+            child_failure_count
+        );
+    }
+
+    assert_terminal_noop(
+        |manager, parent_runtime, child_runtime, child_run_id| {
+            manager
+                .complete_child_run(
+                    parent_runtime,
+                    child_runtime,
+                    child_run_id,
+                    serde_json::json!({"summary_ref": "artifact:summary"}),
+                )
+                .expect("child completed");
+        },
+        LocalRunStatus::Completed,
+    );
+    assert_terminal_noop(
+        |manager, parent_runtime, child_runtime, child_run_id| {
+            manager
+                .fail_child_run(
+                    parent_runtime,
+                    child_runtime,
+                    child_run_id,
+                    TaskFailure::new("specialist_failed", "specialist failed", false),
+                )
+                .expect("child failed");
+        },
+        LocalRunStatus::Failed,
+    );
+    assert_terminal_noop(
+        |manager, parent_runtime, child_runtime, child_run_id| {
+            let evidence = manager
+                .run(child_run_id)
+                .expect("child record")
+                .authority_evidence
+                .expect("authority evidence");
+            let revocations = revocation_snapshot_for(evidence.child_capability_grant_id);
+            manager
+                .cancel_child_if_authority_revoked(
+                    parent_runtime,
+                    child_runtime,
+                    child_run_id,
+                    &revocations,
+                )
+                .expect("child cancelled")
+                .expect("first revocation cancels child");
+        },
+        LocalRunStatus::Cancelled,
+    );
+}
+
+#[test]
 fn cancelled_parent_prevents_new_child_delegation_and_records_trace() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, _child_events) = runtime_for(child_run_id.clone());
     manager
         .cancel_parent_run(&parent_runtime, &parent_run_id, "operator_cancelled")
         .expect("cancel parent");
 
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id);
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     let error = manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect_err("cancelled parent rejects delegation");
     assert!(matches!(error, LocalDelegationError::ParentCancelled(id) if id == parent_run_id));
 
@@ -381,8 +3085,125 @@ fn cancelled_parent_prevents_new_child_delegation_and_records_trace() {
 }
 
 #[test]
+fn concurrent_root_grant_bindings_serialize_to_one_exact_winner() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let manager = Arc::new(manager);
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id);
+    let grant_a = authority_input(&parent_principal, &child_principal, &parent, &request)
+        .parent_capability_grant
+        .expect("legacy root grant");
+    let grant_b = parent_grant_for_request(&parent_principal, &request, &parent.tenant_id);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let manager_a = Arc::clone(&manager);
+    let run_a = parent_run_id.clone();
+    let barrier_a = Arc::clone(&barrier);
+    let grant_a_id = grant_a.grant().grant_id.clone();
+    let handle_a = std::thread::spawn(move || {
+        barrier_a.wait();
+        manager_a.bind_root_run_capability_grant(&run_a, &grant_a)
+    });
+    let manager_b = Arc::clone(&manager);
+    let run_b = parent_run_id.clone();
+    let barrier_b = Arc::clone(&barrier);
+    let grant_b_id = grant_b.grant().grant_id.clone();
+    let handle_b = std::thread::spawn(move || {
+        barrier_b.wait();
+        manager_b.bind_root_run_capability_grant(&run_b, &grant_b)
+    });
+    barrier.wait();
+
+    let result_a = handle_a.join().expect("binding thread A");
+    let result_b = handle_b.join().expect("binding thread B");
+    assert_ne!(result_a.is_ok(), result_b.is_ok());
+    let error = if let Err(error) = result_a {
+        error
+    } else {
+        result_b.expect_err("one concurrent binding must lose")
+    };
+    assert!(matches!(
+        error,
+        LocalDelegationError::ParentRunGrantBindingConflict { .. }
+    ));
+    let bound_id = manager
+        .run(&parent_run_id)
+        .expect("root remains bound")
+        .capability_grant_id
+        .expect("winning binding ID");
+    assert!(bound_id == grant_a_id || bound_id == grant_b_id);
+}
+
+#[test]
+fn root_grant_rebind_waits_for_inflight_child_creation_lifecycle() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let manager = Arc::new(manager);
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let replacement_grant =
+        parent_grant_for_request(&parent_principal, &request, &parent.tenant_id);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let parent_recorder = Arc::new(BlockingDelegationRecorder {
+        run_id: parent_run_id.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Arc::clone(&release),
+    });
+    let child_recorder = Arc::new(SimpleRecorder {
+        run_id: child_run_id,
+    });
+
+    let create_manager = Arc::clone(&manager);
+    let create_parent_recorder = Arc::clone(&parent_recorder);
+    let create_child_recorder = Arc::clone(&child_recorder);
+    let create_handle = std::thread::spawn(move || {
+        create_manager.create_child_run(
+            create_parent_recorder.as_ref(),
+            create_child_recorder.as_ref(),
+            request,
+            authority,
+        )
+    });
+    entered_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .expect("child creation holds lifecycle lock at request trace");
+
+    let bind_manager = Arc::clone(&manager);
+    let bind_run_id = parent_run_id.clone();
+    let (bind_tx, bind_rx) = mpsc::channel();
+    let bind_handle = std::thread::spawn(move || {
+        let result = bind_manager.bind_root_run_capability_grant(&bind_run_id, &replacement_grant);
+        bind_tx.send(result).expect("bind result sent");
+    });
+    assert!(
+        bind_rx.recv_timeout(StdDuration::from_millis(50)).is_err(),
+        "rebind must wait for in-flight child creation"
+    );
+
+    let (lock, cvar) = &*release;
+    *lock.lock().expect("release lock") = true;
+    cvar.notify_all();
+    create_handle
+        .join()
+        .expect("create thread")
+        .expect("child creation succeeds");
+    let bind_error = bind_rx
+        .recv_timeout(StdDuration::from_secs(1))
+        .expect("bind result received")
+        .expect_err("replacement binding fails after create completes");
+    assert!(matches!(
+        bind_error,
+        LocalDelegationError::ParentRunGrantBindingConflict { .. }
+    ));
+    bind_handle.join().expect("bind thread");
+}
+
+#[test]
 fn delegation_creation_and_parent_cancellation_are_serialized() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let manager = Arc::new(manager);
     let (entered_tx, entered_rx) = mpsc::channel();
     let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -395,6 +3216,8 @@ fn delegation_creation_and_parent_cancellation_are_serialized() {
         run_id: child_run_id.clone(),
     });
     let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
 
     let create_manager = Arc::clone(&manager);
     let create_parent_recorder = Arc::clone(&parent_recorder);
@@ -404,6 +3227,7 @@ fn delegation_creation_and_parent_cancellation_are_serialized() {
             create_parent_recorder.as_ref(),
             create_child_recorder.as_ref(),
             request,
+            authority,
         )
     });
 
@@ -458,21 +3282,21 @@ fn delegation_creation_and_parent_cancellation_are_serialized() {
             .run(&created.run.run_id)
             .expect("child record")
             .status,
-        LocalRunStatus::Running
+        LocalRunStatus::Cancelled
     );
 }
 
 #[test]
 fn completed_child_run_returns_response_and_parent_completion_trace() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("child run created");
 
     let response = manager
@@ -515,15 +3339,15 @@ fn completed_child_run_returns_response_and_parent_completion_trace() {
 
 #[test]
 fn repeated_child_completion_is_rejected_without_duplicate_response() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("child run created");
 
     manager
@@ -577,15 +3401,15 @@ fn repeated_child_completion_is_rejected_without_duplicate_response() {
 
 #[test]
 fn repeated_child_failure_is_rejected_without_duplicate_failure_trace() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("child run created");
 
     manager
@@ -650,15 +3474,15 @@ fn repeated_child_failure_is_rejected_without_duplicate_failure_trace() {
 
 #[test]
 fn child_failure_after_completion_is_rejected_without_failure_trace() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("child run created");
     manager
         .complete_child_run(
@@ -716,7 +3540,8 @@ fn child_failure_after_completion_is_rejected_without_failure_trace() {
 
 #[test]
 fn delegation_denies_parent_scope_source_tenant_and_unknown_run_failures() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, _parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, _child_events) = runtime_for(child_run_id.clone());
 
@@ -726,8 +3551,16 @@ fn delegation_denies_parent_scope_source_tenant_and_unknown_run_failures() {
         .delegated_authority
         .allowed_actions
         .push("admin.delete".to_string());
+    let parent_scope_authority =
+        authority_input(&parent_principal, &child_principal, &parent, &parent_scope);
+    bind_parent_authority(&manager, &parent_run_id, &parent_scope_authority);
     let error = manager
-        .create_child_run(&parent_runtime, &child_runtime, parent_scope)
+        .create_child_run(
+            &parent_runtime,
+            &child_runtime,
+            parent_scope,
+            parent_scope_authority,
+        )
         .expect_err("parent authority exceeded");
     assert!(matches!(
         error,
@@ -737,8 +3570,19 @@ fn delegation_denies_parent_scope_source_tenant_and_unknown_run_failures() {
     let mut source_mismatch =
         delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
     source_mismatch.source_agent_id = AgentId::new();
+    let source_mismatch_authority = authority_input(
+        &parent_principal,
+        &child_principal,
+        &parent,
+        &source_mismatch,
+    );
     let error = manager
-        .create_child_run(&parent_runtime, &child_runtime, source_mismatch)
+        .create_child_run(
+            &parent_runtime,
+            &child_runtime,
+            source_mismatch,
+            source_mismatch_authority,
+        )
         .expect_err("source mismatch denied");
     assert!(matches!(error, LocalDelegationError::SourceAgentMismatch));
 
@@ -756,16 +3600,35 @@ fn delegation_denies_parent_scope_source_tenant_and_unknown_run_failures() {
     let mut tenant_mismatch =
         delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
     tenant_mismatch.target_agent_id = other_tenant_agent.agent_id;
+    let tenant_mismatch_authority = authority_input(
+        &parent_principal,
+        &child_principal,
+        &parent,
+        &tenant_mismatch,
+    );
     let error = manager
-        .create_child_run(&parent_runtime, &child_runtime, tenant_mismatch)
+        .create_child_run(
+            &parent_runtime,
+            &child_runtime,
+            tenant_mismatch,
+            tenant_mismatch_authority,
+        )
         .expect_err("tenant mismatch denied");
     assert!(matches!(error, LocalDelegationError::TenantMismatch));
 
+    let unknown_parent_request = delegation_request(&parent, &child, RunId::new(), child_run_id);
+    let authority = authority_input(
+        &parent_principal,
+        &child_principal,
+        &parent,
+        &unknown_parent_request,
+    );
     let unknown_parent = manager
         .create_child_run(
             &parent_runtime,
             &child_runtime,
-            delegation_request(&parent, &child, RunId::new(), child_run_id),
+            unknown_parent_request,
+            authority,
         )
         .expect_err("recorder run mismatch rejected first");
     assert!(matches!(
@@ -805,15 +3668,15 @@ fn registration_and_lookup_fail_closed_for_unknown_agents_and_runs() {
 
 #[test]
 fn replay_collects_rejected_delegation_and_consumed_task_message() {
-    let (manager, parent, child, parent_run_id, child_run_id) = setup_manager();
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
     let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
     let (child_runtime, _child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
     let created = manager
-        .create_child_run(
-            &parent_runtime,
-            &child_runtime,
-            delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone()),
-        )
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
         .expect("child run created");
     manager
         .router()
@@ -830,9 +3693,16 @@ fn replay_collects_rejected_delegation_and_consumed_task_message() {
         .expect("cancel");
     let mut rejected = delegation_request(&parent, &child, parent_run_id, RunId::new());
     rejected.parent_causal_trace_id = None;
+    let rejected_authority =
+        authority_input(&parent_principal, &child_principal, &parent, &rejected);
     let (rejected_child_runtime, _) = runtime_for(rejected.child_run_id.clone());
     let _ = manager
-        .create_child_run(&parent_runtime, &rejected_child_runtime, rejected)
+        .create_child_run(
+            &parent_runtime,
+            &rejected_child_runtime,
+            rejected,
+            rejected_authority,
+        )
         .expect_err("cancelled");
 
     let events = parent_events.lock().expect("events").clone();
@@ -842,4 +3712,1064 @@ fn replay_collects_rejected_delegation_and_consumed_task_message() {
         .messages
         .iter()
         .any(|message| message.schema == TASK_REQUEST_SCHEMA));
+}
+
+#[test]
+fn nested_delegation_stores_complete_chain_and_requires_exact_action_grant_ref() {
+    let nested = create_nested_delegation();
+    let chain_digest = nested
+        .second
+        .run
+        .delegation_chain_digest
+        .as_ref()
+        .expect("redacted nested chain digest");
+    assert!(chain_digest.starts_with("blake3:"));
+
+    let action = Action {
+        name: "query".to_string(),
+        params: serde_json::json!({}),
+        side_effect_class: SideEffectClass::ReadOnly,
+        cost_estimate: None,
+        required_permissions: vec!["finance.read".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let grant_id = nested
+        .second
+        .run
+        .capability_grant_id
+        .as_ref()
+        .expect("child grant ref")
+        .clone();
+    let allowed = nested
+        .second
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action,
+            Some("sql"),
+            &nested.second.run.run_id,
+            Some(&grant_id),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        );
+    assert!(allowed.allowed(), "exact issued grant allows: {allowed:?}");
+    let exhausted = nested
+        .second
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action,
+            Some("sql"),
+            &nested.second.run.run_id,
+            Some(&grant_id),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        );
+    assert_eq!(
+        exhausted.verification.reasons,
+        vec!["delegated_retained_budget_exceeded_max_actions_per_tick".to_string()]
+    );
+    let denied = nested
+        .second
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action,
+            Some("sql"),
+            &nested.second.run.run_id,
+            Some(&CapabilityGrantId::new()),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        );
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["delegated_capability_grant_ref_mismatch".to_string()]
+    );
+
+    let parent_child_grant_id = nested
+        .first
+        .run
+        .capability_grant_id
+        .as_ref()
+        .expect("first child grant")
+        .clone();
+    assert_eq!(
+        nested
+            .manager
+            .child_authority_for_run(
+                &nested.first.run.run_id,
+                PrincipalId::new(),
+                AUTHORITY_AUDIENCE,
+                OffsetDateTime::now_utc(),
+            )
+            .expect("first defaults")
+            .budget
+            .max_actions_per_tick,
+        Some(2)
+    );
+    let parent_spend = nested.first.child_agent.verify_delegated_action_with_grant(
+        &action,
+        Some("sql"),
+        &nested.first.run.run_id,
+        Some(&parent_child_grant_id),
+        QuotaUsage::single_action(),
+        OffsetDateTime::now_utc(),
+        1,
+    );
+    assert!(
+        parent_spend.allowed(),
+        "retained parent budget allows one action: {parent_spend:?}"
+    );
+    let multiplied = nested.first.child_agent.verify_delegated_action_with_grant(
+        &action,
+        Some("sql"),
+        &nested.first.run.run_id,
+        Some(&parent_child_grant_id),
+        QuotaUsage::single_action(),
+        OffsetDateTime::now_utc(),
+        1,
+    );
+    assert!(
+        !multiplied.allowed(),
+        "parent and descendant cannot multiply subtree budget"
+    );
+    drop(allowed);
+    drop(parent_spend);
+
+    nested
+        .manager
+        .complete_child_run(
+            &nested.child_runtime,
+            &nested.grandchild_runtime,
+            &nested.second.run.run_id,
+            serde_json::json!({"ok": true}),
+        )
+        .expect("grandchild complete");
+    let retained_after_cleanup = nested
+        .second
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action,
+            Some("sql"),
+            &nested.second.run.run_id,
+            Some(&grant_id),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            2,
+        );
+    assert_eq!(
+        retained_after_cleanup.verification.reasons,
+        vec!["delegated_authority_inactive".to_string()]
+    );
+}
+
+#[test]
+fn direct_child_cannot_delegate_to_root_sibling_before_traces_routing_or_mutation() {
+    let (
+        manager,
+        mut root,
+        mut first_child,
+        root_principal,
+        first_child_principal,
+        root_run_id,
+        first_child_run_id,
+    ) = setup_manager();
+    let sibling_principal = PrincipalId::new();
+    let sibling_run_id = RunId::new();
+    let sibling = AgentContext::new(
+        AgentId::new(),
+        root.tenant_id.clone(),
+        AgentRuntimeConfig {
+            isolation: AgentIsolationPolicy {
+                allowed_message_schemas: vec![TASK_RESPONSE_SCHEMA.to_string()],
+                allowed_message_recipients: vec![root.agent_id.clone()],
+                ..AgentIsolationPolicy::default()
+            },
+            ..AgentRuntimeConfig::default()
+        },
+    );
+    root.config
+        .isolation
+        .allowed_message_recipients
+        .push(sibling.agent_id.clone());
+    first_child
+        .config
+        .isolation
+        .allowed_message_schemas
+        .push(TASK_REQUEST_SCHEMA.to_string());
+    first_child
+        .config
+        .isolation
+        .allowed_message_recipients
+        .push(sibling.agent_id.clone());
+    manager
+        .register_agent_with_principal(
+            root.clone(),
+            root_principal.clone(),
+            authority(
+                &["query", "publish"],
+                &["sql", "artifact"],
+                &["finance.read", "artifact.publish"],
+            ),
+        )
+        .expect("root isolation updated");
+    manager
+        .register_agent_with_principal(
+            first_child.clone(),
+            first_child_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("child isolation updated");
+    manager
+        .register_agent_with_principal(
+            sibling.clone(),
+            sibling_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("sibling registered");
+
+    let first_request = delegation_request(
+        &root,
+        &first_child,
+        root_run_id.clone(),
+        first_child_run_id.clone(),
+    );
+    let sibling_request =
+        delegation_request(&root, &sibling, root_run_id.clone(), sibling_run_id.clone());
+    let root_grant = parent_grant_for_requests(
+        &root_principal,
+        &root.tenant_id,
+        &[&first_request, &sibling_request],
+    );
+    manager
+        .bind_root_run_capability_grant(&root_run_id, &root_grant)
+        .expect("direct sibling edges bound to root");
+    let (root_runtime, _) = runtime_for(root_run_id.clone());
+    let (first_runtime, _) = runtime_for(first_child_run_id.clone());
+    let mut first_authority = manager
+        .child_authority_for_run(
+            &root_run_id,
+            first_child_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("first child authority");
+    first_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
+    manager
+        .create_child_run(
+            &root_runtime,
+            &first_runtime,
+            first_request,
+            first_authority,
+        )
+        .expect("first direct child created");
+
+    let nested_sibling_request = delegation_request(
+        &first_child,
+        &sibling,
+        first_child_run_id.clone(),
+        sibling_run_id.clone(),
+    );
+    let nested_sibling_authority = manager
+        .child_authority_for_run(
+            &first_child_run_id,
+            sibling_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("child authority configuration");
+    let parent_before = manager.run(&first_child_run_id).expect("child run");
+    let (denial_runtime, denial_events) = runtime_for(first_child_run_id.clone());
+    let (sibling_runtime, sibling_events) = runtime_for(sibling_run_id.clone());
+    let error = manager
+        .create_child_run(
+            &denial_runtime,
+            &sibling_runtime,
+            nested_sibling_request,
+            nested_sibling_authority,
+        )
+        .expect_err("root sibling cannot become a child descendant");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { ref reason }
+            if reason == "delegation_child_runtime_binding_denied"
+    ));
+    assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+        manager: &manager,
+        parent: &first_child,
+        child: &sibling,
+        parent_run_id: &first_child_run_id,
+        child_run_id: &sibling_run_id,
+        parent_before: &parent_before,
+        parent_events: &denial_events,
+        child_events: &sibling_events,
+        expected_reason: "delegation_child_runtime_binding_denied",
+    });
+}
+
+#[test]
+fn nested_escalation_identifies_exact_failing_chain_edge() {
+    let (manager, root, mut child, root_principal, child_principal, root_run_id, child_run_id) =
+        setup_manager();
+    let descendant_principal = PrincipalId::new();
+    let descendant_run_id = RunId::new();
+    let descendant = AgentContext::new(
+        AgentId::new(),
+        root.tenant_id.clone(),
+        AgentRuntimeConfig {
+            isolation: AgentIsolationPolicy {
+                allowed_message_schemas: vec![TASK_RESPONSE_SCHEMA.to_string()],
+                allowed_message_recipients: vec![child.agent_id.clone()],
+                ..AgentIsolationPolicy::default()
+            },
+            ..AgentRuntimeConfig::default()
+        },
+    );
+    child.config.isolation = AgentIsolationPolicy {
+        allowed_message_schemas: vec![
+            TASK_REQUEST_SCHEMA.to_string(),
+            TASK_RESPONSE_SCHEMA.to_string(),
+        ],
+        allowed_message_recipients: vec![root.agent_id.clone(), descendant.agent_id.clone()],
+        ..AgentIsolationPolicy::default()
+    };
+    manager
+        .register_agent_with_principal(
+            child.clone(),
+            child_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("child delegation policy registered");
+    manager
+        .register_agent_with_principal(
+            descendant.clone(),
+            descendant_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("descendant registered");
+
+    let child_request =
+        delegation_request(&root, &child, root_run_id.clone(), child_run_id.clone());
+    let descendant_request = delegation_request(
+        &child,
+        &descendant,
+        child_run_id.clone(),
+        descendant_run_id.clone(),
+    );
+    let root_grant = parent_grant_for_requests(
+        &root_principal,
+        &root.tenant_id,
+        &[&child_request, &descendant_request],
+    );
+    manager
+        .bind_root_run_capability_grant_with_edges(
+            &root_run_id,
+            &root_grant,
+            vec![
+                LocalDelegationRuntimeEdge::new(
+                    root.agent_id.clone(),
+                    root_run_id.clone(),
+                    child.agent_id.clone(),
+                    child_run_id.clone(),
+                ),
+                LocalDelegationRuntimeEdge::new(
+                    child.agent_id.clone(),
+                    child_run_id.clone(),
+                    descendant.agent_id.clone(),
+                    descendant_run_id.clone(),
+                ),
+            ],
+        )
+        .expect("explicit descendant assigned");
+    let (root_runtime, _) = runtime_for(root_run_id);
+    let (child_start_runtime, _) = runtime_for(child_run_id.clone());
+    let mut child_authority = LocalDelegationAuthority::new(
+        root_grant,
+        child_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    child_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
+    manager
+        .create_child_run(
+            &root_runtime,
+            &child_start_runtime,
+            child_request,
+            child_authority,
+        )
+        .expect("assigned child created");
+
+    let mut escalation = manager
+        .child_authority_for_run(
+            &child_run_id,
+            descendant_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("nested escalation authority input");
+    escalation.role_profile = DelegationRoleProfile::Actuator;
+    escalation.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(1),
+        max_action_duration_ms: Some(250),
+        ..AuthorityBudgetScope::default()
+    };
+    let parent_before = manager.run(&child_run_id).expect("child run");
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let (descendant_runtime, descendant_events) = runtime_for(descendant_run_id.clone());
+    let error = manager
+        .create_child_run(
+            &child_runtime,
+            &descendant_runtime,
+            descendant_request,
+            escalation,
+        )
+        .expect_err("nested role escalation denied");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { ref reason }
+            if reason == "delegation_chain_edge_1_role_escalation"
+    ));
+    assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+        manager: &manager,
+        parent: &child,
+        child: &descendant,
+        parent_run_id: &child_run_id,
+        child_run_id: &descendant_run_id,
+        parent_before: &parent_before,
+        parent_events: &child_events,
+        child_events: &descendant_events,
+        expected_reason: "delegation_chain_edge_1_role_escalation",
+    });
+}
+
+#[test]
+fn manager_owned_parent_binding_cannot_be_overridden_for_nested_delegation() {
+    let nested = create_nested_delegation();
+    let grandchild_id = AgentId::new();
+    let grandchild_principal = PrincipalId::new();
+    let grandchild = AgentContext::new(
+        grandchild_id,
+        nested.first.run.tenant_id.clone(),
+        AgentRuntimeConfig::default(),
+    );
+    nested
+        .manager
+        .register_agent_with_principal(
+            grandchild.clone(),
+            grandchild_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("grandchild registered");
+    let request = LocalDelegationRequest::new(
+        nested.first.run.run_id.clone(),
+        nested.first.run.agent_id.clone(),
+        grandchild.agent_id,
+        "impersonated nested request",
+        authority(&["query"], &["sql"], &["finance.read"]),
+        None,
+    );
+    let child_recorder = SimpleRecorder {
+        run_id: request.child_run_id.clone(),
+    };
+    let forged = nested
+        .manager
+        .child_authority_for_run(
+            nested.first.run.parent_run_id.as_ref().expect("root run"),
+            grandchild_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("root-derived child authority input");
+    assert!(nested
+        .manager
+        .create_child_run(&nested.child_runtime, &child_recorder, request, forged,)
+        .is_err());
+}
+
+#[test]
+fn aggregate_sibling_budget_overflow_denies_nth_child_component_wise() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, first_run_id) =
+        setup_manager();
+    let run_ids = [first_run_id, RunId::new(), RunId::new()];
+    let requests = run_ids
+        .iter()
+        .cloned()
+        .map(|run_id| delegation_request(&parent, &child, parent_run_id.clone(), run_id))
+        .collect::<Vec<_>>();
+    let refs = requests.iter().collect::<Vec<_>>();
+    let root = parent_grant_for_requests(&parent_principal, &parent.tenant_id, &refs);
+    manager
+        .bind_root_run_capability_grant(&parent_run_id, &root)
+        .expect("aggregate root bound");
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+
+    for (index, request) in requests.into_iter().enumerate() {
+        let (child_runtime, _) = runtime_for(request.child_run_id.clone());
+        let mut authority = LocalDelegationAuthority::new(
+            root.clone(),
+            child_principal.clone(),
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        );
+        authority.budget = AuthorityBudgetScope {
+            max_actions_per_tick: Some(2),
+            max_action_duration_ms: Some(500),
+            ..AuthorityBudgetScope::default()
+        };
+        let result = manager.create_child_run(&parent_runtime, &child_runtime, request, authority);
+        if index < 2 {
+            result.expect("budget remains for sibling");
+        } else {
+            assert!(matches!(
+                result,
+                Err(LocalDelegationError::AuthorityDenied { reason })
+                    if reason == "aggregate_budget_exceeded_max_actions_per_tick"
+            ));
+        }
+    }
+    let replay = replay_local_delegations(&parent_events.lock().expect("events"));
+    assert!(replay
+        .rejections
+        .iter()
+        .any(|rejection| rejection.reason == "aggregate_budget_exceeded_max_actions_per_tick"));
+}
+
+#[test]
+fn authority_owned_fan_out_is_atomic_under_concurrent_callers() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, _) =
+        setup_manager();
+    let requests = (0..17)
+        .map(|_| delegation_request(&parent, &child, parent_run_id.clone(), RunId::new()))
+        .collect::<Vec<_>>();
+    let refs = requests.iter().collect::<Vec<_>>();
+    let root = parent_grant_for_requests(&parent_principal, &parent.tenant_id, &refs);
+    manager
+        .bind_root_run_capability_grant(&parent_run_id, &root)
+        .expect("fan-out root bound");
+    let manager = Arc::new(manager);
+    let barrier = Arc::new(Barrier::new(requests.len()));
+    let handles = requests
+        .into_iter()
+        .map(|request| {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            let root = root.clone();
+            let child_principal = child_principal.clone();
+            let parent_run_id = parent_run_id.clone();
+            std::thread::spawn(move || {
+                let parent_recorder = SimpleRecorder {
+                    run_id: parent_run_id,
+                };
+                let child_recorder = SimpleRecorder {
+                    run_id: request.child_run_id.clone(),
+                };
+                let mut authority = LocalDelegationAuthority::new(
+                    root,
+                    child_principal,
+                    AUTHORITY_AUDIENCE,
+                    OffsetDateTime::now_utc(),
+                );
+                authority.max_fan_out = u32::MAX;
+                authority.budget = AuthorityBudgetScope {
+                    max_actions_per_tick: Some(0),
+                    max_action_duration_ms: Some(0),
+                    ..AuthorityBudgetScope::default()
+                };
+                barrier.wait();
+                manager.create_child_run(&parent_recorder, &child_recorder, request, authority)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("fan-out thread"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 16);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(LocalDelegationError::AuthorityDenied { reason }) if reason == "fan_out_exceeded"
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn routing_and_start_failures_record_release_or_fail_safe_consumption() {
+    let manager = LocalDelegationManager::with_router_config(MessageRouterConfig {
+        max_outbox_messages: 0,
+        ..MessageRouterConfig::default()
+    });
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager_for(manager);
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, _) = runtime_for(child_run_id);
+    manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect_err("routing capacity failure");
+    let replay = replay_local_delegations(&parent_events.lock().expect("routing events"));
+    assert!(replay
+        .ledger_events
+        .iter()
+        .any(|event| event.status == DelegationReservationStatus::ConsumedAfterRoutingFailure));
+
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id);
+    let child_recorder = FailingRecorder {
+        run_id: child_run_id,
+    };
+    manager
+        .create_child_run(&parent_runtime, &child_recorder, request, authority)
+        .expect_err("child start trace failure");
+    let replay = replay_local_delegations(&parent_events.lock().expect("start events"));
+    assert!(replay
+        .ledger_events
+        .iter()
+        .any(|event| { event.status == DelegationReservationStatus::ConsumedAfterRoutingFailure }));
+}
+
+#[test]
+fn delegation_requested_trace_failure_releases_before_routing_and_exact_retry_succeeds() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let failing = DelegationRequestedFailingRecorder {
+        run_id: parent_run_id.clone(),
+    };
+    let (child_runtime, _) = runtime_for(child_run_id.clone());
+    manager
+        .create_child_run(&failing, &child_runtime, request.clone(), authority)
+        .expect_err("pre-routing trace failure denies");
+    assert!(manager
+        .router()
+        .outbox(&parent.agent_id, &parent_run_id)
+        .expect("outbox")
+        .is_empty());
+
+    let retry_authority = manager
+        .child_authority_for_run(
+            &request.parent_run_id,
+            child_principal.clone(),
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("root child authority");
+    let (parent_runtime, _) = runtime_for(parent_run_id);
+    manager
+        .create_child_run(&parent_runtime, &child_runtime, request, retry_authority)
+        .expect("known pre-routing failure released exact child ID for retry");
+}
+
+#[test]
+fn cleanup_timeout_terminally_fails_child_and_retry_is_replay_stable() {
+    let manager = LocalDelegationManager::with_quiescence_timeout(StdDuration::ZERO);
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager_for(manager);
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let created = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect("child run created");
+    let grant_id = created
+        .run
+        .capability_grant_id
+        .clone()
+        .expect("child grant");
+    let action = Action {
+        name: "query".to_string(),
+        params: serde_json::json!({}),
+        side_effect_class: SideEffectClass::ReadOnly,
+        cost_estimate: None,
+        required_permissions: vec!["finance.read".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let permit = created.child_agent.verify_delegated_action_with_grant(
+        &action,
+        Some("sql"),
+        &child_run_id,
+        Some(&grant_id),
+        QuotaUsage::single_action(),
+        OffsetDateTime::now_utc(),
+        1,
+    );
+    assert!(permit.allowed(), "effect admitted before cleanup");
+    let response_outbox_before = manager
+        .router()
+        .outbox(&child.agent_id, &parent_run_id)
+        .expect("response outbox")
+        .len();
+
+    let error = manager
+        .complete_child_run(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            serde_json::json!({"done": true}),
+        )
+        .expect_err("in-flight effect forces bounded cleanup timeout");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { ref reason }
+            if reason == REASON_DELEGATION_QUIESCENCE_TIMEOUT
+    ));
+    let child_record = manager.run(&child_run_id).expect("terminal child record");
+    assert_eq!(child_record.status, LocalRunStatus::Failed);
+    assert!(child_record.response_message_id.is_none());
+    assert_eq!(
+        manager
+            .router()
+            .outbox(&child.agent_id, &parent_run_id)
+            .expect("response outbox after timeout")
+            .len(),
+        response_outbox_before,
+        "cleanup timeout does not route a successful response"
+    );
+
+    let parent_failure_count =
+        count_events(&parent_events.lock().expect("parent events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { failure, .. }
+            if failure.code == REASON_DELEGATION_QUIESCENCE_TIMEOUT)
+        });
+    let child_failure_count = count_events(&child_events.lock().expect("child events"), |kind| {
+        matches!(kind, TraceEventKind::ChildRunFailed { failure, .. }
+            if failure.code == REASON_DELEGATION_QUIESCENCE_TIMEOUT)
+    });
+    assert_eq!(parent_failure_count, 1);
+    assert_eq!(child_failure_count, 1);
+    let mut events = parent_events.lock().expect("parent events").clone();
+    events.extend(child_events.lock().expect("child events").clone());
+    let replay = replay_local_delegations(&events);
+    assert_eq!(
+        replay
+            .failures
+            .iter()
+            .filter(|failure| failure.code == REASON_DELEGATION_QUIESCENCE_TIMEOUT)
+            .count(),
+        2
+    );
+    assert!(replay.ledger_events.iter().any(|evidence| {
+        evidence.status == DelegationReservationStatus::Cleaned
+            && evidence.reason.as_deref() == Some(REASON_DELEGATION_QUIESCENCE_TIMEOUT)
+    }));
+
+    drop(permit);
+    let retry = manager
+        .complete_child_run(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            serde_json::json!({"done": true}),
+        )
+        .expect_err("terminal timeout cannot be retried as completion");
+    assert!(matches!(
+        retry,
+        LocalDelegationError::ChildRunAlreadyFinished {
+            status: LocalRunStatus::Failed,
+            ..
+        }
+    ));
+    assert_eq!(
+        count_events(
+            &parent_events.lock().expect("parent events"),
+            |kind| matches!(kind, TraceEventKind::ChildRunFailed { failure, .. }
+                if failure.code == REASON_DELEGATION_QUIESCENCE_TIMEOUT),
+        ),
+        parent_failure_count
+    );
+    assert_eq!(
+        count_events(
+            &child_events.lock().expect("child events"),
+            |kind| matches!(kind, TraceEventKind::ChildRunFailed { failure, .. }
+                if failure.code == REASON_DELEGATION_QUIESCENCE_TIMEOUT),
+        ),
+        child_failure_count
+    );
+}
+
+#[test]
+fn routing_uncertainty_tombstones_child_run_id_across_new_grant_attempts() {
+    let manager = LocalDelegationManager::with_router_config(MessageRouterConfig {
+        max_outbox_messages: 0,
+        ..MessageRouterConfig::default()
+    });
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager_for(manager);
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    let (parent_runtime, _) = runtime_for(parent_run_id.clone());
+    let (child_runtime, _) = runtime_for(child_run_id.clone());
+    manager
+        .create_child_run(&parent_runtime, &child_runtime, request.clone(), authority)
+        .expect_err("routing uncertainty");
+    let new_grant_attempt = manager
+        .child_authority_for_run(
+            &request.parent_run_id,
+            child_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("root child authority");
+    assert!(matches!(
+        manager.create_child_run(
+            &parent_runtime,
+            &child_runtime,
+            request,
+            new_grant_attempt,
+        ),
+        Err(LocalDelegationError::DuplicateChildRun(id)) if id == child_run_id
+    ));
+}
+
+#[test]
+fn cleanup_trace_failure_retains_budget_fail_safe_and_cancels_child() {
+    let created = create_delegation_for_revocation();
+    let failing_child_recorder = FailingRecorder {
+        run_id: created.child_run_id.clone(),
+    };
+    created
+        .manager
+        .complete_child_run(
+            &created.parent_runtime,
+            &failing_child_recorder,
+            &created.child_run_id,
+            serde_json::json!({"done": true}),
+        )
+        .expect_err("cleanup trace uncertainty fails closed");
+    assert_eq!(
+        created
+            .manager
+            .run(&created.child_run_id)
+            .expect("child record")
+            .status,
+        LocalRunStatus::Cancelled
+    );
+    let replay = replay_local_delegations(&created.parent_events.lock().expect("parent events"));
+    assert!(replay.ledger_events.iter().any(|event| {
+        event.status == DelegationReservationStatus::ConsumedAfterRoutingFailure
+            && event
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("child_cleanup_trace_failed"))
+    }));
+}
+
+#[test]
+fn root_revocation_cancels_nested_descendants_and_replay_has_no_effects() {
+    let nested = create_nested_delegation();
+    let snapshot = revocation_snapshot_for(nested.root_grant.grant().grant_id.clone());
+    let request_count_before = nested
+        .manager
+        .router()
+        .outbox(
+            &nested.first.request_message.message.source_agent_id,
+            &nested.first.run.parent_run_id.clone().expect("root run"),
+        )
+        .expect("root outbox")
+        .len();
+    nested
+        .manager
+        .cancel_child_if_authority_revoked(
+            &nested.parent_runtime,
+            &nested.child_runtime,
+            &nested.first.run.run_id,
+            &snapshot,
+        )
+        .expect("root revocation applied")
+        .expect("child cancelled");
+    assert_eq!(
+        nested
+            .manager
+            .run(&nested.first.run.run_id)
+            .expect("first")
+            .status,
+        LocalRunStatus::Cancelled
+    );
+    assert_eq!(
+        nested
+            .manager
+            .run(&nested.second.run.run_id)
+            .expect("second")
+            .status,
+        LocalRunStatus::Cancelled
+    );
+
+    let events = nested.parent_events.lock().expect("parent events").clone();
+    let replay = replay_local_delegations(&events);
+    assert!(
+        replay
+            .ledger_events
+            .iter()
+            .filter(|event| event.status == DelegationReservationStatus::Revoked)
+            .count()
+            >= 2
+    );
+    assert_eq!(
+        nested
+            .manager
+            .router()
+            .outbox(
+                &nested.first.request_message.message.source_agent_id,
+                &nested.first.run.parent_run_id.expect("root run"),
+            )
+            .expect("root outbox after replay")
+            .len(),
+        request_count_before
+    );
+    assert!(!nested.child_events.lock().expect("child events").is_empty());
+    assert!(!nested
+        .grandchild_events
+        .lock()
+        .expect("grandchild events")
+        .is_empty());
+    let _ = &nested.grandchild_runtime;
+}
+
+#[test]
+fn descendant_revocation_trace_failure_invalidates_entire_subtree_first() {
+    let nested = create_nested_delegation();
+    let failing = FailingRecorder {
+        run_id: nested.first.run.parent_run_id.clone().expect("root run"),
+    };
+    nested
+        .manager
+        .cancel_parent_run(&failing, failing.run_id(), "operator_revoke")
+        .expect_err("trace persistence fails after invalidation");
+    assert_eq!(
+        nested
+            .manager
+            .run(&nested.first.run.run_id)
+            .expect("first")
+            .status,
+        LocalRunStatus::Cancelled
+    );
+    assert_eq!(
+        nested
+            .manager
+            .run(&nested.second.run.run_id)
+            .expect("second")
+            .status,
+        LocalRunStatus::Cancelled
+    );
+    let action = Action {
+        name: "query".to_string(),
+        params: serde_json::json!({}),
+        side_effect_class: SideEffectClass::ReadOnly,
+        cost_estimate: None,
+        required_permissions: vec!["finance.read".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let grant_id = nested
+        .second
+        .run
+        .capability_grant_id
+        .as_ref()
+        .expect("grant");
+    let denied = nested
+        .second
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action,
+            Some("sql"),
+            &nested.second.run.run_id,
+            Some(grant_id),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        );
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["delegated_authority_inactive"]
+    );
+}
+
+#[test]
+fn delegation_rejects_unknown_runtime_identities_before_routing() {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+
+    let unknown_parent_run_id = RunId::new();
+    let request = delegation_request(
+        &parent,
+        &child,
+        unknown_parent_run_id.clone(),
+        child_run_id.clone(),
+    );
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    assert!(matches!(
+        manager.create_child_run(
+            &SimpleRecorder {
+                run_id: unknown_parent_run_id.clone(),
+            },
+            &SimpleRecorder {
+                run_id: child_run_id.clone(),
+            },
+            request,
+            authority,
+        ),
+        Err(LocalDelegationError::UnknownParentRun(run_id)) if run_id == unknown_parent_run_id
+    ));
+
+    let mut request =
+        delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let unknown_agent_id = AgentId::new();
+    request.target_agent_id = unknown_agent_id.clone();
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    bind_parent_authority(&manager, &parent_run_id, &authority);
+    assert!(matches!(
+        manager.create_child_run(
+            &SimpleRecorder {
+                run_id: parent_run_id,
+            },
+            &SimpleRecorder {
+                run_id: child_run_id,
+            },
+            request,
+            authority,
+        ),
+        Err(LocalDelegationError::UnknownAgent(agent_id)) if agent_id == unknown_agent_id
+    ));
+}
+
+#[test]
+fn delegation_private_guards_cover_expiry_and_default_construction() {
+    let (_manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id);
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    let grant = authority
+        .parent_capability_grant
+        .as_ref()
+        .expect("legacy root grant");
+    assert_eq!(
+        child_grant_liveness_denial_raw(grant.grant(), grant.grant().expires_at),
+        Some("child_grant_expired")
+    );
+    let _default_manager = LocalDelegationManager::default();
 }

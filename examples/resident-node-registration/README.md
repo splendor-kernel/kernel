@@ -13,6 +13,8 @@ safety verifier is involved.
   hosted tenants, and supported features.
 - Emit management audit events for registration and heartbeat changes.
 - Update heartbeat health without overwriting static registration fields.
+- Derive freshness from receiver-owned receipt time rather than sender-reported
+  registration/heartbeat timestamps.
 - Compute stale heartbeat status deterministically at an explicit timestamp.
 
 Registration metadata does not authorize side effects. Any future run dispatched
@@ -63,7 +65,7 @@ let node = NodeRegistration {
     },
     registered_at: now,
 };
-registry.register_node(node)?;
+registry.register_node_received_at(node, now)?;
 
 let instance_id = InstanceId::new();
 let instance = InstanceRegistration {
@@ -83,18 +85,21 @@ let instance = InstanceRegistration {
     },
     registered_at: now,
 };
-registry.register_instance(instance)?;
+registry.register_instance_received_at(instance, now)?;
 
 let heartbeat_at = now + Duration::seconds(5);
-registry.record_node_heartbeat(NodeHeartbeat {
-    node_id: node_id.clone(),
-    health: NodeHealth {
-        status: HealthStatus::Degraded,
-        observed_at: heartbeat_at,
-        metadata: serde_json::json!({"network": "limited"}),
+registry.record_node_heartbeat_received_at(
+    NodeHeartbeat {
+        node_id: node_id.clone(),
+        health: NodeHealth {
+            status: HealthStatus::Degraded,
+            observed_at: heartbeat_at,
+            metadata: serde_json::json!({"network": "limited"}),
+        },
+        recorded_at: heartbeat_at,
     },
-    recorded_at: heartbeat_at,
-})?;
+    heartbeat_at,
+)?;
 
 let fresh = registry.node_health_status_at(&node_id, now + Duration::seconds(29))?;
 assert_eq!(fresh.freshness, HeartbeatFreshness::Fresh);
@@ -134,8 +139,9 @@ order:
 3. `node.heartbeat_recorded`
 4. `instance.heartbeat_recorded`, when an instance heartbeat is recorded
 
-Invalid capability documents, duplicate IDs, unknown parent nodes, timestamp
-regressions, and audit sink failures fail closed without applying the mutation.
+Invalid capability documents, duplicate IDs, unknown parent nodes, manager
+receipt-time regressions, and audit sink failures fail closed without applying
+the mutation. Sender timestamps are observation only and cannot pin freshness.
 
 ## State and replay behavior
 

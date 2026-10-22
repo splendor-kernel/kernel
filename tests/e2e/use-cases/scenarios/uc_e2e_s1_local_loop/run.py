@@ -17,6 +17,7 @@ from pathlib import Path
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
 AGENT_ID = "22222222-2222-4222-8222-222222222222"
 RUN_ID = "33333333-3333-4333-8333-333333333333"
+ARTIFACT_RUN_ID = "33333333-3333-4333-8333-333333333340"
 WORK_ORDER_ID = "wo_uc_e2e_s1_local_loop"
 SECRET = "splendor-local-work-order-secret"
 KEY_ID = "work-order-local-key"
@@ -90,18 +91,18 @@ def sign_work_order(root: Path, artifact_dir: Path, commands: Path, work_order: 
     return json.loads(proc.stdout)
 
 
-def work_order(run_id: str, max_actions: int = 4) -> dict:
+def work_order(run_id: str, profile: dict[str, str], max_actions: int = 4) -> dict:
     return {
         "schema_version": "splendor.work_order.v1",
         "work_order_id": WORK_ORDER_ID + "_" + run_id[-4:],
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "run_id": run_id,
-        "objective": "UC-E2E-S1 tenant_research agent_research_writer local governed loop",
-        "allowed_actions": ["http_get", "write_file"],
-        "allowed_adapters": ["http", "filesystem"],
-        "allowed_permissions": ["research.read", "artifact.write"],
-        "data_refs": ["fixture:http://local/allowed/research-summary", "sandbox://tenant_research/artifacts/summary.md"],
+        "objective": f"UC-E2E-S1 exact {profile['adapter']} authority profile",
+        "allowed_actions": [profile["action"]],
+        "allowed_adapters": [profile["adapter"]],
+        "allowed_permissions": [profile["permission"]],
+        "data_refs": [profile["data_ref"]],
         "quotas": {"max_actions_per_tick": max_actions, "max_http_requests_per_minute": 4, "max_filesystem_write_bytes": 4096},
         "placement": {"target": "local_resident", "requires_gpu": False},
         "issued_at": utc(-1),
@@ -110,25 +111,26 @@ def work_order(run_id: str, max_actions: int = 4) -> dict:
     }
 
 
-def config(root: Path, artifact_dir: Path, envelope: dict, run_id: str, actions: list[dict], port: int, max_actions: int = 4) -> dict:
+def config(root: Path, artifact_dir: Path, envelope: dict, run_id: str, actions: list[dict], port: int, profile: dict[str, str], max_actions: int = 4) -> dict:
+    adapter_config = {
+        "http": {"allowed_domains": ["127.0.0.1"], "allowed_methods": ["GET"], "timeout_ms": 2000},
+        "filesystem": {"base_dir": str(artifact_dir / "sandbox"), "max_write_bytes": 4096},
+    }
     return {
         "trace_db": str(artifact_dir / f"{run_id}.trace.db"),
         "state_db": str(artifact_dir / f"{run_id}.state.db"),
         "run_id": run_id,
         "cycles": 1,
         "work_order": {**envelope, "verification_secret": SECRET, "expected_placement_target": "local_resident"},
-        "adapters": {
-            "http": {"allowed_domains": ["127.0.0.1"], "allowed_methods": ["GET"], "timeout_ms": 2000},
-            "filesystem": {"base_dir": str(artifact_dir / "sandbox"), "max_write_bytes": 4096},
-        },
-        "tenants": [{"id": TENANT_ID, "allowed_actions": ["http_get", "write_file"], "allowed_adapters": ["http", "filesystem"], "allowed_permissions": ["research.read", "artifact.write"], "quotas": {"max_actions_per_tick": max_actions}}],
+        "adapters": {profile["adapter"]: adapter_config[profile["adapter"]]},
+        "tenants": [{"id": TENANT_ID, "allowed_actions": [profile["action"]], "allowed_adapters": [profile["adapter"]], "allowed_permissions": [profile["permission"]], "quotas": {"max_actions_per_tick": max_actions}}],
         "agents": [{
             "id": AGENT_ID,
             "tenant_id": TENANT_ID,
             "run_id": run_id,
             "snapshot_interval": 1,
             "initial_state": "{\"seed\":true}",
-            "allowed_permissions": ["research.read", "artifact.write"],
+            "allowed_permissions": [profile["permission"]],
             "percepts": [{"schema": "splendor.percept.research_request.v1", "payload": {"url": f"http://127.0.0.1:{port}/allowed/research-summary"}, "source": "uc-e2e-s1", "detail": "structured local fixture"}],
             "policy": {"type": "static", "next_state": "{\"artifact\":\"summary.md\"}", "actions": actions},
         }],
@@ -239,33 +241,51 @@ def main() -> int:
     thread.start()
 
     try:
-        envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID))
-        bootstrap_cfg = config(root, artifact_dir, envelope, RUN_ID, [], port)
+        http_profile = {"action": "http_get", "adapter": "http", "permission": "research.read", "data_ref": "fixture:http://local/allowed/research-summary"}
+        filesystem_profile = {"action": "write_file", "adapter": "filesystem", "permission": "artifact.write", "data_ref": "sandbox://tenant_research/artifacts/summary.md"}
+        envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID, http_profile))
+        artifact_envelope = sign_work_order(root, artifact_dir, commands, work_order(ARTIFACT_RUN_ID, filesystem_profile))
+        bootstrap_cfg = config(root, artifact_dir, envelope, RUN_ID, [], port, http_profile)
         bootstrap_cfg["agents"][0]["policy"]["next_state"] = "{\"bootstrap\":true}"
         bootstrap_path = artifact_dir / "bootstrap.config.json"
         write_json(bootstrap_path, bootstrap_cfg)
         run_cmd(ctl + ["run", "--config", str(bootstrap_path)], root, commands)
 
-        cfg = config(root, artifact_dir, envelope, RUN_ID, [action_http(port), action_write()], port)
+        artifact_bootstrap_cfg = config(root, artifact_dir, artifact_envelope, ARTIFACT_RUN_ID, [], port, filesystem_profile)
+        artifact_bootstrap_cfg["agents"][0]["policy"]["next_state"] = "{\"bootstrap\":true}"
+        artifact_bootstrap_path = artifact_dir / "artifact-bootstrap.config.json"
+        write_json(artifact_bootstrap_path, artifact_bootstrap_cfg)
+        run_cmd(ctl + ["run", "--config", str(artifact_bootstrap_path)], root, commands)
+
+        cfg = config(root, artifact_dir, envelope, RUN_ID, [action_http(port)], port, http_profile)
         cfg["agents"][0]["resume"] = True
         cfg_path = artifact_dir / "positive.config.json"
         write_json(cfg_path, cfg)
         run_cmd(ctl + ["run", "--config", str(cfg_path)], root, commands)
 
+        artifact_cfg = config(root, artifact_dir, artifact_envelope, ARTIFACT_RUN_ID, [action_write()], port, filesystem_profile)
+        artifact_cfg["agents"][0]["resume"] = True
+        artifact_cfg_path = artifact_dir / "artifact-positive.config.json"
+        write_json(artifact_cfg_path, artifact_cfg)
+        run_cmd(ctl + ["run", "--config", str(artifact_cfg_path)], root, commands)
+
         trace_export = artifact_dir / "trace-export.jsonl"
         proc = run_cmd(ctl + ["trace", "export", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
-        trace_export.write_text(proc.stdout, encoding="utf-8")
+        artifact_proc = run_cmd(ctl + ["trace", "export", "--db", artifact_cfg["trace_db"], "--run", ARTIFACT_RUN_ID], root, commands)
+        trace_export.write_text(proc.stdout + artifact_proc.stdout, encoding="utf-8")
         state_proc = run_cmd(ctl + ["state", "head", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
         state_head = json.loads(state_proc.stdout)
-        records = trace_records(proc.stdout)
+        primary_records = trace_records(proc.stdout)
+        records = primary_records + trace_records(artifact_proc.stdout)
         events = [event_type(r) for r in records]
         artifact = artifact_dir / "sandbox" / TENANT_ID / "artifacts" / "summary.md"
         checksum_before = sha256(artifact)
         before_replay = FixtureHandler.counter
         replay_proc = run_cmd(ctl + ["replay", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
+        artifact_replay_proc = run_cmd(ctl + ["replay", "--db", artifact_cfg["trace_db"], "--state-db", artifact_cfg["state_db"], "--run", ARTIFACT_RUN_ID], root, commands)
         after_replay = FixtureHandler.counter
         checksum_after = sha256(artifact)
-        replay_lines = trace_records(replay_proc.stdout)
+        replay_lines = trace_records(replay_proc.stdout) + trace_records(artifact_replay_proc.stdout)
         replay_event_ids = replay_lifecycle_evidence(replay_lines)
         replay_report = {
             "mode": "inspect_only",
@@ -293,8 +313,11 @@ def main() -> int:
             ("deny_verifier_precondition", [precondition_action], 4),
         ]:
             rid = "33333333-3333-4333-8333-" + {"deny_url": "333333333334", "deny_path": "333333333335", "deny_quota": "333333333336", "deny_verifier_precondition": "333333333337"}[suffix]
-            env = sign_work_order(root, artifact_dir, commands, work_order(rid, quota))
-            c = config(root, artifact_dir, env, rid, actions, port, quota)
+            profile = http_profile if suffix in {"deny_url", "deny_quota"} else filesystem_profile
+            if suffix == "deny_quota":
+                actions = [action_http(port), action_http(port)]
+            env = sign_work_order(root, artifact_dir, commands, work_order(rid, profile, quota))
+            c = config(root, artifact_dir, env, rid, actions, port, profile, quota)
             p = artifact_dir / f"{suffix}.config.json"
             write_json(p, c)
             before = FixtureHandler.counter
@@ -317,8 +340,8 @@ def main() -> int:
             ("forced_state_commit_failure_prevents_next_tick", {"state_commit_fail": True}),
         ]:
             rid = "33333333-3333-4333-8333-" + ("333333333338" if "trace" in suffix else "333333333339")
-            env = sign_work_order(root, artifact_dir, commands, work_order(rid, 4))
-            c = config(root, artifact_dir, env, rid, [action_http(port), action_write()], port, 4)
+            env = sign_work_order(root, artifact_dir, commands, work_order(rid, http_profile, 4))
+            c = config(root, artifact_dir, env, rid, [action_http(port)], port, http_profile, 4)
             c["failure_injection"] = injection
             if "state" in suffix:
                 c["cycles"] = 2
@@ -343,7 +366,7 @@ def main() -> int:
 
         api_traffic = artifact_dir / "api-traffic.ndjson"
         api_traffic.write_text(json.dumps({"surface": "splendorctl", "commands_log": str(commands)}) + "\n", encoding="utf-8")
-        state_committed = next(r for r in reversed(records) if event_type(r) == "state.committed")
+        state_committed = next(r for r in reversed(primary_records) if event_type(r) == "state.committed")
         committed_kind = state_committed["payload"]["kind"]["StateCommitted"]
         state_node_id = state_committed["payload"]["identity"].get("state_node_id")
         state_hash = f"{committed_kind['state_hash']['algorithm'].lower()}:{committed_kind['state_hash']['value']}"
@@ -365,7 +388,7 @@ def main() -> int:
             "timestamp": state_committed["payload"].get("timestamp") or state_committed.get("recorded_at"),
         }
         write_json(artifact_dir / "state-export.json", state_export)
-        write_json(artifact_dir / "audit-report.json", {"mode": "inspect_only", "denials": negatives, "work_order_id": WORK_ORDER_ID, "audit_export": audit_export})
+        write_json(artifact_dir / "audit-report.json", {"mode": "inspect_only", "denials": negatives, "work_order_ids": [envelope["work_order_id"], artifact_envelope["work_order_id"]], "audit_export": audit_export})
         write_json(artifact_dir / "anti-drift-results.json", {"status": "passed", "checks": ["public_cli_boundary", "gateway_traces_present", "inspect_only_replay_suppression"]})
         (artifact_dir / "stdout.log").write_text("UC-E2E-S1 local governed loop completed with inspect_only side-effect suppression\n", encoding="utf-8")
         (artifact_dir / "stderr.log").write_text("", encoding="utf-8")
@@ -410,12 +433,12 @@ def main() -> int:
         scenario = {
             "id": "UC-E2E-S1", "status": "passed" if not failures else "failed", "fr_coverage": ["FR-0.01-01", "FR-0.01-02", "FR-0.01-03", "FR-0.01-04", "FR-0.01-05"],
             "components": ["splendorctl", "action gateway", "HTTP adapter", "filesystem adapter", "state graph", "trace store", "replay"],
-            "positive_evidence": ["signed scoped work order accepted", "HTTP read and sandbox filesystem write executed through gateway", "state head and ordered trace exported"],
+            "positive_evidence": ["separate exact signed HTTP and filesystem work-order profiles accepted", "HTTP read and sandbox filesystem write executed through their gateways", "state head and ordered trace exported"],
             "negative_evidence": [n["case"] for n in negatives], "replay_evidence": ["inspect_only replay did not increment HTTP counter or change artifact checksum"],
             "required_trace_event_ids": ids_by_event,
             "replay_mode": "inspect_only", "replay_side_effect_suppression": {"required": True, "evidence_present": replay_report["adapter_suppressed"], "side_effects_allowed_default": False},
             "replay_artifacts": [str(artifact_dir / "replay-report.json")], "anti_drift_checks": ["public_cli_boundary", "no_direct_adapter_execution", "inspect_only"],
-            "run_ids": [RUN_ID], "trace_event_ids": trace_ids, "state_node_ids": [state_node_id], "state_hashes": [state_hash], "message_ids": [], "work_order_ids": [envelope["work_order_id"]], "approval_ids": [], "node_ids": [], "action_ids": action_ids,
+            "run_ids": [RUN_ID, ARTIFACT_RUN_ID], "trace_event_ids": trace_ids, "state_node_ids": [state_node_id], "state_hashes": [state_hash], "message_ids": [], "work_order_ids": [envelope["work_order_id"], artifact_envelope["work_order_id"]], "approval_ids": [], "node_ids": [], "action_ids": action_ids,
             "artifact_paths": [str(p) for p in [artifact_dir / "scenario-report.json", commands, api_traffic, trace_export, artifact_dir / "state-export.json", artifact_dir / "replay-report.json", artifact_dir / "audit-report.json", artifact_dir / "anti-drift-results.json", artifact]],
             "blocking_failures": failures,
         }

@@ -2,17 +2,30 @@ use super::*;
 use crate::SnapshotPolicy;
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
-    StateNodeId, StateSnapshot, StateStore, StateStoreError,
+    StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceStoreError,
 };
 use splendor_types::{
-    ActionId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalTraceContext, ConstraintKind,
-    ConstraintScope, DelegatedAuthority, PerceptProvenance, PolicyBundle, PolicyBundleId,
-    PolicyBundleTraceContext, PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, TenantId,
-    TraceEvent, WorkOrder, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    validate_policy_bundle, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId,
+    ApprovalTraceContext, ConstraintKind, ConstraintScope, DelegatedAuthority, PerceptProvenance,
+    PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring,
+    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyDegradedMode, QuotaUsage,
+    RevocationStatus, RunId, StateHandoffAuthority, TenantId, TraceEvent, TraceId, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
     WORK_ORDER_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+struct LoopPolicyTraceRecorder;
+
+impl crate::PolicyCacheMutationRecorder for LoopPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        _event: TraceEventKind,
+    ) -> Result<(), crate::PolicyCacheTraceError> {
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 struct CapturingTraceSink {
@@ -22,6 +35,42 @@ struct CapturingTraceSink {
 impl crate::TraceSink for CapturingTraceSink {
     fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
         self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct FailingActionVerificationTraceSink {
+    events: Arc<Mutex<Vec<TraceEvent>>>,
+    failed: Arc<Mutex<bool>>,
+}
+
+impl crate::TraceSink for FailingActionVerificationTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        let mut failed = self.failed.lock().expect("failed lock");
+        if !*failed
+            && matches!(
+                &event.kind,
+                TraceEventKind::ActionVerificationStarted { .. }
+            )
+        {
+            *failed = true;
+            return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
+        }
+        drop(failed);
+
+        self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
+    }
+}
+
+struct FailingStateHandoffImportedTraceSink;
+
+impl crate::TraceSink for FailingStateHandoffImportedTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        if matches!(event.kind, TraceEventKind::StateHandoffImported { .. }) {
+            return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
+        }
         Ok(())
     }
 }
@@ -76,6 +125,40 @@ impl Policy for StaticPolicy {
     }
 }
 
+struct RawApprovalEvidencePolicy {
+    evidence: ApprovalEvidence,
+}
+
+impl Policy for RawApprovalEvidencePolicy {
+    fn name(&self) -> &str {
+        "raw-approval-evidence-policy"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        let action = Action {
+            name: "noop".to_string(),
+            params: serde_json::json!({"ok": true}),
+            side_effect_class: splendor_types::SideEffectClass::ReadOnly,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        };
+        Ok(PolicyDecision::new(
+            vec![ActionCandidate::new(action).with_approval_evidence(self.evidence.clone())],
+            StateData {
+                bytes: vec![2],
+                content_type: None,
+            },
+            Some("must-not-commit".to_string()),
+        ))
+    }
+}
+
 #[derive(Default)]
 struct StubGateway;
 
@@ -88,6 +171,7 @@ impl ActionGateway for StubGateway {
             post_verification: Some(VerificationResult::allow()),
             output: Some(serde_json::json!({"ok": true})),
             error: None,
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -138,6 +222,7 @@ impl ActionGateway for DenyGateway {
             post_verification: None,
             output: None,
             error: Some("denied".to_string()),
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -164,6 +249,7 @@ impl ActionGateway for ExpiredPolicyGateway {
             post_verification: None,
             output: None,
             error: Some("policy_expired".to_string()),
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -230,6 +316,7 @@ impl ActionGateway for CountingGateway {
             post_verification: Some(VerificationResult::allow()),
             output: Some(serde_json::json!({"ok": true})),
             error: None,
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -286,6 +373,42 @@ impl Policy for MultiActionPolicy {
     }
 }
 
+struct ForgedStateMetadataPolicy {
+    tenant_id: splendor_types::TenantId,
+    agent_id: splendor_types::AgentId,
+    run_id: RunId,
+    trace_event_id: splendor_types::TraceEventId,
+}
+
+impl Policy for ForgedStateMetadataPolicy {
+    fn name(&self) -> &str {
+        "forged-state-metadata-policy"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        let mut metadata = StateMetadata::new(
+            OffsetDateTime::now_utc(),
+            Some("policy-supplied-label".to_string()),
+        );
+        metadata.tenant_id = Some(self.tenant_id.clone());
+        metadata.agent_id = Some(self.agent_id.clone());
+        metadata.run_id = Some(self.run_id.clone());
+        metadata.trace_event_id = Some(self.trace_event_id.clone());
+        Ok(PolicyDecision {
+            actions: Vec::new(),
+            next_state: StateData {
+                bytes: vec![9],
+                content_type: None,
+            },
+            metadata,
+        })
+    }
+}
+
 fn work_order_for(agent: &AgentContext, run_id: RunId) -> WorkOrder {
     let now = OffsetDateTime::now_utc();
     WorkOrder {
@@ -305,6 +428,23 @@ fn work_order_for(agent: &AgentContext, run_id: RunId) -> WorkOrder {
         expires_at: now + time::Duration::hours(1),
         revocation: RevocationStatus::Active,
     }
+}
+
+fn signed_work_order_for(agent: &AgentContext, run_id: RunId) -> WorkOrderEnvelope {
+    WorkOrderEnvelope::signed_with_shared_secret(
+        work_order_for(agent, run_id),
+        "key_loop_state_handoff",
+        b"loop-state-handoff-secret",
+    )
+    .expect("signed work order")
+}
+
+fn state_handoff_keyring() -> WorkOrderKeyring {
+    let mut keyring = WorkOrderKeyring::new();
+    keyring
+        .insert_shared_secret("key_loop_state_handoff", b"loop-state-handoff-secret")
+        .expect("state handoff key");
+    keyring
 }
 
 fn policy_bundle_for(
@@ -397,6 +537,113 @@ impl StateStore for FailingStateStore {
     ) -> Result<StateSnapshot, StateStoreError> {
         Err(StateStoreError::MissingSnapshot)
     }
+}
+
+#[test]
+fn state_handoff_import_trace_failure_restores_live_owner_state() {
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let agent = AgentContext::new(
+        agent_id.clone(),
+        tenant_id.clone(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let work_order = signed_work_order_for(&agent, run_id.clone());
+    let now = OffsetDateTime::now_utc();
+
+    let mut source = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let mut source_metadata = StateMetadata::new(now, Some("source".to_string()));
+    source_metadata.tenant_id = Some(tenant_id.clone());
+    source_metadata.agent_id = Some(agent_id.clone());
+    source_metadata.run_id = Some(run_id.clone());
+    source
+        .commit(
+            StateData {
+                bytes: vec![9],
+                content_type: Some("application/octet-stream".to_string()),
+            },
+            source_metadata,
+        )
+        .expect("source commit");
+
+    let receiver_state = StateData {
+        bytes: vec![1],
+        content_type: Some("application/octet-stream".to_string()),
+    };
+    let mut receiver = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let mut receiver_metadata = StateMetadata::new(now, Some("receiver".to_string()));
+    receiver_metadata.tenant_id = Some(tenant_id.clone());
+    receiver_metadata.agent_id = Some(agent_id.clone());
+    receiver_metadata.run_id = Some(run_id.clone());
+    let previous = receiver
+        .commit(receiver_state.clone(), receiver_metadata)
+        .expect("receiver commit");
+
+    let handoff = source
+        .export_current_handoff(StateHandoffExportRequest {
+            handoff_id: "handoff_trace_failure".to_string(),
+            authority: StateHandoffAuthority {
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                work_order_id: work_order.work_order.work_order_id.to_string(),
+            },
+            source_instance_id: None,
+            receiver_instance_id: None,
+            previous_state_node_id: Some(previous.node_id.to_string()),
+            source_trace_id: Some(TraceId::new()),
+            created_at: now,
+        })
+        .expect("handoff export");
+
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(FailingStateHandoffImportedTraceSink),
+        run_id: Some(run_id.clone()),
+        ..KernelRuntimeConfig::default()
+    });
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        receiver,
+        receiver_state.clone(),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        runtime,
+    );
+    let mut import_metadata = StateMetadata::new(now, Some("import".to_string()));
+    import_metadata.tenant_id = Some(tenant_id.clone());
+    import_metadata.agent_id = Some(agent_id.clone());
+    import_metadata.run_id = Some(run_id.clone());
+
+    let error = engine
+        .import_state_handoff(
+            &handoff,
+            &work_order,
+            &state_handoff_keyring(),
+            &StateHandoffScope {
+                tenant_id,
+                agent_id,
+                run_id,
+                receiver_instance_id: None,
+            },
+            now,
+            import_metadata,
+        )
+        .expect_err("trace failure denies imported live state");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(crate::TraceError::Store(TraceStoreError::Poisoned))
+    ));
+    assert_eq!(engine.state_graph.head(), Some(&previous.node_id));
+    assert_eq!(engine.agent.state_head.as_ref(), Some(&previous.node_id));
+    assert_eq!(engine.state, receiver_state);
 }
 
 #[test]
@@ -512,6 +759,159 @@ fn loop_engine_emits_ordered_trace_events() {
             Some(&outcome.action_outcomes[0].action_id)
         );
     }
+}
+
+#[test]
+fn loop_engine_overwrites_policy_state_metadata_identity() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingTraceSink {
+        events: Arc::clone(&events),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink),
+        ..KernelRuntimeConfig::default()
+    });
+    let runtime_run_id = runtime.run_id().clone();
+
+    let store = Arc::new(InMemoryStateStore::default());
+    let graph = StateGraph::new(store.clone(), SnapshotPolicy::default());
+    let initial_state = StateData {
+        bytes: vec![1],
+        content_type: None,
+    };
+    let agent_id = splendor_types::AgentId::new();
+    let tenant_id = splendor_types::TenantId::new();
+    let agent = AgentContext::new(
+        agent_id.clone(),
+        tenant_id.clone(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let forged_tenant_id = splendor_types::TenantId::new();
+    let forged_agent_id = splendor_types::AgentId::new();
+    let forged_run_id = RunId::new();
+    let forged_trace_event_id = splendor_types::TraceEventId::new();
+
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        graph,
+        initial_state,
+        Box::new(ForgedStateMetadataPolicy {
+            tenant_id: forged_tenant_id.clone(),
+            agent_id: forged_agent_id.clone(),
+            run_id: forged_run_id.clone(),
+            trace_event_id: forged_trace_event_id.clone(),
+        }),
+        Arc::new(StubGateway),
+        runtime,
+    );
+
+    let outcome = engine.tick(1).expect("tick");
+
+    let recorded = events.lock().expect("events lock");
+    let state_event = recorded
+        .iter()
+        .find(|event| matches!(event.kind, TraceEventKind::StateCommitted { .. }))
+        .expect("state committed");
+    assert_eq!(outcome.state_commit.tenant_id.as_ref(), Some(&tenant_id));
+    assert_eq!(outcome.state_commit.agent_id.as_ref(), Some(&agent_id));
+    assert_eq!(outcome.state_commit.run_id.as_ref(), Some(&runtime_run_id));
+    assert_eq!(
+        outcome.state_commit.trace_event_id.as_ref(),
+        Some(&state_event.trace_event_id)
+    );
+    assert_ne!(
+        outcome.state_commit.tenant_id.as_ref(),
+        Some(&forged_tenant_id)
+    );
+    assert_ne!(
+        outcome.state_commit.agent_id.as_ref(),
+        Some(&forged_agent_id)
+    );
+    assert_ne!(outcome.state_commit.run_id.as_ref(), Some(&forged_run_id));
+    assert_ne!(
+        outcome.state_commit.trace_event_id.as_ref(),
+        Some(&forged_trace_event_id)
+    );
+
+    let node = store
+        .get_node(&outcome.state_commit.node_id)
+        .expect("stored state node");
+    assert_eq!(node.metadata.tenant_id.as_ref(), Some(&tenant_id));
+    assert_eq!(node.metadata.agent_id.as_ref(), Some(&agent_id));
+    assert_eq!(node.metadata.run_id.as_ref(), Some(&runtime_run_id));
+    assert_eq!(
+        node.metadata.trace_event_id.as_ref(),
+        Some(&state_event.trace_event_id)
+    );
+    assert_eq!(
+        node.metadata.label.as_deref(),
+        Some("policy-supplied-label")
+    );
+}
+
+#[test]
+fn loop_engine_trace_failure_before_action_dispatch_stops_gateway_and_state_advance() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = FailingActionVerificationTraceSink {
+        events: Arc::clone(&events),
+        failed: Arc::new(Mutex::new(false)),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink),
+        ..KernelRuntimeConfig::default()
+    });
+
+    let store = Arc::new(InMemoryStateStore::default());
+    let graph = StateGraph::new(store, SnapshotPolicy::default());
+    let initial_bytes = vec![1];
+    let initial_state = StateData {
+        bytes: initial_bytes.clone(),
+        content_type: None,
+    };
+    let agent = AgentContext::new(
+        splendor_types::AgentId::new(),
+        splendor_types::TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = Arc::new(CountingGateway {
+        calls: Arc::clone(&calls),
+    });
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        graph,
+        initial_state,
+        Box::new(StaticPolicy),
+        gateway,
+        runtime,
+    );
+    engine.set_constraint_engine(StaticConstraintEngine);
+
+    let error = engine.tick(1).expect_err("trace failure before dispatch");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(crate::TraceError::Store(TraceStoreError::Poisoned))
+    ));
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+    assert_eq!(engine.state.bytes, initial_bytes);
+    assert_eq!(engine.state_graph.tick(), 0);
+    assert!(engine.state_graph.head().is_none());
+    assert!(engine.agent.state_head.is_none());
+
+    let recorded = events.lock().expect("events lock");
+    assert_eq!(engine.runtime.next_sequence(), recorded.len() as u64);
+    assert!(recorded
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ConstraintsEvaluated { .. })));
+    assert!(!recorded.iter().any(|event| matches!(
+        event.kind,
+        TraceEventKind::ActionVerificationStarted { .. }
+            | TraceEventKind::ActionVerificationCompleted { .. }
+            | TraceEventKind::ActionExecuted { .. }
+            | TraceEventKind::StateCommitted { .. }
+            | TraceEventKind::LoopTickCompleted { .. }
+    )));
 }
 
 #[test]
@@ -760,7 +1160,7 @@ fn loop_engine_denies_child_action_outside_delegated_scope_and_skips_gateway() {
     if let TraceEventKind::ActionDenied { result, .. } = &denied.kind {
         assert!(result
             .reasons
-            .contains(&"delegated_action_not_allowed".to_string()));
+            .contains(&"delegated_runtime_authority_missing".to_string()));
     }
 }
 
@@ -819,12 +1219,12 @@ fn loop_engine_denies_delegated_action_without_explicit_adapter_and_skips_gatewa
     if let TraceEventKind::ActionDenied { result, .. } = &denied.kind {
         assert!(result
             .reasons
-            .contains(&"delegated_adapter_unspecified".to_string()));
+            .contains(&"delegated_runtime_authority_missing".to_string()));
     }
 }
 
 #[test]
-fn loop_engine_allows_delegated_action_with_explicit_adapter() {
+fn loop_engine_legacy_delegated_projection_cannot_independently_allow_action() {
     let runtime = KernelRuntime::new(KernelRuntimeConfig::default());
     let store = Arc::new(InMemoryStateStore::default());
     let graph = StateGraph::new(store, SnapshotPolicy::default());
@@ -858,9 +1258,9 @@ fn loop_engine_allows_delegated_action_with_explicit_adapter() {
     let outcome = engine.tick(1).expect("tick");
     assert!(matches!(
         outcome.action_outcomes[0].status,
-        ActionStatus::Executed
+        ActionStatus::Denied
     ));
-    assert_eq!(*calls.lock().expect("calls lock"), 1);
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
 }
 
 #[test]
@@ -1027,6 +1427,43 @@ fn loop_engine_resumes_from_trace_store() {
 }
 
 #[test]
+fn shared_trace_runtime_resume_rejects_mismatched_run() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let runtime_run_id = RunId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(runtime_run_id))
+            .expect("runtime"),
+    );
+    let requested_run_id = RunId::new();
+    let graph = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let agent = AgentContext::new(
+        splendor_types::AgentId::new(),
+        splendor_types::TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+
+    let result = LoopEngine::resume_from_shared_trace_runtime_and_work_order(
+        agent,
+        graph,
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store,
+        runtime,
+        requested_run_id,
+        None,
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Resume(message))
+            if message == "shared trace runtime run_id does not match resumed run"
+    ));
+}
+
+#[test]
 fn action_candidate_builder_methods() {
     let action = Action {
         name: "build".to_string(),
@@ -1061,6 +1498,92 @@ fn action_candidate_builder_methods() {
     assert_eq!(candidate.usage.actions, 2);
     assert_eq!(candidate.satisfied_preconditions, vec!["ready".to_string()]);
     assert_eq!(candidate.approval_evidence.as_ref(), Some(&evidence));
+}
+
+#[test]
+fn loop_engine_rejects_every_policy_supplied_raw_approval_evidence_before_action_path() {
+    for (decision, expired, revoked) in [
+        (ApprovalDecision::Granted, false, false),
+        (ApprovalDecision::Denied, false, false),
+        (ApprovalDecision::Granted, true, false),
+        (ApprovalDecision::Granted, false, true),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = KernelRuntime::new(KernelRuntimeConfig {
+            trace_sink: Arc::new(CapturingTraceSink {
+                events: Arc::clone(&events),
+            }),
+            ..KernelRuntimeConfig::default()
+        });
+        let initial_state = StateData {
+            bytes: vec![1],
+            content_type: None,
+        };
+        let agent = AgentContext::new(
+            AgentId::new(),
+            TenantId::new(),
+            crate::AgentRuntimeConfig::default(),
+        );
+        let expires_at = if expired {
+            OffsetDateTime::now_utc() - time::Duration::seconds(1)
+        } else {
+            OffsetDateTime::now_utc() + time::Duration::minutes(5)
+        };
+        let mut evidence = ApprovalEvidence::new(
+            ApprovalId::new(),
+            agent.tenant_id.clone(),
+            agent.agent_id.clone(),
+            runtime.run_id().clone(),
+            decision.clone(),
+            expires_at,
+        );
+        evidence.revoked = revoked;
+        let calls = Arc::new(Mutex::new(0));
+        let gateway = Arc::new(CountingGateway {
+            calls: Arc::clone(&calls),
+        });
+        let graph = StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        );
+        let mut engine = LoopEngine::with_runtime(
+            agent,
+            graph,
+            initial_state.clone(),
+            Box::new(RawApprovalEvidencePolicy { evidence }),
+            gateway,
+            runtime,
+        );
+
+        let error = engine.tick(1).expect_err("raw policy evidence is rejected");
+        assert!(matches!(
+            error,
+            LoopError::Policy(ref reason) if reason == "policy_raw_approval_evidence_forbidden"
+        ));
+        assert_eq!(*calls.lock().expect("calls lock"), 0);
+        assert_eq!(engine.state, initial_state);
+        assert_eq!(engine.state_graph.tick(), 0);
+        assert!(engine.state_graph.head().is_none());
+        assert!(engine.agent.state_head.is_none());
+        let recorded = events.lock().expect("events lock");
+        assert!(
+            recorded.iter().all(|event| !matches!(
+                event.kind,
+                TraceEventKind::ActionVerificationStarted { .. }
+                    | TraceEventKind::ActionVerificationCompleted { .. }
+                    | TraceEventKind::ActionExecuted { .. }
+                    | TraceEventKind::ActionDenied { .. }
+                    | TraceEventKind::ActionNeedsApproval { .. }
+                    | TraceEventKind::ApprovalRequested { .. }
+                    | TraceEventKind::ApprovalGranted { .. }
+                    | TraceEventKind::ApprovalDenied { .. }
+                    | TraceEventKind::ApprovalExpired { .. }
+                    | TraceEventKind::ApprovalRevoked { .. }
+                    | TraceEventKind::StateCommitted { .. }
+            )),
+            "decision={decision:?} expired={expired} revoked={revoked}"
+        );
+    }
 }
 
 #[test]
@@ -1313,14 +1836,40 @@ fn loop_engine_rejects_policy_before_policy_invoked_when_bundle_expired() {
         splendor_types::TenantId::new(),
         crate::AgentRuntimeConfig::default(),
     );
-    let cache = crate::PolicyCache::with_bundle(
-        policy_bundle_for(
-            &agent,
-            OffsetDateTime::now_utc() - time::Duration::minutes(1),
-            false,
-        ),
-        OffsetDateTime::now_utc(),
+    let expires_at = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    let bundle = policy_bundle_for(&agent, expires_at, false);
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        bundle.clone(),
+        "loop-policy-key",
+        b"loop-policy-secret",
+    )
+    .expect("signed loop policy");
+    let mut keyring = PolicyBundleKeyring::new();
+    keyring
+        .insert_shared_secret("loop-policy-key", b"loop-policy-secret")
+        .expect("loop policy key");
+    let validated = validate_policy_bundle(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: bundle.tenant_id.clone(),
+            agent_id: bundle.agent_id.clone(),
+            now: expires_at - time::Duration::minutes(1),
+        },
+        &keyring,
+    )
+    .expect("policy was valid before expiry");
+    let cache = crate::PolicyCache::new(
+        crate::PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        crate::PolicyCacheOwner {
+            tenant_id: agent.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+        },
     );
+    cache
+        .install_validated_traced(validated, false, &LoopPolicyTraceRecorder)
+        .expect("trusted loop policy installs");
     let mut engine = LoopEngine::with_runtime(
         agent,
         graph,

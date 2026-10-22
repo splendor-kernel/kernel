@@ -25,6 +25,7 @@ CORE_LOCAL_REQUIRED = {
     "cancelRun",
     "appendPercept",
     "submitAction",
+    "revokeApprovalReceipt",
     "getStateHead",
     "getRunTraces",
     "exportTraces",
@@ -44,6 +45,7 @@ FUTURE_GROUPS = {
         "registerNode",
         "registerInstance",
         "heartbeatNode",
+        "heartbeatInstance",
         "advertiseCapabilities",
         "listNodes",
         "evaluatePlacement",
@@ -144,6 +146,8 @@ S6_PHYSICAL_REQUEST_REFS = {
     "syncDeviceTraceBuffer": "DeviceTraceBufferSyncRequest",
 }
 
+RESIDENT_DAEMON_OPERATIONS = CORE_LOCAL_REQUIRED | LOCAL_CONTRACT_NOT_YET_COVERED | FUTURE_GROUPS["physical_edge"]
+
 
 def parse_operation_ids(text: str) -> set[str]:
     return set(re.findall(r"^\s*operationId:\s*([A-Za-z0-9_]+)\s*$", text, re.MULTILINE))
@@ -181,6 +185,29 @@ def require_schema_fields(text: str, schema_name: str, fields: set[str]) -> list
     return [f"{schema_name}.{field}" for field in missing]
 
 
+def schema_property_fields(text: str, schema_name: str) -> set[str]:
+    return set(
+        re.findall(
+            r"^        ([a-z][A-Za-z0-9_]*):\s*",
+            schema_block(text, schema_name),
+            re.MULTILINE,
+        )
+    )
+
+
+def require_exact_schema_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
+    actual = schema_property_fields(text, schema_name)
+    failures = [
+        f"{schema_name}.{field}"
+        for field in sorted(fields - actual)
+    ]
+    failures.extend(
+        f"{schema_name}.{field}_unexpected"
+        for field in sorted(actual - fields)
+    )
+    return failures
+
+
 def require_non_null_authority_fields(text: str, schema_name: str) -> list[str]:
     block = schema_block(text, schema_name)
     if not block:
@@ -214,6 +241,38 @@ def require_schema_required_fields(text: str, schema_name: str, fields: set[str]
     return [f"{schema_name}.{field}_not_required" for field in missing]
 
 
+def require_exact_schema_required_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    match = re.search(r"^      required:\s*\[([^\]]*)\]\s*$", block, re.MULTILINE)
+    if not match:
+        return [f"{schema_name}.required_fields_missing"]
+    actual = {
+        item.strip().strip("'\"")
+        for item in match.group(1).split(",")
+        if item.strip()
+    }
+    failures = [
+        f"{schema_name}.{field}_not_required"
+        for field in sorted(fields - actual)
+    ]
+    failures.extend(
+        f"{schema_name}.{field}_unexpected_required"
+        for field in sorted(actual - fields)
+    )
+    return failures
+
+
+def require_closed_schema(text: str, schema_name: str) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    if not re.search(r"^\s+additionalProperties:\s*false\s*$", block, re.MULTILINE):
+        return [f"{schema_name}.additionalProperties_not_false"]
+    return []
+
+
 def require_non_null_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
     block = schema_block(text, schema_name)
     if not block:
@@ -242,6 +301,17 @@ def require_operation_response_ref(blocks: dict[str, str], op_id: str, schema_na
         return [f"{op_id}.200_missing_{schema_name}_ref"]
     if re.search(r"'200':\s*\{\s*description:\s*[^}]+\}\s*$", block, re.MULTILINE):
         return [f"{op_id}.200_description_only"]
+    return []
+
+
+def require_operation_request_ref(blocks: dict[str, str], op_id: str, schema_name: str) -> list[str]:
+    block = blocks.get(op_id, "")
+    if not block:
+        return [f"missing operation {op_id}"]
+    if "requestBody:" not in block:
+        return [f"{op_id}.missing_request_body"]
+    if f"#/components/schemas/{schema_name}" not in block:
+        return [f"{op_id}.request_missing_{schema_name}_ref"]
     return []
 
 
@@ -274,8 +344,11 @@ def main() -> int:
         "cancelRun",
         "appendPercept",
         "submitAction",
+        "revokeApprovalReceipt",
         "replayRun",
         "exportTraces",
+        "exportStateSnapshot",
+        "importStateSnapshot",
     }
     for op_id in sorted(mutating_core & operation_ids):
         block = blocks.get(op_id, "")
@@ -288,6 +361,57 @@ def main() -> int:
         block = blocks.get(op_id, "")
         if "'401':" not in block and "401:" not in block:
             failures.append(f"{op_id} must declare missing-caller/local-dev auth response semantics")
+
+    for op_id in sorted(RESIDENT_DAEMON_OPERATIONS & operation_ids):
+        block = blocks.get(op_id, "")
+        if "ResidentCallerBearer" not in block:
+            failures.append(f"{op_id} must declare the resident caller bearer security scheme")
+        if "'401':" not in block and "401:" not in block:
+            failures.append(f"{op_id} must declare resident authentication failure semantics")
+    for op_id in sorted(FUTURE_GROUPS["fleet"] & operation_ids):
+        if "ResidentCallerBearer" in blocks.get(op_id, ""):
+            failures.append(f"{op_id} must not claim resident bearer authentication for manager inbound traffic")
+    for op_id in sorted(
+        {"requestApproval", "grantApproval", "denyApproval", "revokeApproval"}
+        & operation_ids
+    ):
+        block = blocks.get(op_id, "")
+        if "ManagerApprovalCallerBearer" not in block:
+            failures.append(
+                f"{op_id} must declare bounded manager approval caller authentication"
+            )
+        if "'401':" not in block and "401:" not in block:
+            failures.append(
+                f"{op_id} must declare manager caller authentication failure semantics"
+            )
+    for op_id in sorted(
+        (FUTURE_GROUPS["governance"] - {"requestApproval", "grantApproval", "denyApproval", "revokeApproval"})
+        & operation_ids
+    ):
+        if "ManagerApprovalCallerBearer" in blocks.get(op_id, ""):
+            failures.append(
+                f"{op_id} must not broaden the bounded approval bearer profile"
+            )
+    for marker in [
+        "type: http",
+        "scheme: bearer",
+        "splendor-caller+jwt (Ed25519)",
+        "WWW-Authenticate",
+        "non-authoritative compatibility mirror",
+    ]:
+        if marker not in text:
+            failures.append(f"resident authentication contract missing marker: {marker}")
+
+    import_block = blocks.get("importStateSnapshot", "")
+    for marker in [
+        "'503':",
+        "state_handoff_proof_unavailable",
+        "needs_intervention",
+        "signed_source_handoff_manifest",
+        "No state-store, state-head, or run-trace mutation occurs",
+    ]:
+        if marker not in import_block:
+            failures.append(f"resident state import fail-closed contract missing marker: {marker}")
 
     schema_failures: list[str] = []
     schema_failures.extend(
@@ -317,12 +441,284 @@ def main() -> int:
             },
         )
     )
+    schema_failures.extend(
+        require_schema_fields(text, "SubmitWorkOrderRequest", {"approval_policies"})
+    )
+    submit_work_order_block = schema_block(text, "SubmitWorkOrderRequest")
+    for marker in (
+        "default: []",
+        "maxItems: 64",
+        "#/components/schemas/ApprovalPolicy",
+        "non-authorizing governance configuration",
+    ):
+        if marker not in submit_work_order_block:
+            schema_failures.append(f"SubmitWorkOrderRequest.approval_policies_missing_{marker}")
+    approval_policy_fields = {
+        "schema_version",
+        "policy_id",
+        "tenant_id",
+        "agent_id",
+        "action_name",
+        "adapter",
+        "required_permission",
+        "side_effect_class",
+        "risk_level",
+        "reason",
+        "expires_at",
+    }
+    schema_failures.extend(
+        require_exact_schema_fields(text, "ApprovalPolicy", approval_policy_fields)
+    )
+    schema_failures.extend(
+        require_exact_schema_required_fields(text, "ApprovalPolicy", approval_policy_fields)
+    )
+    schema_failures.extend(require_closed_schema(text, "ApprovalPolicy"))
+    approval_policy_block = schema_block(text, "ApprovalPolicy")
+    for marker in (
+        "enum: [splendor.approval_policy.v1]",
+        "maxLength: 128",
+        "maxLength: 1024",
+        "#/components/schemas/SideEffectClass",
+    ):
+        if marker not in approval_policy_block:
+            schema_failures.append(f"ApprovalPolicy.missing_{marker}")
+    side_effect_class_block = schema_block(text, "SideEffectClass")
+    for marker in (
+        "enum: [ReadOnly, Filesystem, Network, External]",
+        "additionalProperties: false",
+        "required: [Custom]",
+    ):
+        if marker not in side_effect_class_block:
+            schema_failures.append(f"SideEffectClass.missing_{marker}")
+    approval_challenge_fields = {
+        "schema_version",
+        "approval_id",
+        "tenant_id",
+        "agent_id",
+        "run_id",
+        "action_id",
+        "action_name",
+        "adapter",
+        "policy_id",
+        "risk_level",
+        "subject",
+        "authority_decision_id",
+        "obligation_id",
+        "receipt_audience",
+        "canonical_request_digest",
+        "gateway_action_request_digest",
+        "physical_action_resource_coordinate",
+        "authority_decision_digest",
+        "requested_at",
+        "expires_at",
+    }
+    schema_failures.extend(require_schema_fields(text, "ApprovalChallenge", approval_challenge_fields))
+    schema_failures.extend(
+        require_schema_required_fields(
+            text,
+            "ApprovalChallenge",
+            approval_challenge_fields
+            - {"risk_level", "physical_action_resource_coordinate"},
+        )
+    )
+    approval_challenge_block = schema_block(text, "ApprovalChallenge")
+    if "enum: [splendor.approval_challenge.v1]" not in approval_challenge_block:
+        schema_failures.append("ApprovalChallenge.schema_version_literal_mismatch")
+    schema_failures.extend(
+        require_exact_schema_fields(
+            text,
+            "PhysicalActionResourceCoordinate",
+            {"resource_kind", "node_id"},
+        )
+    )
+    schema_failures.extend(
+        require_exact_schema_required_fields(
+            text,
+            "PhysicalActionResourceCoordinate",
+            {"resource_kind", "node_id"},
+        )
+    )
+    schema_failures.extend(
+        require_exact_schema_fields(
+            text,
+            "ResidentApprovalReceiptRevocationRequest",
+            {"schema_version", "authority_obligation_receipt", "reason"},
+        )
+    )
+    schema_failures.extend(
+        require_exact_schema_required_fields(
+            text,
+            "ResidentApprovalReceiptRevocationRequest",
+            {"schema_version", "authority_obligation_receipt", "reason"},
+        )
+    )
+    schema_failures.extend(
+        require_exact_schema_fields(
+            text,
+            "ResidentApprovalReceiptRevocationAck",
+            {
+                "schema_version",
+                "receipt_id",
+                "approval_id",
+                "target_instance_id",
+                "run_id",
+                "receipt_audience",
+                "status",
+                "effect_certainty",
+                "acknowledged_at",
+            },
+        )
+    )
+    schema_failures.extend(
+        require_exact_schema_required_fields(
+            text,
+            "ResidentApprovalReceiptRevocationAck",
+            {
+                "schema_version",
+                "receipt_id",
+                "approval_id",
+                "target_instance_id",
+                "run_id",
+                "receipt_audience",
+                "status",
+                "effect_certainty",
+                "acknowledged_at",
+            },
+        )
+    )
+    schema_failures.extend(
+        require_operation_request_ref(
+            blocks,
+            "revokeApprovalReceipt",
+            "ResidentApprovalReceiptRevocationRequest",
+        )
+    )
+    schema_failures.extend(
+        require_operation_response_ref(
+            blocks,
+            "revokeApprovalReceipt",
+            "ResidentApprovalReceiptRevocationAck",
+        )
+    )
+    revoke_receipt_block = blocks.get("revokeApprovalReceipt", "")
+    for marker in (
+        "ResidentCallerBearer",
+        "splendor.approval_receipts.revoke",
+        "approval_receipt_revocation_too_late",
+        "'409':",
+    ):
+        if marker not in revoke_receipt_block:
+            schema_failures.append(f"revokeApprovalReceipt.missing_{marker}")
+    if "splendor.approvals.manage" in revoke_receipt_block:
+        schema_failures.append("revokeApprovalReceipt.broad_approval_scope")
+    schema_failures.extend(require_closed_schema(text, "PhysicalActionResourceCoordinate"))
+    schema_failures.extend(require_closed_schema(text, "ResidentApprovalReceiptRevocationRequest"))
+    schema_failures.extend(require_closed_schema(text, "ResidentApprovalReceiptRevocationAck"))
+    governance_approval_record_fields = {
+        "approval_id",
+        "tenant_id",
+        "agent_id",
+        "run_id",
+        "action_id",
+        "action_name",
+        "adapter",
+        "policy_id",
+        "risk_level",
+        "audience",
+        "status",
+        "reason",
+        "issued_by",
+        "requested_by",
+        "decided_by",
+        "expires_at",
+        "trace_event_id",
+        "evidence",
+        "challenge",
+        "authority_obligation_receipt",
+        "resident_receipt_revocation_ack",
+    }
+    schema_failures.extend(
+        require_exact_schema_fields(
+            text,
+            "GovernanceApprovalRecord",
+            governance_approval_record_fields,
+        )
+    )
+    governance_record_block = schema_block(text, "GovernanceApprovalRecord")
+    revocation_ack_match = re.search(
+        r"^        resident_receipt_revocation_ack:\s*$([\s\S]*?)(?=^        [a-z][A-Za-z0-9_]*:|\Z)",
+        governance_record_block,
+        re.MULTILINE,
+    )
+    if not revocation_ack_match:
+        schema_failures.append("GovernanceApprovalRecord.resident_receipt_revocation_ack")
+    else:
+        revocation_ack_block = revocation_ack_match.group(1)
+        if "type: 'null'" not in revocation_ack_block:
+            schema_failures.append("GovernanceApprovalRecord.resident_receipt_revocation_ack_not_nullable")
+        if "#/components/schemas/ResidentApprovalReceiptRevocationAck" not in revocation_ack_block:
+            schema_failures.append("GovernanceApprovalRecord.resident_receipt_revocation_ack_missing_ref")
+    if re.search(
+        r"^      required: \[[^\]]*resident_receipt_revocation_ack[^\]]*\]",
+        governance_record_block,
+        re.MULTILINE,
+    ):
+        schema_failures.append("GovernanceApprovalRecord.resident_receipt_revocation_ack_not_optional")
     schema_failures.extend(require_schema_fields(text, "ReplayRequest", {"credential", "audit_attribution", "mode", "side_effects_allowed"}))
     schema_failures.extend(
         require_schema_fields(text, "TraceExportRequest", {"credential", "audit_attribution", "redaction_policy", "start", "end"})
     )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "ExportStateSnapshotRequest",
+            {
+                "run_id",
+                "credential",
+                "audit_attribution",
+                "work_order_id",
+                "source_instance_id",
+                "receiver_instance_id",
+                "previous_state_node_id",
+            },
+        )
+    )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "ImportStateSnapshotRequest",
+            {"handoff", "work_order", "credential", "audit_attribution"},
+        )
+    )
+    schema_failures.extend(
+        require_schema_required_fields(
+            text,
+            "ImportStateSnapshotRequest",
+            {"handoff", "work_order", "credential", "audit_attribution"},
+        )
+    )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "StateHandoff",
+            {
+                "schema_version",
+                "handoff_id",
+                "mode",
+                "authority",
+                "source_instance_id",
+                "receiver_instance_id",
+                "previous_state_node_id",
+                "snapshot",
+                "source_trace_id",
+                "created_at",
+            },
+        )
+    )
     schema_failures.extend(require_non_null_authority_fields(text, "ReplayRequest"))
     schema_failures.extend(require_non_null_authority_fields(text, "TraceExportRequest"))
+    schema_failures.extend(require_non_null_authority_fields(text, "ExportStateSnapshotRequest"))
+    schema_failures.extend(require_non_null_authority_fields(text, "ImportStateSnapshotRequest"))
     schema_failures.extend(
         require_schema_fields(text, "VersionResponse", {"daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"})
     )
@@ -362,6 +758,34 @@ def main() -> int:
     schema_failures.extend(require_schema_fields(text, "DeviceRuntimeProfile", {"node_id", "tenant_id", "device_kind", "capabilities", "allowed_physical_actions", "forbidden_action_classes", "safety_constraints", "runtime_mode", "safety_status", "policy_cache", "trace_buffer", "registered_at"}))
     schema_failures.extend(require_schema_fields(text, "DevicePolicyCacheStatus", {"policy_id", "loaded", "ttl_seconds", "expires_at", "expired"}))
     schema_failures.extend(require_schema_fields(text, "SubmitPhysicalActionRequest", {"safety_context", "operator_intervention_evidence"}))
+    submit_action_request_fields = {
+        "action_id",
+        "run_id",
+        "tenant_id",
+        "agent_id",
+        "credential",
+        "audit_attribution",
+        "causal_trace_id",
+        "action",
+        "adapter",
+        "quota_usage",
+        "satisfied_preconditions",
+        "requested_at",
+        "approval_evidence",
+        "authority_obligation_receipts",
+    }
+    schema_failures.extend(
+        require_exact_schema_fields(
+            text,
+            "SubmitActionRequest",
+            submit_action_request_fields,
+        )
+    )
+    schema_failures.extend(require_closed_schema(text, "SubmitActionRequest"))
+    if "physical_action_resource_coordinate" in schema_property_fields(text, "SubmitActionRequest"):
+        schema_failures.append("SubmitActionRequest.physical_action_resource_coordinate_is_caller_field")
+    schema_failures.extend(require_closed_schema(text, "SubmitPhysicalActionRequest"))
+    schema_failures.extend(require_closed_schema(text, "ApprovalEvidence"))
     schema_failures.extend(require_schema_fields(text, "SafetyContext", {"allowed_zone_refs", "zone_ref", "altitude_m", "max_altitude_m", "battery_percent", "privacy_clear", "human_proximity_clear", "emergency_stop_clear", "offline", "policy_cache_expired", "high_risk", "cloud_helper_direct_authority", "cloud_helper_proposal_id"}))
     schema_failures.extend(require_schema_fields(text, "OperatorInterventionRequest", {"credential", "audit_attribution", "intervention_id", "tenant_id", "agent_id", "run_id", "node_id", "action_name", "reason", "expires_at"}))
     schema_failures.extend(require_schema_fields(text, "OperatorDecisionRequest", {"credential", "audit_attribution", "reason", "expires_at"}))
@@ -373,6 +797,13 @@ def main() -> int:
     schema_failures.extend(require_non_null_authority_fields(text, "OperatorInterventionRequest"))
     schema_failures.extend(require_non_null_authority_fields(text, "OperatorDecisionRequest"))
     schema_failures.extend(require_non_null_authority_fields(text, "DeviceTraceBufferSyncRequest"))
+    device_trace_sync = blocks.get("syncDeviceTraceBuffer", "")
+    if "splendor.device.trace_sync" not in device_trace_sync:
+        schema_failures.append("syncDeviceTraceBuffer.missing_dedicated_mutating_scope")
+    if "device_trace_sync" not in schema_block(text, "EndpointScope"):
+        schema_failures.append("EndpointScope.missing_device_trace_sync")
+    if "approval_receipts_revoke" not in schema_block(text, "EndpointScope"):
+        schema_failures.append("EndpointScope.missing_approval_receipts_revoke")
     if schema_failures:
         failures.append("Missing required local contract schema fields: " + ", ".join(schema_failures))
 
@@ -568,6 +999,7 @@ def main() -> int:
         "structural_checks": {
             "mutating_operations_checked": sorted(mutating_core & operation_ids),
             "health_capabilities_auth_semantics_checked": sorted({"getHealth", "getCapabilities"} & operation_ids),
+            "resident_bearer_operations_checked": sorted(RESIDENT_DAEMON_OPERATIONS & operation_ids),
             "schema_fields_checked": ["CallerCredential", "WorkOrderEnvelope", "ReplayRequest"],
             "s4_response_refs_checked": sorted(op for op in S4_MANAGER_RESPONSE_REFS if op in operation_ids),
             "s6_physical_response_refs_checked": sorted(op for op in S6_PHYSICAL_RESPONSE_REFS if op in operation_ids),

@@ -1,25 +1,35 @@
 # Governance Workflows
 
 0.04-S2 implements the first governance workflow slice: approval-required actions
-pause through the gateway verifier and resume only with valid scoped approval
-evidence. This reference intentionally describes the implemented approval path and
+pause through the gateway verifier and continue only when the exact action is
+retried with a valid scoped receipt. This reference intentionally describes the implemented approval path and
 marks later governance features as future work.
 
 ## Implemented in 0.04-S2
 
 - Approval policies can mark scoped actions as approval-required.
 - The action gateway returns `NeedsApproval` before adapter execution when
-  evidence is missing.
+  a trusted receipt is missing and includes an exact non-authorizing challenge.
 - The daemon maps approval-required tick outcomes to `waiting_for_approval` and
   records a trace-linked pause.
-- Resume from `waiting_for_approval` requires a signed resume work order and
-  approval evidence.
-- Valid grants allow the action to be re-evaluated by the gateway.
+- Lifecycle resume from `waiting_for_approval` is rejected without running a
+  tick. The caller must retry the exact challenged action through `/actions`.
+- The manager may issue a receipt only from the recorded exact challenge. Raw
+  granted `ApprovalEvidence` remains non-authorizing compatibility data.
+- A valid exact receipt allows the action to be re-evaluated and executed once by
+  the gateway after every other required verifier passes.
 - Denial, expiry, revocation, wrong-scope evidence, unsupported approval schema,
   or verifier uncertainty fails closed without adapter execution.
-- Approval evidence must include action scope (`action_id` or `action_name`) and
-  adapter scope for adapter-backed actions; omitted action/adapter scope is not a
-  wildcard grant.
+- An exact pending `/actions` retry may carry raw denied evidence without a
+  receipt. It is evaluated by the approval verifier, records terminal denial and
+  replay evidence, and never calls the adapter; raw grants remain non-authorizing.
+- Manager approval records distinguish `requested_by` from `decided_by`, retain
+  `issued_by` for compatibility, and allow an absent/null risk only when the exact
+  challenge also has no risk label.
+- The challenge/receipt binds action ID and payload, effective adapter, tenant,
+  agent, run, authority subject/decision/obligation, policy, original request
+  time, expiry, receipt audience, and integrity digests. Changed scope is not a
+  wildcard grant and receipt reuse is denied.
 - Replay exposes approval lifecycle events without re-running verifiers or
   adapters.
 
@@ -43,8 +53,9 @@ Percepts
   -> Policy proposes action
   -> Constraints evaluated
   -> Action Gateway
-  -> Approval Verifier
-  -> other verifier checks
+  -> Approval policy creates exact conditional obligation
+  -> other verifier checks and final live-authority check
+  -> Trusted receipt validation, exact match, and atomic one-use claim
   -> Adapter only if all verifiers allow
   -> Outcome
   -> State Commit
@@ -65,9 +76,8 @@ Action statuses added for governance:
 Daemon run statuses added for the approval path:
 
 - `waiting_for_approval`: run paused after an approval-required action.
-- `denied`: run reached a terminal denial due to approval denial, wrong scope, or
-  revocation.
-- `expired`: run reached a terminal expiry due to expired approval evidence.
+- `denied` / `expired`: retained fail-closed statuses for legacy denial,
+  revocation, wrong-scope, or expiry facts. Raw evidence never permits execution.
 
 ## Approval lifecycle trace events
 
@@ -93,7 +103,8 @@ Replay explains the approval path from trace records:
 - which approval grant, denial, unsupported schema, expiry, or revocation was
   presented;
 - the trace event ID and sequence for each approval lifecycle event;
-- whether adapter execution remained suppressed until a grant was accepted.
+- whether adapter execution remained suppressed until a trusted receipt was
+  validated and claimed.
 
 Replay does not execute adapters, re-submit actions, re-deliver notifications,
 call approval services, or mutate run state.

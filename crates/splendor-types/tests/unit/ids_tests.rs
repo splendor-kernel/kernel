@@ -259,3 +259,219 @@ fn snapshot_id_from_bytes_is_stable() {
     let from_hash = SnapshotId::from_hash(ContentHash::blake3(b"state"));
     assert_eq!(from_hash, snapshot);
 }
+
+macro_rules! with_secret_id_types {
+    ($callback:ident $(, $argument:expr)*) => {
+        $callback!($($argument,)* [
+            SecretRefId,
+            SecretLeaseRequestId,
+            SecretLeaseId,
+            SecretDeliveryHandleId,
+            SecretDeliveryReceiptId,
+            SecretDeliveryControlAttestationId,
+            SecretActionSubmissionId,
+            SecretActionIdempotencyKey,
+            SecretApprovalContinuationId,
+            SecretOuterAdmissionCapacityBindingId,
+            SecretProviderId,
+            SecretProviderRouteId,
+            SecretProviderAuditId,
+            SecretProviderControlInvocationId,
+            SecretBootstrapSourceBindingId,
+            SecretAccessEventId,
+            SecretTickCandidateObservationId,
+            SecretTickCandidateObservationLinkReceiptId,
+            SecretNodeControlInvocationId,
+            SecretNodeControlReceiptId,
+            SecretAudienceId,
+            SecretDetectorRegistrationId,
+            SecretExposureLineageId,
+            SecretUseAttemptId,
+            SecretRefMutationCommandId,
+            SecretRenewalCommandId,
+            SecretRotationCommandId,
+            SecretRevocationCommandId,
+            SecretCleanupCommandId,
+            SecretContainmentCommandId,
+            SecretUseClaimId,
+            SecretContainmentReserveId,
+            SecretPublicationPreparationId,
+            SecretPublicationAuthorizationId,
+            SecretPublicationPrepareReceiptId,
+            SecretReconciliationClaimId,
+            SecretConsumedEffectTombstoneId,
+            SecretPermanentAuxiliaryIdentityMarkerId,
+            SecretRetiredAuthorityDomainDenyHeadId,
+            SecretRetirementManifestId,
+        ]);
+    };
+}
+
+fn secret_id_fixture() -> serde_json::Value {
+    serde_json::from_str(include_str!("../fixtures/secrets/v1a/ids.json"))
+        .expect("secret ID fixture must be valid JSON")
+}
+
+macro_rules! assert_secret_id_round_trips {
+    ($valid:expr, [$($id_type:ident),+ $(,)?]) => {
+        $(
+            let raw = $valid
+                .get(stringify!($id_type))
+                .and_then(serde_json::Value::as_str)
+                .expect("fixture must contain each secret ID type");
+            let parsed = <crate::$id_type>::parse(raw).expect("canonical secret ID must parse");
+            assert_eq!(parsed.to_string(), raw);
+            assert_eq!(parsed, raw.parse().expect("FromStr must use strict parsing"));
+            assert_eq!(
+                serde_json::to_value(&parsed).expect("secret ID must serialize"),
+                serde_json::Value::String(raw.to_owned())
+            );
+            assert_eq!(
+                serde_json::from_value::<crate::$id_type>(serde_json::Value::String(raw.to_owned()))
+                    .expect("canonical secret ID must deserialize"),
+                parsed
+            );
+
+            let uuid = Uuid::parse_str(raw).expect("fixture UUID must parse");
+            assert_eq!(parsed.as_uuid(), &uuid);
+            assert_eq!(
+                <crate::$id_type>::try_from(uuid)
+                    .expect("non-nil UUID construction must succeed"),
+                parsed
+            );
+        )+
+    };
+}
+
+#[test]
+fn all_secret_ids_have_fixed_canonical_round_trips() {
+    let fixture = secret_id_fixture();
+    let valid = fixture["valid"]
+        .as_object()
+        .expect("valid fixture section must be an object");
+    with_secret_id_types!(assert_secret_id_round_trips, valid);
+}
+
+macro_rules! assert_secret_id_inventory {
+    ($valid:expr, [$($id_type:ident),+ $(,)?]) => {
+        let expected = [$(stringify!($id_type)),+]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = $valid
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(expected.len(), 40);
+        assert_eq!(actual, expected);
+    };
+}
+
+#[test]
+fn secret_id_fixture_has_the_exact_synthetic_inventory() {
+    let fixture_text = include_str!("../fixtures/secrets/v1a/ids.json");
+    for credential_term in ["password", "passwd", "api_key", "token", "credential"] {
+        assert!(!fixture_text.contains(credential_term));
+    }
+
+    let fixture = secret_id_fixture();
+    let valid = fixture["valid"]
+        .as_object()
+        .expect("valid fixture section must be an object");
+    with_secret_id_types!(assert_secret_id_inventory, valid);
+}
+
+#[test]
+fn secret_ids_reject_nil_and_noncanonical_wire_forms_without_echoing_input() {
+    let fixture = secret_id_fixture();
+    let invalid_strings = fixture["invalid_strings"]
+        .as_array()
+        .expect("invalid string fixture section must be an array");
+
+    for value in invalid_strings {
+        let raw = value.as_str().expect("invalid string case must be text");
+        let expected = if raw == "00000000-0000-0000-0000-000000000000" {
+            SecretIdParseError::Nil
+        } else {
+            SecretIdParseError::InvalidFormat
+        };
+        assert_eq!(SecretRefId::parse(raw), Err(expected));
+
+        let error = serde_json::from_value::<SecretLeaseId>(value.clone())
+            .expect_err("noncanonical secret ID JSON must reject")
+            .to_string();
+        assert!(error.len() <= 80, "secret ID errors must remain bounded");
+        assert!(!error.contains(raw), "secret ID errors must not echo input");
+    }
+
+    for value in fixture["invalid_json"]
+        .as_array()
+        .expect("invalid JSON fixture section must be an array")
+    {
+        let candidate = value.to_string();
+        let error = serde_json::from_value::<SecretProviderId>(value.clone())
+            .expect_err("non-string secret ID JSON must reject")
+            .to_string();
+        assert!(error.len() <= 80, "secret ID errors must remain bounded");
+        assert!(
+            !error.contains(&candidate),
+            "secret ID errors must not echo input"
+        );
+    }
+
+    assert_eq!(
+        SecretLeaseId::try_from(Uuid::nil()),
+        Err(SecretIdParseError::Nil)
+    );
+
+    let oversized_candidate = "x".repeat(4096);
+    let oversized_error = SecretRefId::parse(&oversized_candidate)
+        .expect_err("oversized secret ID must reject")
+        .to_string();
+    assert!(oversized_error.len() <= 80);
+    assert!(!oversized_error.contains(&oversized_candidate));
+}
+
+macro_rules! assert_secret_id_type_ids_are_unique {
+    ([$($id_type:ident),+ $(,)?]) => {
+        let type_ids = [$(std::any::TypeId::of::<crate::$id_type>()),+];
+        let unique = type_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(type_ids.len(), 40);
+        assert_eq!(unique.len(), type_ids.len());
+    };
+}
+
+#[test]
+fn all_secret_ids_are_pairwise_nominally_distinct() {
+    with_secret_id_types!(assert_secret_id_type_ids_are_unique);
+}
+
+#[test]
+fn secret_id_ordering_uses_canonical_uuid_network_bytes() {
+    let raw = [
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001",
+        "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4000",
+        "10000000-0000-4000-8000-000000000000",
+    ];
+    let mut actual = raw
+        .iter()
+        .map(|value| SecretRefId::parse(value).expect("canonical secret ID"))
+        .collect::<Vec<_>>();
+    let mut expected = raw
+        .iter()
+        .map(|value| *Uuid::parse_str(value).expect("canonical UUID").as_bytes())
+        .collect::<Vec<_>>();
+
+    actual.sort();
+    expected.sort();
+
+    assert_eq!(
+        actual
+            .iter()
+            .map(|value| *value.as_uuid().as_bytes())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}

@@ -14,10 +14,15 @@
 //! assert_eq!(sequence, 0);
 //! ```
 
+mod identity;
 mod state;
 mod trace;
 mod trace_sync;
 
+pub use identity::{
+    IdentityHistoryRecord, InMemoryPrincipalRegistryStore, PrincipalRegistryStore,
+    PrincipalRegistryStoreError,
+};
 pub use splendor_types::{SnapshotId, StateNodeId};
 pub use state::{
     AsyncStateStore, ImportedStateSnapshot, InMemoryStateStore, SqliteStateStore, StateData,

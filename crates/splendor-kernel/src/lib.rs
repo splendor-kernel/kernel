@@ -24,6 +24,7 @@
 //! assert_eq!(event.sequence, 0);
 //! ```
 
+pub mod authority_obligation_receipts;
 mod escalation;
 mod fleet_telemetry;
 mod local_delegation;
@@ -32,6 +33,7 @@ mod message_router;
 mod node_registry;
 mod policy_cache;
 mod remote_message_transport;
+mod run_authority;
 mod runtime;
 mod scheduler;
 mod state;
@@ -39,15 +41,22 @@ mod tenancy;
 mod trace;
 mod trace_durability;
 
+pub use authority_obligation_receipts::{
+    AuthorityObligationReceiptFacadeError, AuthorityObligationReceiptRevocation,
+    AuthorityObligationReceiptVerifier, LocalAuthorityObligationReceiptConfig,
+};
 pub use escalation::{
     apply_escalation_to_outcome, escalations_require_intervention, observations_for_outcome,
     EscalationEvaluator, EscalationOutcomeInput, ESCALATION_ENGINE_SOURCE,
 };
 pub use fleet_telemetry::{FleetTelemetryCollector, TelemetryThresholds};
 pub use local_delegation::{
-    replay_local_delegations, LocalAgentRegistration, LocalChildRun, LocalDelegationError,
-    LocalDelegationManager, LocalDelegationReplay, LocalDelegationRequest, LocalRunRecord,
-    LocalRunStatus, LocalTaskResponse,
+    replay_local_delegations, LocalAgentRegistration, LocalChildRun, LocalDelegationAuthority,
+    LocalDelegationError, LocalDelegationManager, LocalDelegationRejection, LocalDelegationReplay,
+    LocalDelegationRequest, LocalDelegationRuntimeEdge, LocalRunRecord, LocalRunStatus,
+    LocalTaskResponse, REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION,
+    REASON_DELEGATION_QUIESCENCE_TIMEOUT, REASON_MISSING_PARENT_RUN_GRANT_BINDING,
+    REASON_PARENT_RUN_GRANT_MISMATCH,
 };
 pub use loop_engine::{
     ActionCandidate, AllowAllConstraintEngine, ConstraintEngine, ConstraintEvaluation, LoopEngine,
@@ -64,35 +73,45 @@ pub use node_registry::{
     NodeRegistryError, RegistryHealthStatus,
 };
 pub use policy_cache::{
-    PolicyCache, PolicyCacheConfig, PolicyCacheSnapshot, PolicyDistributionGateway,
-    PolicyDistributionStatus, PolicyRuntimeAuthority, PolicyRuntimeDecision, PolicySyncFailure,
+    PolicyCache, PolicyCacheConfig, PolicyCacheInstallError, PolicyCacheInstallResult,
+    PolicyCacheInstallStatus, PolicyCacheMutationError, PolicyCacheMutationRecorder,
+    PolicyCacheOwner, PolicyCacheRevocationMetadata, PolicyCacheRevocationResult,
+    PolicyCacheRevocationStatus, PolicyCacheSnapshot, PolicyCacheTraceError,
+    PolicyCacheValidationMetadata, PolicyDistributionGateway, PolicyDistributionStatus,
+    PolicyOfflineStatus, PolicyRuntimeAuthority, PolicyRuntimeDecision, PolicySyncFailure,
 };
 pub use remote_message_transport::{
     send_remote_message, InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault,
     RemoteMessageReceiver, RemoteMessageTransport, RemoteMessageTransportError,
 };
+pub use run_authority::{
+    KernelPreEffectAuthorityRecorder, RunActionAdmissionError, RunActionAdmissionState,
+    RunAuthorityHandle,
+};
 pub use runtime::{KernelRuntime, KernelRuntimeConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};
 pub use splendor_types::{
     cloud_helper_failure_validation, validate_cloud_helper_work_order,
-    validate_route_plan_for_local_execution, Action, ActionId, AgentId, CapabilityDocument,
-    CapabilityValidationError, CloudHelperAuthority, CloudHelperValidationError, Constraint,
-    ConstraintKind, ConstraintScope, ContentHash, CostEstimate, DelegatedAuthority, DenialSignal,
-    EscalationContext, EscalationDecision, EscalationObservation, EscalationPolicy,
-    EscalationPolicyError, EscalationRule, EscalationScope, EscalationTrigger, FailureCategory,
-    FailureSignal, Feedback, FleetId, FleetTelemetrySnapshot, HashAlgorithm, HealthStatus,
-    IdentityValidationError, InstanceHealth, InstanceHeartbeat, InstanceId, InstanceRegistration,
-    InstanceTelemetry, LocalDelegationTraceContext, LocalRoutePlanValidation, ManagementAuditEvent,
-    ManagementAuditEventKind, Message, MessageDeliveryStatus, MessageEnvelope, MessageId,
-    MessageSchemaVersion, MessageTraceContext, MessageTraceLinks, MessageValidationError,
-    NodeHealth, NodeHeartbeat, NodeId, NodeKind, NodeOnlineState, NodeRegistration,
-    NodeRegistryValidationError, NodeTelemetry, Percept, PerceptProvenance, PolicyBundle,
-    PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring, PolicyBundleTraceContext,
-    PolicyBundleValidationContext, PolicyBundleValidationError, PolicyDegradedMode, QueueTelemetry,
-    QuotaSignal, QuotaUsage, RegistryScope, RemoteMessageEnvelope, RemoteMessageEnvelopeVersion,
-    RemoteMessageRetryPolicy, RemoteMessageTraceContext, RemoteMessageValidationError, Reward,
-    RoutePlanProposal, RouteWaypointProposal, RunId, RunStatus, RunStatusCount, RunStatusCounts,
-    RunTelemetry, RuntimeIdentityContext, RuntimeMode, SideEffectClass, SnapshotId, StateHandoff,
+    validate_route_plan_for_local_execution, Action, ActionId, AgentId, AuthorityBudgetScope,
+    CapabilityDocument, CapabilityGrantId, CapabilityValidationError, CloudHelperAuthority,
+    CloudHelperValidationError, Constraint, ConstraintKind, ConstraintScope, ContentHash,
+    CostEstimate, DelegatedAuthority, DelegationRoleProfile, DenialSignal, EscalationContext,
+    EscalationDecision, EscalationObservation, EscalationPolicy, EscalationPolicyError,
+    EscalationRule, EscalationScope, EscalationTrigger, FailureCategory, FailureSignal, Feedback,
+    FleetId, FleetTelemetrySnapshot, HashAlgorithm, HealthStatus, IdentityValidationError,
+    InstanceHealth, InstanceHeartbeat, InstanceId, InstanceRegistration, InstanceTelemetry,
+    LocalDelegationAuthorityEvidence, LocalDelegationTraceContext, LocalRoutePlanValidation,
+    ManagementAuditEvent, ManagementAuditEventKind, Message, MessageDeliveryStatus,
+    MessageEnvelope, MessageId, MessageSchemaVersion, MessageTraceContext, MessageTraceLinks,
+    MessageValidationError, NodeHealth, NodeHeartbeat, NodeId, NodeKind, NodeOnlineState,
+    NodeRegistration, NodeRegistryValidationError, NodeTelemetry, Percept, PerceptProvenance,
+    PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring,
+    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError,
+    PolicyDegradedMode, PrincipalId, QueueTelemetry, QuotaSignal, QuotaUsage, RegistryScope,
+    RemoteMessageEnvelope, RemoteMessageEnvelopeVersion, RemoteMessageRetryPolicy,
+    RemoteMessageTraceContext, RemoteMessageValidationError, Reward, RoutePlanProposal,
+    RouteWaypointProposal, RunId, RunStatus, RunStatusCount, RunStatusCounts, RunTelemetry,
+    RuntimeIdentityContext, RuntimeMode, SideEffectClass, SnapshotId, StateHandoff,
     StateHandoffAuthority, StateHandoffSnapshot, StateHandoffTraceContext, StateNodeId,
     StateReference, StateReferenceMode, TaskFailure, TaskRequest, TaskResponse, TaskResponseStatus,
     TelemetryAuthority, TelemetryRuntimeMode, TenantId, TickId, TraceEvent, TraceEventId,

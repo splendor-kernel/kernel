@@ -158,7 +158,7 @@ fn registers_node_with_scope_capabilities_version_health_and_audit() {
 
     let registration = node_registration(node_id.clone(), tenant_id, at);
     let record = registry
-        .register_node(registration.clone())
+        .register_node_received_at(registration.clone(), at)
         .expect("node registered");
 
     assert_eq!(record.registration.node_id, node_id);
@@ -194,13 +194,16 @@ fn registers_instance_under_node_with_runtime_mode_tenants_features_and_audit() 
     let sink = Arc::new(CapturingAuditSink::default());
     let registry = registry_with_sink(sink.clone(), Duration::seconds(30));
     registry
-        .register_node(node_registration(node_id.clone(), tenant_id.clone(), at))
+        .register_node_received_at(
+            node_registration(node_id.clone(), tenant_id.clone(), at),
+            at,
+        )
         .expect("node");
 
     let registration = instance_registration(node_id.clone(), tenant_id, at);
     let instance_id = registration.instance_id.clone();
     let record = registry
-        .register_instance(registration.clone())
+        .register_instance_received_at(registration.clone(), at)
         .expect("instance registered");
 
     assert_eq!(record.registration.instance_id, instance_id);
@@ -229,20 +232,23 @@ fn heartbeat_updates_health_without_overwriting_static_registration() {
     let registry = registry_with_sink(sink.clone(), Duration::seconds(30));
     let registration = node_registration(node_id.clone(), tenant_id, at);
     registry
-        .register_node(registration.clone())
+        .register_node_received_at(registration.clone(), at)
         .expect("node registered");
 
     let heartbeat_at = at + Duration::seconds(5);
     let updated = registry
-        .record_node_heartbeat(NodeHeartbeat {
-            node_id: node_id.clone(),
-            health: NodeHealth {
-                status: HealthStatus::Degraded,
-                observed_at: heartbeat_at,
-                metadata: serde_json::json!({"network": "limited"}),
+        .record_node_heartbeat_received_at(
+            NodeHeartbeat {
+                node_id: node_id.clone(),
+                health: NodeHealth {
+                    status: HealthStatus::Degraded,
+                    observed_at: heartbeat_at,
+                    metadata: serde_json::json!({"network": "limited"}),
+                },
+                recorded_at: heartbeat_at,
             },
-            recorded_at: heartbeat_at,
-        })
+            heartbeat_at,
+        )
         .expect("heartbeat");
 
     assert_eq!(updated.health.status, HealthStatus::Degraded);
@@ -273,7 +279,7 @@ fn stale_heartbeat_detection_is_deterministic_at_boundary() {
         Duration::seconds(30),
     );
     registry
-        .register_node(node_registration(node_id.clone(), tenant_id, at))
+        .register_node_received_at(node_registration(node_id.clone(), tenant_id, at), at)
         .expect("node");
 
     let fresh = registry
@@ -372,7 +378,7 @@ fn instance_registration_cannot_exceed_parent_node_tenant_scope() {
 }
 
 #[test]
-fn duplicate_instance_unknown_instance_and_timestamp_regression_fail_closed() {
+fn sender_timestamps_cannot_pin_heartbeat_freshness_or_reorder_receipts() {
     let at = now();
     let tenant_id = TenantId::new();
     let node_id = NodeId::new();
@@ -381,12 +387,15 @@ fn duplicate_instance_unknown_instance_and_timestamp_regression_fail_closed() {
         Duration::seconds(30),
     );
     registry
-        .register_node(node_registration(node_id.clone(), tenant_id.clone(), at))
+        .register_node_received_at(
+            node_registration(node_id.clone(), tenant_id.clone(), at),
+            at,
+        )
         .expect("node");
     let registration = instance_registration(node_id.clone(), tenant_id, at);
     let instance_id = registration.instance_id.clone();
     registry
-        .register_instance(registration.clone())
+        .register_instance_received_at(registration.clone(), at)
         .expect("instance");
 
     let duplicate = registry
@@ -399,30 +408,87 @@ fn duplicate_instance_unknown_instance_and_timestamp_regression_fail_closed() {
         Err(NodeRegistryError::UnknownInstance(_))
     ));
 
-    let node_regression = registry
-        .record_node_heartbeat(NodeHeartbeat {
-            node_id: node_id.clone(),
-            health: node_health(HealthStatus::Healthy, at - Duration::seconds(1)),
-            recorded_at: at - Duration::seconds(1),
-        })
-        .expect_err("node regression rejected");
-    assert!(matches!(
-        node_regression,
-        NodeRegistryError::HeartbeatTimestampRegression { .. }
-    ));
+    let future_reported_at = at + Duration::days(365);
+    let first_received_at = at + Duration::seconds(1);
+    let node = registry
+        .record_node_heartbeat_received_at(
+            NodeHeartbeat {
+                node_id: node_id.clone(),
+                health: node_health(HealthStatus::Healthy, future_reported_at),
+                recorded_at: future_reported_at,
+            },
+            first_received_at,
+        )
+        .expect("future sender timestamp is observational only");
+    assert_eq!(node.last_heartbeat_at, first_received_at);
 
-    let instance_regression = registry
-        .record_instance_heartbeat(InstanceHeartbeat {
-            node_id,
-            instance_id,
-            health: instance_health(HealthStatus::Healthy, at - Duration::seconds(1)),
-            recorded_at: at - Duration::seconds(1),
-        })
-        .expect_err("instance regression rejected");
+    let node_receipt_regression = registry
+        .record_node_heartbeat_received_at(
+            NodeHeartbeat {
+                node_id: node_id.clone(),
+                health: node_health(HealthStatus::Degraded, at),
+                recorded_at: at,
+            },
+            at,
+        )
+        .expect_err("manager receipt time cannot move backwards");
     assert!(matches!(
-        instance_regression,
+        node_receipt_regression,
         NodeRegistryError::HeartbeatTimestampRegression { .. }
     ));
+    assert_eq!(
+        registry
+            .node(&node_id)
+            .expect("node after rejected receipt")
+            .last_heartbeat_at,
+        first_received_at
+    );
+
+    let second_received_at = at + Duration::seconds(2);
+    let instance = registry
+        .record_instance_heartbeat_received_at(
+            InstanceHeartbeat {
+                node_id,
+                instance_id,
+                health: instance_health(HealthStatus::Healthy, at - Duration::seconds(1)),
+                recorded_at: at - Duration::seconds(1),
+            },
+            second_received_at,
+        )
+        .expect("later receipt wins despite older sender timestamp");
+    assert_eq!(instance.last_heartbeat_at, second_received_at);
+    let instance_receipt_regression = registry
+        .record_instance_heartbeat_received_at(
+            InstanceHeartbeat {
+                node_id: node.registration.node_id.clone(),
+                instance_id: instance.registration.instance_id.clone(),
+                health: instance_health(HealthStatus::Degraded, future_reported_at),
+                recorded_at: future_reported_at,
+            },
+            first_received_at,
+        )
+        .expect_err("instance receipt time cannot move backwards");
+    assert!(matches!(
+        instance_receipt_regression,
+        NodeRegistryError::HeartbeatTimestampRegression { .. }
+    ));
+    assert_eq!(
+        registry
+            .instance(&instance.registration.instance_id)
+            .expect("instance after rejected receipt")
+            .last_heartbeat_at,
+        second_received_at
+    );
+    assert_eq!(
+        registry
+            .node_health_status_at(
+                &node.registration.node_id,
+                first_received_at + Duration::seconds(30)
+            )
+            .expect("node freshness")
+            .freshness,
+        HeartbeatFreshness::Stale
+    );
 }
 
 #[test]
@@ -452,26 +518,32 @@ fn instance_heartbeat_checks_parent_and_updates_only_mutable_health() {
         Duration::seconds(30),
     );
     registry
-        .register_node(node_registration(node_id.clone(), tenant_id.clone(), at))
+        .register_node_received_at(
+            node_registration(node_id.clone(), tenant_id.clone(), at),
+            at,
+        )
         .expect("node");
     let registration = instance_registration(node_id.clone(), tenant_id, at);
     let instance_id = registration.instance_id.clone();
     registry
-        .register_instance(registration.clone())
+        .register_instance_received_at(registration.clone(), at)
         .expect("instance");
 
     let updated_at = at + Duration::seconds(3);
     let updated = registry
-        .record_instance_heartbeat(InstanceHeartbeat {
-            node_id: node_id.clone(),
-            instance_id: instance_id.clone(),
-            health: InstanceHealth {
-                status: HealthStatus::Degraded,
-                observed_at: updated_at,
-                metadata: serde_json::json!({"queue_pressure": "high"}),
+        .record_instance_heartbeat_received_at(
+            InstanceHeartbeat {
+                node_id: node_id.clone(),
+                instance_id: instance_id.clone(),
+                health: InstanceHealth {
+                    status: HealthStatus::Degraded,
+                    observed_at: updated_at,
+                    metadata: serde_json::json!({"queue_pressure": "high"}),
+                },
+                recorded_at: updated_at,
             },
-            recorded_at: updated_at,
-        })
+            updated_at,
+        )
         .expect("heartbeat");
 
     assert_eq!(updated.health.status, HealthStatus::Degraded);
@@ -482,11 +554,10 @@ fn instance_heartbeat_checks_parent_and_updates_only_mutable_health() {
 
     let second_node_id = NodeId::new();
     registry
-        .register_node(node_registration(
-            second_node_id.clone(),
-            TenantId::new(),
+        .register_node_received_at(
+            node_registration(second_node_id.clone(), TenantId::new(), updated_at),
             updated_at,
-        ))
+        )
         .expect("second node");
 
     let wrong_parent = registry
@@ -513,11 +584,16 @@ fn instance_health_status_uses_explicit_stale_boundary() {
         Duration::seconds(30),
     );
     registry
-        .register_node(node_registration(node_id.clone(), tenant_id.clone(), at))
+        .register_node_received_at(
+            node_registration(node_id.clone(), tenant_id.clone(), at),
+            at,
+        )
         .expect("node");
     let registration = instance_registration(node_id, tenant_id, at);
     let instance_id = registration.instance_id.clone();
-    registry.register_instance(registration).expect("instance");
+    registry
+        .register_instance_received_at(registration, at)
+        .expect("instance");
 
     let fresh = registry
         .instance_health_status_at(&instance_id, at + Duration::seconds(29))

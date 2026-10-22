@@ -8,11 +8,23 @@ use splendor_kernel::{
     TraceEventKind,
 };
 use splendor_store::{InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceStore};
-use splendor_types::{Action, Percept, PerceptProvenance, TenantId};
+use splendor_types::{
+    Action, DeterministicIdFactory, FixedClock, Percept, PerceptProvenance, TenantId,
+};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
-struct StaticPerceptor;
+struct StaticPerceptor {
+    clock: FixedClock,
+}
+
+impl StaticPerceptor {
+    fn new(timestamp: OffsetDateTime) -> Self {
+        Self {
+            clock: FixedClock::new(timestamp),
+        }
+    }
+}
 
 impl Perceptor for StaticPerceptor {
     fn collect(&self, _agent: &AgentContext) -> Result<Vec<Percept>, splendor_kernel::LoopError> {
@@ -23,7 +35,7 @@ impl Perceptor for StaticPerceptor {
                 source: "integration".to_string(),
                 detail: None,
             },
-            timestamp: OffsetDateTime::now_utc(),
+            timestamp: self.clock.now(),
         }])
     }
 }
@@ -162,25 +174,34 @@ fn build_gateway(registry: &TenantRegistry, actions: &[&str]) -> Arc<dyn ActionG
     Arc::new(gateway)
 }
 
-fn build_engine(
+struct EngineFixture {
+    agent_id: splendor_kernel::AgentId,
     tenant_id: TenantId,
     run_id: RunId,
-    action_name: &str,
+    action_name: &'static str,
     state_store: Arc<InMemoryStateStore>,
     trace_store: Arc<InMemoryTraceStore>,
     snapshot_policy: SnapshotPolicy,
     gateway: Arc<dyn ActionGateway>,
-) -> LoopEngine {
+}
+
+fn build_engine(fixture: EngineFixture) -> LoopEngine {
+    let EngineFixture {
+        agent_id,
+        tenant_id,
+        run_id,
+        action_name,
+        state_store,
+        trace_store,
+        snapshot_policy,
+        gateway,
+    } = fixture;
     let graph = StateGraph::new(state_store, snapshot_policy);
     let initial_state = StateData {
         bytes: vec![0],
         content_type: None,
     };
-    let agent = AgentContext::new(
-        splendor_kernel::AgentId::new(),
-        tenant_id,
-        AgentRuntimeConfig::default(),
-    );
+    let agent = AgentContext::new(agent_id, tenant_id, AgentRuntimeConfig::default());
     let mut engine = LoopEngine::with_trace_store(
         agent,
         graph,
@@ -193,8 +214,17 @@ fn build_engine(
         Some(run_id),
     )
     .expect("engine");
-    engine.add_perceptor(StaticPerceptor);
+    engine.add_perceptor(StaticPerceptor::new(fixture_time()));
     engine
+}
+
+fn fixture_ids() -> DeterministicIdFactory {
+    DeterministicIdFactory::from_seed("integration_scheduler_state_trace_resume")
+        .expect("deterministic fixture IDs")
+}
+
+fn fixture_time() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("deterministic fixture time")
 }
 
 fn read_events(trace_store: &InMemoryTraceStore, run_id: &RunId) -> Vec<TraceEvent> {
@@ -232,7 +262,8 @@ fn last_snapshot_bytes(
 
 #[test]
 fn scheduler_runs_cycles_and_persists_state_and_traces() {
-    let tenant_id = TenantId::new();
+    let ids = fixture_ids();
+    let tenant_id = ids.tenant_id("scheduler-tenant").expect("tenant");
     let actions = ["alpha", "beta"];
     let registry = build_registry(&tenant_id, &actions);
     let gateway = build_gateway(&registry, &actions);
@@ -243,29 +274,31 @@ fn scheduler_runs_cycles_and_persists_state_and_traces() {
     };
     let state_store_one = Arc::new(InMemoryStateStore::default());
     let trace_store_one = Arc::new(InMemoryTraceStore::default());
-    let run_id_one = RunId::new();
-    let engine_one = build_engine(
-        tenant_id.clone(),
-        run_id_one.clone(),
-        "alpha",
-        state_store_one.clone(),
-        trace_store_one.clone(),
-        snapshot_policy.clone(),
-        gateway.clone(),
-    );
+    let run_id_one = ids.run_id("alpha-run").expect("run");
+    let engine_one = build_engine(EngineFixture {
+        agent_id: ids.agent_id("alpha-agent").expect("agent"),
+        tenant_id: tenant_id.clone(),
+        run_id: run_id_one.clone(),
+        action_name: "alpha",
+        state_store: state_store_one.clone(),
+        trace_store: trace_store_one.clone(),
+        snapshot_policy: snapshot_policy.clone(),
+        gateway: gateway.clone(),
+    });
 
     let state_store_two = Arc::new(InMemoryStateStore::default());
     let trace_store_two = Arc::new(InMemoryTraceStore::default());
-    let run_id_two = RunId::new();
-    let engine_two = build_engine(
-        tenant_id.clone(),
-        run_id_two.clone(),
-        "beta",
-        state_store_two.clone(),
-        trace_store_two.clone(),
-        snapshot_policy.clone(),
+    let run_id_two = ids.run_id("beta-run").expect("run");
+    let engine_two = build_engine(EngineFixture {
+        agent_id: ids.agent_id("beta-agent").expect("agent"),
+        tenant_id: tenant_id.clone(),
+        run_id: run_id_two.clone(),
+        action_name: "beta",
+        state_store: state_store_two.clone(),
+        trace_store: trace_store_two.clone(),
+        snapshot_policy: snapshot_policy.clone(),
         gateway,
-    );
+    });
 
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
     scheduler.add_agent(engine_one);
@@ -318,7 +351,9 @@ fn scheduler_runs_cycles_and_persists_state_and_traces() {
 
 #[test]
 fn scheduler_resumes_from_trace_store_and_continues_state() {
-    let tenant_id = TenantId::new();
+    let ids = fixture_ids();
+    let tenant_id = ids.tenant_id("resume-tenant").expect("tenant");
+    let agent_id = ids.agent_id("resume-agent").expect("agent");
     let actions = ["resume"];
     let registry = build_registry(&tenant_id, &actions);
     let gateway = build_gateway(&registry, &actions);
@@ -329,16 +364,17 @@ fn scheduler_resumes_from_trace_store_and_continues_state() {
     };
     let state_store = Arc::new(InMemoryStateStore::default());
     let trace_store = Arc::new(InMemoryTraceStore::default());
-    let run_id = RunId::new();
-    let engine = build_engine(
-        tenant_id.clone(),
-        run_id.clone(),
-        "resume",
-        state_store.clone(),
-        trace_store.clone(),
-        snapshot_policy.clone(),
+    let run_id = ids.run_id("resume-run").expect("run");
+    let engine = build_engine(EngineFixture {
+        agent_id: agent_id.clone(),
+        tenant_id: tenant_id.clone(),
+        run_id: run_id.clone(),
+        action_name: "resume",
+        state_store: state_store.clone(),
+        trace_store: trace_store.clone(),
+        snapshot_policy: snapshot_policy.clone(),
         gateway,
-    );
+    });
 
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
     scheduler.add_agent(engine);
@@ -347,11 +383,7 @@ fn scheduler_resumes_from_trace_store_and_continues_state() {
     let registry = build_registry(&tenant_id, &actions);
     let gateway = build_gateway(&registry, &actions);
     let graph = StateGraph::new(state_store.clone(), snapshot_policy);
-    let agent = AgentContext::new(
-        splendor_kernel::AgentId::new(),
-        tenant_id,
-        AgentRuntimeConfig::default(),
-    );
+    let agent = AgentContext::new(agent_id, tenant_id, AgentRuntimeConfig::default());
     let mut engine = LoopEngine::resume_from_trace_store(
         agent,
         graph,
@@ -363,7 +395,7 @@ fn scheduler_resumes_from_trace_store_and_continues_state() {
         run_id.clone(),
     )
     .expect("resume");
-    engine.add_perceptor(StaticPerceptor);
+    engine.add_perceptor(StaticPerceptor::new(fixture_time()));
 
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
     scheduler.add_agent(engine);
@@ -386,7 +418,7 @@ fn loop_engine_marks_needs_intervention_on_postcondition_failure() {
     let tenant_id = TenantId::new();
     let actions = ["post"];
     let registry = build_registry(&tenant_id, &actions);
-    registry.begin_tick(1, OffsetDateTime::now_utc());
+    registry.begin_tick(1, fixture_time());
     let gateway = build_gateway(&registry, &actions);
 
     let state_store = Arc::new(InMemoryStateStore::default());
@@ -420,7 +452,7 @@ fn loop_engine_marks_needs_intervention_on_postcondition_failure() {
         Some(run_id.clone()),
     )
     .expect("engine");
-    engine.add_perceptor(StaticPerceptor);
+    engine.add_perceptor(StaticPerceptor::new(fixture_time()));
 
     let outcome = engine.tick(1).expect("tick");
     assert!(matches!(
@@ -449,7 +481,7 @@ fn loop_engine_denies_adapter_mismatch_without_execution() {
     let tenant_id = TenantId::new();
     let actions = ["mismatch"];
     let registry = build_registry(&tenant_id, &actions);
-    registry.begin_tick(1, OffsetDateTime::now_utc());
+    registry.begin_tick(1, fixture_time());
 
     let calls = Arc::new(Mutex::new(0));
     let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
@@ -491,7 +523,7 @@ fn loop_engine_denies_adapter_mismatch_without_execution() {
         Some(run_id.clone()),
     )
     .expect("engine");
-    engine.add_perceptor(StaticPerceptor);
+    engine.add_perceptor(StaticPerceptor::new(fixture_time()));
 
     let outcome = engine.tick(1).expect("tick");
     assert!(matches!(

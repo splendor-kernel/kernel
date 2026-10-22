@@ -19,6 +19,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
           rustup default stable
+      - name: FND-002 architecture dependency guard
+        run: |
+          python3 scripts/architecture/check-dependency-policy.py --self-test
+          python3 scripts/architecture/check-dependency-policy.py
       - name: Rust fmt
         run: cargo fmt --all -- --check
       - name: Rust clippy

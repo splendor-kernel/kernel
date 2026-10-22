@@ -14,6 +14,18 @@ def audit():
     return {"credential_id": "cred", "principal": {"client_principal_id": "client"}, "requested_at": "2026-06-05T00:00:00Z"}
 
 
+def create_run_body(**overrides):
+    body = {
+        "request_id": "req_python_create_run",
+        "idempotency_key": "idem_python_create_run",
+        "credential": credential(),
+        "audit_attribution": audit(),
+        "work_order": {"signature": "sig"},
+    }
+    body.update(overrides)
+    return body
+
+
 class Response:
     def __init__(self, body=b'{"ok":true}'):
         self.body = body
@@ -45,7 +57,7 @@ def test_refuses_anonymous_fallback():
         SplendorDaemonClient("http://127.0.0.1:8077", "  ")
     client = SplendorDaemonClient("http://127.0.0.1:8077", "token")
     with pytest.raises(ValueError, match="caller credential"):
-        client.create_run({"work_order": {"signature": {}}, "audit_attribution": audit()})
+        client.create_run({"request_id": "req", "idempotency_key": "idem", "work_order": {"signature": {}}, "audit_attribution": audit()})
 
 
 def test_replay_request_shape_suppresses_side_effects(monkeypatch):
@@ -108,7 +120,7 @@ def test_mutating_methods_include_credentials_and_audit(monkeypatch):
         default_audit_attribution=audit(),
     )
 
-    client.create_run({"credential": credential(), "audit_attribution": audit(), "work_order": {"signature": "sig"}})
+    client.create_run(create_run_body())
     client.append_percept("run_1", {"schema": "splendor.percept.test.v1"})
     client.start_run("run_1", {})
     client.stop_run("run_1", {})
@@ -128,6 +140,9 @@ def test_mutating_methods_include_credentials_and_audit(monkeypatch):
         body = request.data.decode("utf-8")
         assert '"credential"' in body
         assert '"audit_attribution"' in body
+    create_body = captured[0].data.decode("utf-8")
+    assert '"request_id": "req_python_create_run"' in create_body
+    assert '"idempotency_key": "idem_python_create_run"' in create_body
 
 
 def test_mutating_validation_and_redaction_policy():
@@ -137,8 +152,12 @@ def test_mutating_validation_and_redaction_policy():
         default_credential=credential(),
         default_audit_attribution=audit(),
     )
+    with pytest.raises(ValueError, match="request_id"):
+        client.create_run(create_run_body(request_id=" "))
+    with pytest.raises(ValueError, match="idempotency_key"):
+        client.create_run(create_run_body(idempotency_key="\t"))
     with pytest.raises(ValueError, match="signed scoped work_order"):
-        client.create_run({"credential": credential(), "audit_attribution": audit()})
+        client.create_run(create_run_body(work_order=None))
     with pytest.raises(ValueError, match="causal_trace_id"):
         client.submit_action({"action": {"name": "noop"}})
     with pytest.raises(ValueError, match="redaction_policy"):

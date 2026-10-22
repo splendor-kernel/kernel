@@ -73,7 +73,7 @@ TraceEventId = uuid_v5(NAMESPACE_OID, "{run_id}:{sequence}")
 - `source_agent_id` (`AgentId`): sending agent.
 - `target_agent_id` (`AgentId`): intended receiving agent.
 - `run_id` (`RunId`): run scope.
-- `schema` (`String`): versioned payload schema such as `splendor.message.task_request.v1`.
+- `schema` (`String`): versioned payload schema such as `splendor.message.task_request.v2`.
 - `payload` (`serde_json::Value`): typed JSON payload.
 - `causal_parent` (`Option<TraceEventId>`): required-but-nullable trace event that caused the message; canonical JSON must include the field and use `null` when no parent exists.
 - `requires_response` (`bool`): whether a response is expected.

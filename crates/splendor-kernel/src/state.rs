@@ -30,7 +30,8 @@ use splendor_types::{
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-const STATE_HANDOFF_SCHEMA_VERSION: &str = "splendor.state_handoff.v0";
+/// Current state-handoff schema accepted by the kernel state owner.
+pub const STATE_HANDOFF_SCHEMA_VERSION: &str = "splendor.state_handoff.v0";
 
 /// Policy describing when snapshots should be created.
 #[derive(Clone, Debug, Default)]
@@ -81,6 +82,8 @@ pub struct StateHandoffScope {
     pub agent_id: AgentId,
     /// Run identity expected by the receiver.
     pub run_id: RunId,
+    /// Concrete receiver instance expected by the importing runtime, when known.
+    pub receiver_instance_id: Option<String>,
 }
 
 /// Request fields needed to export a state handoff envelope from a snapshot.
@@ -188,6 +191,19 @@ impl StateGraph {
         })
     }
 
+    /// Snapshots the current head and builds a handoff through the state owner.
+    pub fn export_current_handoff(
+        &self,
+        request: StateHandoffExportRequest,
+    ) -> Result<StateHandoff, StateGraphError> {
+        let head = self
+            .head
+            .as_ref()
+            .ok_or(StateGraphError::MissingStateHead)?;
+        let snapshot_id = self.store.snapshot(head)?;
+        self.export_handoff(&snapshot_id, request)
+    }
+
     /// Imports a validated state handoff snapshot and updates the receiver head.
     ///
     /// All authority, trace, hash, and stale-head checks run before the receiver
@@ -212,12 +228,22 @@ impl StateGraph {
                 schema_version: handoff.schema_version.clone(),
             });
         }
+        if let Some(expected_receiver) = scope.receiver_instance_id.as_deref() {
+            if handoff.receiver_instance_id.as_deref() != Some(expected_receiver) {
+                return Err(StateGraphError::IncompatibleWorkOrder);
+            }
+        }
         validate_handoff_authority(&handoff.authority, work_order, keyring, scope, now)?;
         if handoff.source_trace_id.is_none() {
             return Err(StateGraphError::MissingTraceContinuity);
         }
 
         let actual_head = self.head.as_ref().map(ToString::to_string);
+        if actual_head.as_deref() == Some(handoff.snapshot.state_node_id.as_str()) {
+            return Err(StateGraphError::ReplayedHandoff {
+                handoff_id: handoff.handoff_id.clone(),
+            });
+        }
         if handoff.previous_state_node_id != actual_head {
             return Err(StateGraphError::StaleStateHead {
                 expected: handoff.previous_state_node_id.clone(),
@@ -336,6 +362,9 @@ pub enum StateGraphError {
     /// Propagated failures from the underlying state store.
     #[error("state store error: {0}")]
     Store(#[from] StateStoreError),
+    /// A handoff export was requested before the graph had a state head.
+    #[error("state handoff export requires an existing state head")]
+    MissingStateHead,
     /// Handoff mode did not match the operation.
     #[error("invalid state handoff mode: expected {expected:?}, got {actual:?}")]
     InvalidHandoffMode {
@@ -371,6 +400,12 @@ pub enum StateGraphError {
     /// Source trace linkage was absent.
     #[error("state handoff is missing source trace continuity")]
     MissingTraceContinuity,
+    /// The receiver already owns the handed-off state node.
+    #[error("state handoff {handoff_id} has already been imported")]
+    ReplayedHandoff {
+        /// Replayed handoff identity.
+        handoff_id: String,
+    },
     /// Receiver head did not match the expected previous head.
     #[error("state handoff expected receiver head {expected:?} but found {actual:?}")]
     StaleStateHead {
@@ -393,6 +428,30 @@ pub enum StateGraphError {
         /// Reference identifier.
         reference_id: String,
     },
+}
+
+impl StateGraphError {
+    /// Returns a bounded reason suitable for trace/audit projection.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Store(_) => "state_store_error",
+            Self::MissingStateHead => "state_handoff_missing_state_head",
+            Self::InvalidHandoffMode { .. } => "invalid_state_handoff_mode",
+            Self::UnsupportedHandoffSchema { .. } => "unsupported_state_handoff_schema",
+            Self::IncompatibleWorkOrder => "incompatible_state_handoff_work_order",
+            Self::WorkOrderValidation(error) => error.reason_code(),
+            Self::UnsignedWorkOrder => "unsigned_state_handoff_work_order",
+            Self::ExpiredWorkOrder => "expired_state_handoff_work_order",
+            Self::RevokedWorkOrder { .. } => "revoked_state_handoff_work_order",
+            Self::MissingTraceContinuity => "missing_state_handoff_trace_continuity",
+            Self::ReplayedHandoff { .. } => "replayed_state_handoff",
+            Self::StaleStateHead { .. } => "stale_state_handoff_head",
+            Self::StateReferenceHashMismatch { .. } => "state_reference_hash_mismatch",
+            Self::ReadOnlyReferenceMutationDenied { .. } => {
+                "read_only_state_reference_mutation_denied"
+            }
+        }
+    }
 }
 
 fn validate_handoff_authority(

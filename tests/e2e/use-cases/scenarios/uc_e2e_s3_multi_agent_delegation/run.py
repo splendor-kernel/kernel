@@ -293,7 +293,7 @@ def main() -> int:
     for case in [
         "specialist_external_artifact_publish_denied",
         "unauthorized_recipient_message_denied",
-        "unsupported_message_schema_rejected_before_delivery",
+        "invalid_v2_task_request_payload_rejected_before_delivery",
         "broad_permission_data_ref_smuggling_denied",
         "cross_tenant_message_attempt_rejected",
         "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger",

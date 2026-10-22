@@ -16,6 +16,11 @@ Rust contract:
 splendor_kernel::{
     PolicyCache,
     PolicyCacheConfig,
+    PolicyCacheOwner,
+    PolicyCacheInstallResult,
+    PolicyCacheRevocationMetadata,
+    PolicyCacheMutationRecorder,
+    PolicyCacheMutationError,
     PolicyCacheSnapshot,
     PolicyCacheValidationMetadata,
     PolicyDistributionGateway,
@@ -30,11 +35,14 @@ splendor_kernel::{
 | Field | Purpose |
 | --- | --- |
 | `enforcement_required` | Whether missing policy authority denies policy invocation/action execution. |
+| `owner` | Immutable tenant+agent cache owner. Validated wrappers and action requests must match it. |
 | `disconnected` | Whether the runtime is explicitly operating without central policy connectivity. |
 | `bundle` | Current validated bundle metadata and authority. |
-| `validation` | Signature algorithm/key-id metadata and validation time without signature material. |
+| `validation` | Trusted signature algorithm/key-id metadata and validation time from `ValidatedPolicyBundle`, without signature material. |
 | `last_sync_at` | Last successful bundle install/sync time. |
 | `revoked_reason` | Local revocation marker applied to the current bundle. |
+| `revocation` | Exact trusted revoked candidate watermark metadata used to prevent older active/revoked replay. |
+| `pending_revocation` | Exact trusted revocation watermark retained after required evidence failure; runtime remains deny-only. |
 | `last_sync_failure` | Sanitized sync failure reason and timestamp. |
 
 `PolicyCacheSnapshot` exposes trace/API-safe status: bundle version, scope, TTL,
@@ -62,6 +70,8 @@ and sync failure state. It does not expose detached signatures or secrets.
 | Disconnected, within TTL | Any other action | Deny `offline_action_not_allowed`; adapter not called. |
 | Disconnected, expired bundle | Any action, including explicit low-risk read-only | Deny `policy_expired`; adapter not called. |
 | Missing or revoked bundle | Any action/policy invocation | Fail closed. |
+| Runtime time before trusted validation/maximum observed time | Any action/policy invocation | Deny `policy_clock_rollback`; adapter not called. |
+| Trusted revocation pending required trace evidence | Any action/policy invocation | Deny `policy_evidence_unavailable`; adapter not called. |
 
 This makes low-risk cached behavior explicit and avoids inferring broad authority
 from arbitrary action names or side-effect classes.
@@ -69,18 +79,67 @@ from arbitrary action names or side-effect classes.
 ## Lifecycle
 
 1. A run is created with a validated policy bundle, or a bundle is synced later.
-2. `PolicyCache::install_validated` or `install_validated_envelope` installs the
-   bundle and records `last_sync_at` plus validation metadata.
-3. Central disconnection is marked by `set_disconnected_with_trace(true, time)`.
+2. `PolicyCache::install_validated_traced` consumes only a
+   `ValidatedPolicyBundle` plus a trusted `PolicyCacheMutationRecorder`. The method
+   internally plans, persists required acceptance/connectivity events, and only
+   then commits. Internal plan/commit methods and plan types are not public.
+   There is no raw bundle/envelope production insertion API.
+3. Central disconnection is marked by `mark_disconnected_with_trace(time)`.
 4. The gateway wrapper applies the decision rules before adapters can run.
-5. Reconnect is marked by `set_disconnected_with_trace(false, time)`; a new valid
-   bundle may then update cache status without resetting trace continuity.
+5. Reconnect can be planned only by a first or strictly newer accepted active
+   policy. An exact retry never reconnects. Commit occurs only after the required
+   reconnect trace is durable.
+
+Policy validation occurs before installation. Unsupported, future-issued, and
+expired sync candidates record `PolicyBundleRejected` plus `PolicySyncFailed`
+and leave the last trusted cached bundle unchanged. A matching revoked candidate
+uses the existing revocation path to block the current cached bundle. None of
+these failures installs candidate authority or creates an alternate adapter path.
+Older active candidates, same-issued-at content conflicts, and unrelated/older
+revocation candidates likewise fail before authority mutation. The exact trusted
+revoked candidate remains as a watermark: older active/revoked candidates cannot
+clear or replace it, exact revocation retry is idempotent, and equal-time
+different revocation content conflicts. Only active authority strictly newer
+than both current authority and that watermark clears it. Reconnect is emitted
+only for an initial/strictly-newer accepted install, never an exact retry.
+
+## Rust migration
+
+| Removed/changed API | Current API |
+| --- | --- |
+| `PolicyCache::new(config)` | `PolicyCache::new(config, PolicyCacheOwner { tenant_id, agent_id })` |
+| `install_validated(...)`, public prepare/commit, or raw bundle/envelope insertion | `install_validated_traced(ValidatedPolicyBundle, reconnect, &dyn PolicyCacheMutationRecorder)` |
+| `apply_validated_revocation(...)`, public prepare/commit, or raw revocation marker | `apply_validated_revocation_traced(ValidatedPolicyBundle, &dyn PolicyCacheMutationRecorder)` |
+| Legacy direct disconnection setter | `mark_disconnected_with_trace(at)` |
+| Legacy direct reconnect setter | No direct equivalent; only first/strictly-newer traced install can reconnect. |
+
+Internal plans are cache-instance/revision bound, and callers cannot obtain or
+commit them. A trace append may leave partial prepared/non-authorizing evidence,
+but authority/reconnect is not committed unless all required events were
+persisted. If matching revocation tracing fails, the exact candidate is retained
+as a pending watermark and the cache denies `policy_evidence_unavailable` until
+durable retry reconciliation or a successfully traced strictly newer refresh.
+If all revocation events are accepted but internal commit loses a revision race,
+the cache atomically re-evaluates the preserved exact candidate: a still-
+applicable candidate becomes pending deny-only evidence; an already committed or
+pending same/newer revocation remains stricter; and a strictly newer active
+winner is not poisoned by the obsolete candidate. The original race error is
+returned in every case.
+
+`PolicyCacheRevocationMetadata.issued_at` exposes the trace-safe issuance
+watermark; it does not expose policy content, signature bytes, or secrets.
+
+`PolicyCacheMutationRecorder` is a trusted kernel-composition boundary. Its
+implementations must return `Ok(())` only after the required event has been
+durably accepted by the configured runtime trace store. No-op/fake recorders are
+test fixtures only and are not valid daemon or production composition.
 
 ## Trace behavior
 
 Offline/degraded cache decisions are visible through:
 
-- `PolicyBundleAccepted` for installed authority;
+- `PolicyBundleAccepted` for a prepared monotonic candidate before commit; this
+  event alone is non-authorizing and does not prove installation;
 - `PolicyConnectivityChanged` for disconnect/reconnect;
 - `PolicySyncFailed` for failed central sync;
 - `PolicyExpired` for TTL denial;
@@ -94,6 +153,12 @@ connectivity changed, and whether expiry/revocation/offline rules denied or
 paused an action. Replay does not reconnect to central policy distribution,
 refresh bundles, invoke policy code, or execute adapters.
 
+Pre-commit policy events are explicitly prepared/non-authorizing. Their presence
+alone does not prove cache commit. `PolicyCacheSnapshot` and the runtime decision
+at the observed point are authoritative. This slice adds no mutation-attempt ID
+or terminal-status trace schema, so replay correlation of partial attempts is an
+explicit P2 non-claim.
+
 ## Failure modes
 
 | Condition | Result |
@@ -104,7 +169,10 @@ refresh bundles, invoke policy code, or execute adapters.
 | Disconnected high-risk action | Deny or `NeedsIntervention` according to policy. |
 | Disconnected unspecified action | Deny `offline_action_not_allowed`. |
 | Bundle revoked | Deny with `policy_revoked`. |
+| Matching revocation trace evidence unavailable | Retain exact pending issuance watermark and deny `policy_evidence_unavailable` until durable reconciliation or a successfully traced strictly newer active refresh. |
+| Signed bundle issued after the receiver clock | Reject with `future_issued_policy_bundle` before cache installation. |
 | Central sync failed | Record failure and keep previous authority. |
+| Clock moved behind trusted validation/observation time | Deny `policy_clock_rollback`; latched expiry cannot reactivate. |
 
 ## Security notes
 

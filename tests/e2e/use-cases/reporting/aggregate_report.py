@@ -5,13 +5,206 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fixtures"))
+from acceptance_provider_evidence import (  # noqa: E402
+    VERIFICATION_MATERIAL_FIELD,
+    verify_retained_provider_evidence,
+)
+from acceptance_provider_output import (  # noqa: E402
+    project_private_v3_output,
+    verify_retained_private_v3_projection,
+)
+from acceptance_scenario_expectations import (  # noqa: E402
+    expectation_for,
+    expectations_for,
+)
+
+from source_identity import (
+    SOURCE_TREE_DIGEST_ALGORITHM,
+    clean_source_tree_digest,
+    source_tree_identity,
+)
 
 
 FUTURE_SCENARIOS = [f"UC-E2E-S{i}" for i in range(1, 11)]
+
+
+def validate_private_v3_scenario_evidence(
+    scenario: dict,
+    expectations: dict[str, dict],
+    trusted_public_key_path: Path,
+    prefix: str,
+) -> list[str]:
+    failures: list[str] = []
+    projections = scenario.get("private_v3_outputs")
+    if not isinstance(projections, list) or not projections:
+        return [f"{prefix}_private_v3_outputs_missing"]
+    if len(projections) != len(expectations):
+        failures.append(f"{prefix}_private_v3_output_cardinality_invalid")
+    verified_by_id: dict[str, dict] = {}
+    projection_keys: set[str] = set()
+    for index, projection in enumerate(projections):
+        expectation_id = (
+            projection.get("expectation_id") if isinstance(projection, dict) else None
+        )
+        expectation = expectations.get(str(expectation_id))
+        if expectation is None or expectation_id in verified_by_id:
+            failures.append(
+                f"{prefix}_private_v3_output_expectation_invalid:{index}"
+            )
+            continue
+        try:
+            verified = verify_retained_private_v3_projection(
+                projection,
+                trusted_public_key_path=trusted_public_key_path,
+                expectation=expectation,
+            )
+        except Exception as error:  # noqa: BLE001 - aggregate records bounded verifier failure
+            failures.append(
+                f"{prefix}_private_v3_output_invalid:{index}:{type(error).__name__}"
+            )
+            continue
+        verified_by_id[expectation_id] = verified
+        projection_keys.add(verified["public_key_fingerprint"])
+    missing = sorted(set(expectations) - set(verified_by_id))
+    if missing:
+        failures.append(f"{prefix}_private_v3_expectations_missing:" + ",".join(missing))
+    if len(projection_keys) != 1:
+        failures.append(f"{prefix}_private_v3_signing_key_inconsistent")
+    projection_epochs = {
+        projection["provider_epoch"] for projection in verified_by_id.values()
+    }
+    if len(projection_epochs) != 1:
+        failures.append(f"{prefix}_private_v3_provider_epoch_inconsistent")
+    request_ids = [projection["request_id"] for projection in verified_by_id.values()]
+    if len(request_ids) != len(set(request_ids)):
+        failures.append(f"{prefix}_private_v3_request_id_reused")
+    receipt_ids = [
+        projection["provider_receipt_id"] for projection in verified_by_id.values()
+    ]
+    if len(receipt_ids) != len(set(receipt_ids)):
+        failures.append(f"{prefix}_private_v3_provider_receipt_id_reused")
+
+    retained = scenario.get("provider_evidence")
+    if not isinstance(retained, list) or len(retained) != 2:
+        failures.append(f"{prefix}_signed_provider_evidence_missing")
+        return failures
+    provider_epoch: str | None = None
+    seen_nonces: set[str] = set()
+    sequence_by_epoch: dict[tuple[str, str], int] = {}
+    evidence_keys: set[str] = set()
+    verified_evidence: list[dict] = []
+    for index, evidence in enumerate(retained):
+        try:
+            payload = verify_retained_provider_evidence(
+                evidence, trusted_public_key_path=trusted_public_key_path
+            )
+        except Exception as error:  # noqa: BLE001 - aggregate records bounded verifier failure
+            failures.append(
+                f"{prefix}_signed_provider_evidence_invalid:{index}:{type(error).__name__}"
+            )
+            continue
+        verified_evidence.append(payload)
+        binding = payload["request_binding"]
+        if provider_epoch is None:
+            provider_epoch = payload["provider_epoch"]
+        elif payload["provider_epoch"] != provider_epoch:
+            failures.append(f"{prefix}_provider_evidence_epoch_inconsistent:{index}")
+        if binding["nonce"] in seen_nonces:
+            failures.append(f"{prefix}_provider_evidence_nonce_reused:{index}")
+        seen_nonces.add(binding["nonce"])
+        evidence_keys.add(
+            evidence[VERIFICATION_MATERIAL_FIELD]["public_key_fingerprint"]
+        )
+        key = (payload["provider_epoch"], binding["key_id"])
+        previous = sequence_by_epoch.get(key, 0)
+        if payload["snapshot_sequence"] <= previous:
+            failures.append(f"{prefix}_provider_evidence_sequence_not_monotonic:{index}")
+        sequence_by_epoch[key] = payload["snapshot_sequence"]
+    if evidence_keys != projection_keys:
+        failures.append(f"{prefix}_provider_evidence_signing_key_mismatch")
+    evidence_epochs = {payload["provider_epoch"] for payload in verified_evidence}
+    if projection_epochs and evidence_epochs != projection_epochs:
+        failures.append(f"{prefix}_provider_output_evidence_epoch_mismatch")
+    for expectation_id, projection in verified_by_id.items():
+        expected_receipt = {
+            "provider_receipt_id": projection["provider_receipt_id"],
+            "request_body_digest": projection["request_body_digest"],
+            "client_principal_id": projection["client_principal_id"],
+            "operation_id": projection["operation_id"],
+            "action_id": projection["action_id"],
+            "effect_id": projection["effect_id"],
+            "state_digest": projection["state_digest"],
+            "output_digest": projection["output_digest"],
+            "status": projection["status"],
+            "issued_at_unix_ms": projection["receipt_issued_at_unix_ms"],
+            "expires_at_unix_ms": projection["receipt_expires_at_unix_ms"],
+        }
+        for index, payload in enumerate(verified_evidence):
+            receipt_matches = [
+                row for row in payload["receipts"] if row == expected_receipt
+            ]
+            action_matches = [
+                row
+                for row in payload["actions"]
+                if row.get("provider_receipt_id") == projection["provider_receipt_id"]
+                and row.get("request_body_digest") == projection["request_body_digest"]
+                and row.get("client_principal_id")
+                == projection["client_principal_id"]
+                and row.get("tenant_id") == projection["tenant_id"]
+                and row.get("agent_id") == projection["agent_id"]
+                and row.get("run_id") == projection["run_id"]
+                and row.get("action_id") == projection["action_id"]
+                and row.get("effect_id") == projection["effect_id"]
+                and row.get("state_digest") == projection["state_digest"]
+                and row.get("result") == projection["status"]
+            ]
+            if len(receipt_matches) != 1 or len(action_matches) != 1:
+                failures.append(
+                    f"{prefix}_provider_evidence_receipt_chain_mismatch:"
+                    f"{expectation_id}:{index}"
+                )
+    return failures
+
+
+def retained_projection(scenario: dict, expectation_id: str) -> dict:
+    projections = scenario.get("private_v3_outputs", [])
+    matches = [
+        projection
+        for projection in projections
+        if isinstance(projection, dict)
+        and projection.get("expectation_id") == expectation_id
+    ]
+    return matches[0] if len(matches) == 1 else {}
+
+
+def validate_exact_private_v3_output(
+    value: dict,
+    projection: dict,
+    expectation: dict,
+    trusted_public_key_path: Path,
+    failure: str,
+) -> list[str]:
+    try:
+        verified = project_private_v3_output(
+            value,
+            expectation=expectation,
+            public_key_path=trusted_public_key_path,
+            now_ms=projection.get("verified_at_unix_ms"),
+        )
+    except Exception:  # noqa: BLE001 - aggregate reports a bounded verifier failure
+        return [failure]
+    return [] if verified == projection else [failure]
+
+
 S1_REQUIRED_EVENTS = {
     "tick.started",
     "percepts.received",
@@ -76,7 +269,7 @@ S3_REQUIRED_EVENTS = {
 S3_REQUIRED_NEGATIVES = {
     "specialist_external_artifact_publish_denied",
     "unauthorized_recipient_message_denied",
-    "unsupported_message_schema_rejected_before_delivery",
+    "invalid_v2_task_request_payload_rejected_before_delivery",
     "broad_permission_data_ref_smuggling_denied",
     "cross_tenant_message_attempt_rejected",
     "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger",
@@ -85,10 +278,13 @@ S4_REQUIRED_OPERATIONS = {
     "registerNode",
     "registerInstance",
     "heartbeatNode",
+    "heartbeatInstance",
     "advertiseCapabilities",
     "evaluatePlacement",
     "submitWorkOrder",
     "dispatchWorkOrder",
+    "createRun",
+    "startRun",
     "sendMessage",
     "exportStateSnapshot",
     "importStateSnapshot",
@@ -110,8 +306,9 @@ S4_REQUIRED_NEGATIVES = {
     "remote_message_delivery_failure",
     "unsupported_remote_message_schema",
     "unauthorized_remote_message_recipient",
-    "state_handoff_wrong_tenant_rejected",
-    "state_handoff_wrong_hash_rejected",
+    "resident_state_handoff_proof_unavailable",
+    "hash_valid_fabricated_handoff_proof_unavailable",
+    "state_handoff_wrong_hash_not_evaluated_without_proof",
     "state_handoff_wrong_run_rejected",
     "receiver_state_unchanged_on_failed_import",
     "trace_sync_idempotent_duplicate",
@@ -196,6 +393,7 @@ S6_REQUIRED_OPERATIONS = {
 }
 S6_REQUIRED_NEGATIVES = {
     "forbidden_low_level_actions_rejected",
+    "physical_reserved_node_param_rejected",
     "geofence_breach_denied_before_adapter",
     "low_battery_forces_return_to_base_or_intervention",
     "expired_policy_cache_denies_high_risk_offline",
@@ -231,6 +429,7 @@ S6_REQUIRED_EVENTS = {
     "trace.sync.failed",
 }
 S6_REQUIRED_SIMULATED_ACTION_LABELS = {
+    "physical_reserved_node_param_rejected": 0,
     "read_battery_policy_warmup": 1,
     "inspect_zone_from_typed_cloud_proposal": 1,
     "move_to_waypoint_from_typed_cloud_proposal": 1,
@@ -296,6 +495,7 @@ S7_REQUIRED_EVENTS = {
     "artifact.publish.needs_approval",
     "artifact.publish.executed",
     "artifact.publish.denied",
+    "run.resumed",
     "trace.exported.redacted",
     "state.committed",
     "replay.explained",
@@ -343,15 +543,10 @@ S9_REQUIRED_OPERATIONS = {
     "getStateHead",
     "exportTraces",
     "replayRun",
-    "registerNode",
-    "registerInstance",
-    "heartbeatNode",
-    "advertiseCapabilities",
     "evaluatePlacement",
     "submitWorkOrder",
     "sendMessage",
     "getMessage",
-    "syncTraceBuffer",
     "requestApproval",
     "denyApproval",
     "createCircuitBreaker",
@@ -387,6 +582,7 @@ S9_REQUIRED_NEGATIVES = {
     "remote_message_transport_failure_records_delivery_failure",
     "node_heartbeat_stale_denies_placement",
     "quota_exceeded_denies_not_silently_retried",
+    "non_idempotent_adapter_failure_not_automatically_retried",
     "circuit_breaker_wins_pending_approval_race",
     "kill_switch_wins_resume_race_fail_closed",
     "telemetry_stale_missing_cannot_authorize",
@@ -427,7 +623,7 @@ S10_REQUIRED_POSITIVES = {
     "edge_bounded_inspection_executed",
     "internal_artifact_created",
     "external_publication_approval_gated_and_executed_once",
-    "state_handoff_imported_and_resumed_once",
+    "resident_state_handoff_denied_without_source_proof_and_receiver_resumed",
     "central_trace_aggregation_completed",
     "audit_and_replay_explain_without_side_effects",
 }
@@ -460,11 +656,11 @@ S10_REQUIRED_EVENTS = {
     "action.denied",
     "action.needs_approval",
     "approval.granted",
+    "approval.revoked",
     "artifact.created",
     "artifact.publish.executed",
     "state.committed",
     "state.exported",
-    "state.imported",
     "run.resumed",
     "trace.sync.completed",
     "replay.explained",
@@ -547,10 +743,18 @@ S10_RUN_IDS = {
     "44444444-4444-4444-8444-444444448813",
     "44444444-4444-4444-8444-444444448814",
     "44444444-4444-4444-8444-444444448815",
+    "44444444-4444-4444-8444-444444448816",
+    "44444444-4444-4444-8444-444444448817",
+    "44444444-4444-4444-8444-444444448818",
 }
 S10_WORK_ORDER_IDS = {
     "wo_uc_e2e_s10_field_intelligence",
+    "wo_uc_e2e_s10_field_intelligence_data",
+    "wo_uc_e2e_s10_field_intelligence_publish",
+    "wo_uc_e2e_s10_field_intelligence_publish_revoke",
+    "wo_uc_e2e_s10_field_intelligence_message",
     "wo_uc_e2e_s10_scoped_specialist",
+    "wo_uc_e2e_s10_scoped_specialist_message",
     "wo_uc_e2e_s10_cloud_helper_proposal",
     "wo_uc_e2e_s10_edge_inspection",
     "wo_uc_e2e_s10_circuit_branch",
@@ -596,6 +800,7 @@ S10_MANAGER_EVENT_ORIGINALS = {
     "message.received": {"remote_message.received"},
     "cloud_helper.proposal.received": {"remote_message.delivered", "remote_message.received"},
     "approval.granted": {"approval.granted"},
+    "approval.revoked": {"approval.revoked"},
     "governance.audit.exported": {"governance.audit.exported"},
     "circuit_breaker.tripped": {"circuit_breaker.tripped"},
     "kill_switch.activated": {"kill_switch.activated"},
@@ -603,8 +808,8 @@ S10_MANAGER_EVENT_ORIGINALS = {
 S10_RESPONSE_EVENT_ORIGINALS = {
     "cloud_helper.proposal.received": {"sendMessage"},
     "approval.granted": {"grantApproval"},
+    "approval.revoked": {"revokeApproval"},
     "state.exported": {"exportStateSnapshot"},
-    "state.imported": {"importStateSnapshot"},
     "trace.sync.completed": {"syncTraceBuffer", "syncDeviceTraceBuffer"},
     "governance.audit.exported": {"exportGovernanceAudit"},
 }
@@ -809,6 +1014,167 @@ def collect_values_for_key(value: object, key: str) -> list[str]:
     return found
 
 
+def operation_rows(api_rows: list[dict], operation_id: str) -> list[tuple[int, dict]]:
+    return [
+        (index, row)
+        for index, row in enumerate(api_rows)
+        if row.get("operation_id") == operation_id
+    ]
+
+
+def row_path(row: dict) -> str:
+    return urlsplit(str(row.get("url", ""))).path.rstrip("/") or "/"
+
+
+def lifecycle_projection(value: object) -> dict:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: source.get(key)
+        for key in ["run_id", "status", "ticks", "state_head", "adapter_executions"]
+    }
+
+
+def state_projection(value: object) -> dict:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: source.get(key)
+        for key in ["run_id", "state_node_id", "data_hash", "parent_state_node_ids"]
+    }
+
+
+def authority_receipt_projection(value: object) -> dict:
+    source = value if isinstance(value, dict) else {}
+    validation = source.get("validation", {})
+    if not isinstance(validation, dict):
+        validation = {}
+    return {
+        key: source.get(key)
+        for key in [
+            "schema_version",
+            "receipt_id",
+            "issuer",
+            "kind",
+            "approval_id",
+            "subject",
+            "audience",
+            "authority_decision_id",
+            "obligation_id",
+            "canonical_request_digest",
+            "evidence_digest",
+            "expires_at",
+            "approval_trace_event_id",
+            "evidence_ref",
+            "revocation",
+            "revocation_ref",
+        ]
+    } | {
+        "validation": {
+            key: validation.get(key)
+            for key in ["algorithm", "digest", "key_id", "validation_kind"]
+        }
+    }
+
+
+def contains_unredacted_authority_receipt_signature(value: object) -> bool:
+    if isinstance(value, dict):
+        is_receipt = (
+            value.get("schema_version")
+            == "splendor.authority.obligation_receipt.v1"
+            or bool(value.get("receipt_id") and value.get("validation"))
+        )
+        validation = value.get("validation")
+        if is_receipt and isinstance(validation, dict):
+            signature = validation.get("signature")
+            if signature and not str(signature).startswith("[REDACTED"):
+                return True
+        return any(
+            contains_unredacted_authority_receipt_signature(child)
+            for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(contains_unredacted_authority_receipt_signature(child) for child in value)
+    return False
+
+
+def validate_manager_approval_auth_evidence(
+    report: dict,
+    api_rows: list[dict],
+    required_operations: set[str],
+    prefix: str,
+) -> list[str]:
+    failures: list[str] = []
+    events = report.get("events", [])
+    relevant_rows = [row for row in api_rows if row.get("manager_approval_call_id")]
+    if not isinstance(events, list):
+        return [f"{prefix}_manager_approval_auth_events_invalid"]
+    event_ids = [event.get("call_id") for event in events]
+    row_ids = [row.get("manager_approval_call_id") for row in relevant_rows]
+    events_by_id = {event.get("call_id"): event for event in events}
+    rows_by_id = {row.get("manager_approval_call_id"): row for row in relevant_rows}
+    if (
+        len(events) != len(required_operations)
+        or {event.get("operation_id") for event in events} != required_operations
+    ):
+        failures.append(f"{prefix}_manager_approval_auth_operations_invalid")
+    if (
+        len(event_ids) != len(set(event_ids))
+        or len(row_ids) != len(set(row_ids))
+        or set(event_ids) != set(row_ids)
+    ):
+        failures.append(f"{prefix}_manager_approval_auth_api_cardinality_mismatch")
+    credential_ids: list[str] = []
+    for call_id, event in events_by_id.items():
+        row = rows_by_id.get(call_id, {})
+        request = row.get("request", {}) if isinstance(row.get("request"), dict) else {}
+        credential = request.get("credential", {}) if isinstance(request.get("credential"), dict) else {}
+        audit = request.get("audit_attribution", {}) if isinstance(request.get("audit_attribution"), dict) else {}
+        response = row.get("response", {}) if isinstance(row.get("response"), dict) else {}
+        credential_id = str(event.get("credential_id") or "")
+        credential_ids.append(credential_id)
+        trace_ids = event.get("trace_event_ids", [])
+        response_trace_id = response.get("trace_event_id")
+        if (
+            event.get("operation_id") not in required_operations
+            or event.get("method") not in {None, "POST"}
+            or event.get("scope") != "approvals_manage"
+            or event.get("required_scope", "approvals_manage") != "approvals_manage"
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", credential_id)
+            or event.get("fleet_id") != "00000000-0000-4000-8000-000000000104"
+            or event.get("target_manager_id") != "central-manager"
+            or event.get("audience_manager_id") != "central-manager"
+            or event.get("header_presence", {}).get("authorization") is not True
+            or event.get("body_mirror_status") != "matched"
+            or event.get("raw_bearer_recorded") is not False
+            or event.get("raw_signature_recorded", False) is not False
+            or event.get("receipt_signature_recorded", False) is not False
+            or row.get("operation_id") != event.get("operation_id")
+            or row.get("method") != "POST"
+            or row.get("status") != event.get("result_status")
+            or event.get("result_status") not in event.get(
+                "expected_statuses", [event.get("result_status")]
+            )
+            or credential.get("credential_id") != credential_id
+            or credential.get("scopes") != ["approvals_manage"]
+            or credential.get("binding")
+            != {"fleet": {"fleet_id": "00000000-0000-4000-8000-000000000104"}}
+            or credential.get("audience")
+            != {"central_manager": {"manager_id": "central-manager"}}
+            or audit.get("credential_id") != credential_id
+            or audit.get("principal") != credential.get("principal")
+            or contains_bearer_bytes(row)
+            or (
+                row.get("status") == 200
+                and (not response_trace_id or response_trace_id not in trace_ids)
+            )
+        ):
+            failures.append(f"{prefix}_manager_approval_auth_event_invalid:{call_id}")
+    if len(credential_ids) != len(set(credential_ids)) or any(not value for value in credential_ids):
+        failures.append(f"{prefix}_manager_approval_auth_jti_reused")
+    if contains_unredacted_authority_receipt_signature(report) or contains_unredacted_authority_receipt_signature(relevant_rows):
+        failures.append(f"{prefix}_manager_approval_auth_contains_receipt_signature")
+    return failures
+
+
 def validate_s9_required_event_evidence(
     *,
     scenario: dict,
@@ -852,6 +1218,7 @@ def validate_s9_required_event_evidence(
         source_id: index_trace_records(records)
         for source_id, records in source_trace_records.items()
     }
+    trace_failure_modes = {"before_side_effect": False, "after_side_effect": False}
 
     for record in trace_records:
         if record.get("event_type") or record.get("scenario_id"):
@@ -933,8 +1300,28 @@ def validate_s9_required_event_evidence(
                         failures.append("s9_verifier_unavailable_adapter_counter_changed")
                 if event_name in {"trace.write_failed", "state.commit_failed", "run.paused", "run.cancelled"} and not row.get("run_id"):
                     failures.append(f"s9_runtime_event_run_correlation_missing:{event_name}")
-                if event_name == "trace.write_failed" and details.get("http_counter_before") != details.get("http_counter_after"):
-                    failures.append("s9_trace_write_failure_counter_changed")
+                if event_name == "trace.write_failed":
+                    observed_payload = trace_record_kind_payload(observed["record"])
+                    failed_event = observed_payload.get("failed_event")
+                    side_effect_executed = observed_payload.get("side_effect_executed")
+                    if details.get("failed_event") != failed_event or details.get("side_effect_executed") is not side_effect_executed:
+                        failures.append("s9_trace_write_failure_details_not_runtime_derived")
+                    if failed_event == "ActionVerificationStarted":
+                        trace_failure_modes["before_side_effect"] = True
+                        if side_effect_executed is not False or details.get("http_counter_before") != details.get("http_counter_after"):
+                            failures.append("s9_trace_write_failure_before_effect_not_blocked")
+                    elif failed_event == "OutcomeRecorded":
+                        trace_failure_modes["after_side_effect"] = True
+                        events = details.get("events", [])
+                        exported_run_events = [trace_record_kind(record) for record in trace_records if trace_record_run_id(record) == observed["run_id"]]
+                        if side_effect_executed is not True or details.get("effect_exists") is not True or details.get("effect_contents") != "executed-once\n":
+                            failures.append("s9_trace_write_failure_after_effect_not_proven")
+                        if events.count("action.executed") != 1 or events.count("tick.started") != 1 or any(forbidden in events for forbidden in ["outcome.recorded", "state.committed", "tick.completed"]):
+                            failures.append("s9_trace_write_failure_after_effect_hidden_continuation")
+                        if exported_run_events.count("action.executed") != 1 or exported_run_events.count("tick.started") != 1 or any(forbidden in exported_run_events for forbidden in ["outcome.recorded", "state.committed", "tick.completed"]):
+                            failures.append("s9_trace_write_failure_after_effect_export_mismatch")
+                    else:
+                        failures.append(f"s9_trace_write_failure_unexpected_injection_point:{failed_event}")
                 if event_name == "state.commit_failed":
                     events = details.get("events", [])
                     failure_indexes = [index for index, observed_event in enumerate(events) if observed_event == "state.commit_failed"]
@@ -984,6 +1371,10 @@ def validate_s9_required_event_evidence(
                     if details.get("reason_code") != "policy_expired" or not row.get("run_id") or not row.get("action_id"):
                         failures.append("s9_policy_expired_missing_action_correlation")
 
+    if not trace_failure_modes["before_side_effect"]:
+        failures.append("s9_trace_write_failure_before_effect_evidence_missing")
+    if not trace_failure_modes["after_side_effect"]:
+        failures.append("s9_trace_write_failure_after_effect_evidence_missing")
     return failures
 
 
@@ -1067,7 +1458,7 @@ def validate_s10_required_event_evidence(
                     row.get("instance_id") in S10_INSTANCE_IDS,
                     row.get("circuit_breaker_id") == "55555555-5555-4555-8555-555555558816",
                     row.get("kill_switch_id") == "ks_uc_e2e_s10_controlled_branch",
-                    row.get("approval_id") and row.get("run_id") == "44444444-4444-4444-8444-444444448810",
+                    row.get("approval_id") and row.get("run_id") == "44444444-4444-4444-8444-444444448817",
                     details.get("proposal_id") == "route-proposal-s10-zone-a3",
                 ]
             )
@@ -1237,6 +1628,7 @@ def validate_report_shape(report: dict) -> list[str]:
         "suite_id",
         "suite_version",
         "source_revision",
+        "source_tree",
         "started_at",
         "completed_at",
         "container_topology_hash",
@@ -1258,6 +1650,55 @@ def validate_report_shape(report: dict) -> list[str]:
         failures.append("report_suite_id_invalid")
     if not str(report.get("container_topology_hash", "")).startswith("sha256:"):
         failures.append("report_topology_hash_invalid")
+    source_tree = report.get("source_tree")
+    if not isinstance(source_tree, dict):
+        failures.append("report_source_tree_invalid")
+    else:
+        required_source_tree = {
+            "status",
+            "source",
+            "head_revision",
+            "dirty",
+            "digest",
+            "digest_algorithm",
+            "tracked_change_count",
+            "staged_change_count",
+            "unstaged_change_count",
+            "untracked_file_count",
+            "reason",
+        }
+        missing_source_tree = sorted(required_source_tree - source_tree.keys())
+        if missing_source_tree:
+            failures.append(
+                "report_source_tree_missing_fields:" + ",".join(missing_source_tree)
+            )
+        if source_tree.get("digest_algorithm") != SOURCE_TREE_DIGEST_ALGORITHM:
+            failures.append("report_source_tree_algorithm_invalid")
+        if source_tree.get("status") == "known":
+            if source_tree.get("source") not in {"git", "environment_override"}:
+                failures.append("report_source_tree_source_invalid")
+            if not isinstance(source_tree.get("dirty"), bool):
+                failures.append("report_source_tree_dirty_invalid")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(source_tree.get("digest", ""))):
+                failures.append("report_source_tree_digest_invalid")
+            if not source_tree.get("head_revision"):
+                failures.append("report_source_tree_head_invalid")
+        elif source_tree.get("status") == "unknown":
+            if source_tree.get("source") != "unknown":
+                failures.append("report_unknown_source_tree_source_invalid")
+            unknown_values = [
+                source_tree.get("head_revision"),
+                source_tree.get("dirty"),
+                source_tree.get("digest"),
+                source_tree.get("tracked_change_count"),
+                source_tree.get("staged_change_count"),
+                source_tree.get("unstaged_change_count"),
+                source_tree.get("untracked_file_count"),
+            ]
+            if any(value is not None for value in unknown_values):
+                failures.append("report_unknown_source_tree_fabricates_state")
+        else:
+            failures.append("report_source_tree_status_invalid")
     scenario_required = {
         "id",
         "status",
@@ -1284,11 +1725,23 @@ def validate_report_shape(report: dict) -> list[str]:
 
 
 def render_markdown(report: dict) -> str:
+    def source_count(field: str) -> str:
+        value = report["source_tree"][field]
+        return "unknown" if value is None else str(value)
+
+    source_tree = report["source_tree"]
+    dirty = source_tree["dirty"]
+    dirty_text = "unknown" if dirty is None else str(dirty).lower()
+    digest = source_tree["digest"] or "unknown"
     lines = [
         "# Splendor Use-Case E2E Acceptance Report",
         "",
         f"- Suite: `{report['suite_id']}` `{report['suite_version']}`",
         f"- Source revision: `{report['source_revision']}`",
+        f"- Source tree status: `{source_tree['status']}` ({source_tree['source']})",
+        f"- Source tree dirty: `{dirty_text}`",
+        f"- Source tree digest: `{digest}` ({source_tree['digest_algorithm']})",
+        f"- Source changes: tracked `{source_count('tracked_change_count')}`, staged `{source_count('staged_change_count')}`, unstaged `{source_count('unstaged_change_count')}`, untracked non-ignored `{source_count('untracked_file_count')}`",
         f"- Topology: `{report['topology_identifier']}` `{report['container_topology_hash']}`",
         f"- Contract status: `{report['contract_status']['status']}`",
         f"- Anti-drift status: `{report['anti_drift_status']['status']}`",
@@ -1665,13 +2118,16 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     expected_negative_kinds = {
         "specialist_external_artifact_publish_denied": "action.denied",
         "unauthorized_recipient_message_denied": "message.rejected",
-        "unsupported_message_schema_rejected_before_delivery": "message.rejected",
+        "invalid_v2_task_request_payload_rejected_before_delivery": "message.rejected",
         "broad_permission_data_ref_smuggling_denied": "delegation.rejected",
         "cross_tenant_message_attempt_rejected": "delegation.rejected",
         "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger": "action.denied",
     }
     expected_reason_text = {
-        "unsupported_message_schema_rejected_before_delivery": ["unsupported"],
+        "invalid_v2_task_request_payload_rejected_before_delivery": [
+            "missing field",
+            "parent_run_id",
+        ],
     }
     for case, item in negatives.items():
         expected_kind = expected_negative_kinds.get(case)
@@ -1774,7 +2230,7 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
             failures.append(f"s3_python_callback_missing:{callback}")
     if python_schema.get("actions_proposed") != 0 or python_schema.get("adapter_callbacks_executed") != 0:
         failures.append("s3_python_callback_side_effect_boundary_failed")
-    if rust_schema.get("task_request_schema") != "splendor.message.task_request.v1" or rust_schema.get("task_response_schema") != "splendor.message.task_response.v1":
+    if rust_schema.get("task_request_schema") != "splendor.message.task_request.v2" or rust_schema.get("task_response_schema") != "splendor.message.task_response.v1":
         failures.append("s3_rust_schema_parity_wrong_schema")
     return scenario, failures
 
@@ -1863,13 +2319,18 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if remote.get("unauthorized_recipient", {}).get("status") != 403:
         failures.append("s4_unauthorized_recipient_not_rejected")
     handoff = read_json(artifact_dir / "state-handoff-report.json")
-    if not handoff.get("exported", {}).get("handoff") or handoff.get("imported", {}).get("accepted") is not True:
-        failures.append("s4_state_handoff_export_import_missing")
-    if handoff.get("rejected", {}).get("status") not in {400, 403}:
-        failures.append("s4_bad_state_handoff_not_rejected")
-    if handoff.get("wrong_hash", {}).get("status") != 403:
-        failures.append("s4_wrong_hash_handoff_not_rejected")
-    if handoff.get("wrong_run", {}).get("status") not in {400, 404}:
+    import_denied = handoff.get("resident_import_denied", {})
+    if not handoff.get("exported", {}).get("handoff"):
+        failures.append("s4_state_handoff_export_missing")
+    if import_denied.get("status") != 503 or import_denied.get("body", {}).get("code") != "state_handoff_proof_unavailable":
+        failures.append("s4_resident_handoff_import_not_denied_without_source_proof")
+    if import_denied.get("body", {}).get("details", {}).get("disposition") != "needs_intervention":
+        failures.append("s4_resident_handoff_denial_missing_intervention_disposition")
+    if handoff.get("hash_valid_fabricated", {}).get("status") != 503:
+        failures.append("s4_hash_valid_fabricated_handoff_not_denied")
+    if handoff.get("wrong_hash", {}).get("status") != 503:
+        failures.append("s4_wrong_hash_handoff_reached_validation_without_source_proof")
+    if handoff.get("wrong_run", {}).get("status") != 503 or handoff.get("wrong_run", {}).get("body", {}).get("code") != "state_handoff_proof_unavailable":
         failures.append("s4_wrong_run_handoff_not_rejected")
     if handoff.get("receiver_unchanged_on_failed_import") is not True:
         failures.append("s4_failed_handoff_mutated_receiver_state")
@@ -1903,18 +2364,228 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
-def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def validate_s5_approval_remediation(
+    approval_flow: dict, api_rows: list[dict]
+) -> list[str]:
+    failures: list[str] = []
+
+    active_raw = approval_flow.get("active_run_expired_raw_rejection", {})
+    active_operations = [
+        "inspectRunBeforeExpiredRaw",
+        "submitExpiredRawEvidenceOnActiveRun",
+        "inspectRunAfterExpiredRaw",
+    ]
+    active_rows = [operation_rows(api_rows, operation) for operation in active_operations]
+    if any(len(rows) != 1 for rows in active_rows):
+        failures.append("s5_active_raw_api_cardinality_invalid")
+    else:
+        indexes = [rows[0][0] for rows in active_rows]
+        before_row, raw_row, after_row = [rows[0][1] for rows in active_rows]
+        if indexes != sorted(indexes):
+            failures.append("s5_active_raw_api_order_invalid")
+        if (
+            raw_row.get("method") != "POST"
+            or row_path(raw_row) != "/actions"
+            or raw_row.get("status") != 409
+            or raw_row.get("response", {}).get("code")
+            != "legacy_approval_evidence_non_authorizing"
+            or not isinstance(raw_row.get("request", {}).get("approval_evidence"), dict)
+            or raw_row.get("request", {}).get("authority_obligation_receipts")
+        ):
+            failures.append("s5_active_raw_not_pre_gateway_rejected")
+        before = lifecycle_projection(before_row.get("response"))
+        after = lifecycle_projection(after_row.get("response"))
+        artifact_before = lifecycle_projection(active_raw.get("before"))
+        if (
+            before != after
+            or any(
+                before.get(key) != artifact_before.get(key)
+                for key in ["status", "ticks", "state_head", "adapter_executions"]
+            )
+            or before.get("run_id") != active_raw.get("run_id")
+        ):
+            failures.append("s5_active_raw_lifecycle_or_effect_changed")
+        if (
+            active_raw.get("classification")
+            != "pre_gateway_run_action_admission_rejection"
+            or active_raw.get("gateway_invoked") is not False
+            or active_raw.get("http_status") != 409
+            or active_raw.get("code") != "legacy_approval_evidence_non_authorizing"
+            or active_raw.get("adapter_effect_delta") != 0
+            or active_raw.get("appended_trace_event_ids") != []
+            or active_raw.get("approval_trace_records") != []
+            or active_raw.get("trace_ids_before") != active_raw.get("trace_ids_after")
+        ):
+            failures.append("s5_active_raw_artifact_not_fail_closed")
+
+    expired_rows = operation_rows(api_rows, "submitExpiredExactWaitingApproval")
+    expired = approval_flow.get("expired", {})
+    if len(expired_rows) != 1:
+        failures.append("s5_exact_pending_expiry_api_cardinality_invalid")
+    else:
+        expired_row = expired_rows[0][1]
+        if (
+            expired_row.get("method") != "POST"
+            or row_path(expired_row) != "/actions"
+            or expired_row.get("status") != 200
+            or expired_row.get("response") != expired
+            or not isinstance(expired_row.get("request", {}).get("approval_evidence"), dict)
+            or expired_row.get("request", {}).get("authority_obligation_receipts")
+            or expired.get("status") != "Denied"
+            or expired.get("error") != "approval_expired"
+            or expired.get("output") is not None
+            or "approval_expired" not in expired.get("verification", {}).get("reasons", [])
+        ):
+            failures.append("s5_exact_pending_expiry_not_denied")
+
+    revocation = approval_flow.get("resident_receipt_revocation", {})
+    required_order = [
+        "submitRevocableWorkOrder",
+        "dispatchRevocableWorkOrder",
+        "submitRevocableAction",
+        "requestRevocableApproval",
+        "grantRevocableApproval",
+        "inspectRevocableBeforeManagerRevoke",
+        "revokeApproval",
+        "inspectRevocableAfterManagerRevoke",
+        "submitRevokedOriginalReceipt",
+        "inspectRevocableAfterDeniedRetry",
+        "getRevocableStateAfterDeniedRetry",
+    ]
+    ordered_rows = [operation_rows(api_rows, operation) for operation in required_order]
+    if any(len(rows) != 1 for rows in ordered_rows):
+        failures.append("s5_resident_revocation_api_cardinality_invalid")
+    else:
+        indexes = [rows[0][0] for rows in ordered_rows]
+        rows = [rows[0][1] for rows in ordered_rows]
+        if indexes != sorted(indexes):
+            failures.append("s5_resident_revocation_api_order_invalid")
+        (
+            submit_row,
+            dispatch_row,
+            proposal_row,
+            request_row,
+            grant_row,
+            before_row,
+            revoke_row,
+            after_revoke_row,
+            retry_row,
+            after_retry_row,
+            state_after_row,
+        ) = rows
+        retained_receipt = revocation.get("retained_receipt", {})
+        grant_receipt = grant_row.get("response", {}).get(
+            "authority_obligation_receipt", {}
+        )
+        retry_receipts = retry_row.get("request", {}).get(
+            "authority_obligation_receipts", []
+        )
+        acknowledgement = revocation.get("acknowledgement", {})
+        expected_audience = (
+            "splendor.daemon.approval_receipt.v2:instance:"
+            f"{revocation.get('dispatch', {}).get('selected_instance_id')}:run:"
+            f"{revocation.get('dispatch', {}).get('run_id')}"
+        )
+        if (
+            submit_row.get("response") != revocation.get("work_order_admission")
+            or dispatch_row.get("response") != revocation.get("dispatch")
+            or proposal_row.get("response") != revocation.get("proposal")
+            or request_row.get("response") != approval_flow.get("request")
+            or authority_receipt_projection(grant_receipt)
+            != authority_receipt_projection(retained_receipt)
+            or len(retry_receipts) != 1
+            or authority_receipt_projection(retry_receipts[0])
+            != authority_receipt_projection(retained_receipt)
+            or retained_receipt.get("audience") != expected_audience
+            or retained_receipt.get("revocation") != "active"
+        ):
+            failures.append("s5_resident_revocation_receipt_or_dispatch_mismatch")
+        if (
+            revoke_row.get("status") != 200
+            or revoke_row.get("response", {}).get("resident_receipt_revocation_ack")
+            != acknowledgement
+            or approval_flow.get("revoke", {}).get("resident_receipt_revocation_ack")
+            != acknowledgement
+            or acknowledgement.get("schema_version")
+            != "splendor.resident.approval_receipt_revocation_ack.v1"
+            or acknowledgement.get("status") not in {"revoked", "already_revoked"}
+            or acknowledgement.get("effect_certainty") != "known"
+            or acknowledgement.get("receipt_id") != retained_receipt.get("receipt_id")
+            or acknowledgement.get("approval_id") != retained_receipt.get("approval_id")
+            or acknowledgement.get("receipt_audience") != expected_audience
+        ):
+            failures.append("s5_resident_revocation_ack_not_exact")
+        retry_response = retry_row.get("response", {})
+        if (
+            retry_row.get("status") != 200
+            or retry_response != revocation.get("revoked_receipt_retry", {}).get("body")
+            or retry_response.get("status") != "Denied"
+            or retry_response.get("error") != "authority_obligation_receipt_revoked"
+            or retry_response.get("output") is not None
+            or "authority_obligation_receipt_revoked"
+            not in retry_response.get("verification", {}).get("reasons", [])
+        ):
+            failures.append("s5_revoked_original_receipt_not_denied")
+        before = lifecycle_projection(before_row.get("response"))
+        after_revoke = lifecycle_projection(after_revoke_row.get("response"))
+        after_retry = lifecycle_projection(after_retry_row.get("response"))
+        if (
+            before != after_revoke
+            or before != after_retry
+            or before.get("adapter_executions") != 0
+            or state_projection(state_after_row.get("response"))
+            != state_projection(revocation.get("state", {}).get("before_manager_revoke"))
+            or revocation.get("action_executed_trace_records") != []
+        ):
+            failures.append("s5_resident_revocation_changed_tick_state_or_effect")
+
+    revocation_auth = revocation.get("resident_revocation_authentication", [])
+    if (
+        len(revocation_auth) != 1
+        or revocation_auth[0].get("required_scope")
+        != "splendor.approval_receipts.revoke"
+        or revocation_auth[0].get("tls_verification") != "acceptance_ca"
+        or revocation_auth[0].get("target_instance_id")
+        != revocation.get("acknowledgement", {}).get("target_instance_id")
+        or revocation_auth[0].get("run_id")
+        != revocation.get("acknowledgement", {}).get("run_id")
+        or revocation_auth[0].get("receipt_id")
+        != revocation.get("acknowledgement", {}).get("receipt_id")
+        or revocation_auth[0].get("ack_status")
+        != revocation.get("acknowledgement", {}).get("status")
+        or revocation_auth[0].get("raw_bearer_recorded") is not False
+        or revocation_auth[0].get("raw_jti_recorded") is not False
+        or revocation_auth[0].get("receipt_signature_recorded") is not False
+    ):
+        failures.append("s5_resident_revocation_authentication_invalid")
+    if contains_unredacted_authority_receipt_signature(approval_flow) or contains_unredacted_authority_receipt_signature(api_rows):
+        failures.append("s5_retained_evidence_contains_receipt_signature")
+    return failures
+
+
+def load_s5_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S5"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S5"),
+            trusted_public_key_path,
+            "s5",
+        )
+    )
     required = [
         "scenario-report.json",
         "api-traffic.ndjson",
         "trace-export.jsonl",
         "approval-flow.json",
+        "internal-artifact-report.json",
         "policy-bundle-report.json",
         "circuit-breaker-report.json",
         "kill-switch-report.json",
@@ -1950,6 +2621,7 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     missing_events = sorted(event for event in S5_REQUIRED_EVENTS if not event_ids.get(event))
     if missing_events:
         failures.append("s5_missing_required_trace_events:" + ",".join(missing_events))
+    api_rows = read_jsonl(artifact_dir / "api-traffic.ndjson")
     trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
     trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
     audit = read_json(artifact_dir / "audit-report.json")
@@ -1978,6 +2650,23 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if positive.get(key) is not True:
             failures.append(f"s5_positive_check_missing:{key}")
     approval_flow = read_json(artifact_dir / "approval-flow.json")
+    internal_artifact_report = read_json(
+        artifact_dir / "internal-artifact-report.json"
+    )
+    for expectation_id, value in {
+        "internal_artifact": internal_artifact_report.get("outcome", {}),
+        "approved_publish": approval_flow.get("approved_exact_action_retry", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S5", expectation_id),
+                trusted_public_key_path,
+                f"s5_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
+    failures.extend(validate_s5_approval_remediation(approval_flow, api_rows))
     grant_evidence = approval_flow.get("grant", {}).get("evidence", {})
     request_approval = approval_flow.get("request", {})
     if grant_evidence.get("decision") != "Granted":
@@ -2074,7 +2763,7 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     activated_kill = kill.get("activated", {})
     if activated_kill.get("target_derived_from_registry") is not True or not activated_kill.get("target_instance_id") or activated_kill.get("cancel_payload_schema") != "splendor.daemon.lifecycle_request.v1":
         failures.append("s5_kill_switch_target_not_registry_derived")
-    for row in read_jsonl(artifact_dir / "api-traffic.ndjson"):
+    for row in api_rows:
         if row.get("operation_id") != "activateKillSwitch":
             continue
         request_keys = set((row.get("request") or {}).keys())
@@ -2100,13 +2789,323 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
-def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def validate_s6_physical_approval_binding(
+    artifact: dict, manager_auth: dict, api_rows: list[dict]
+) -> list[str]:
+    failures: list[str] = []
+    ids = artifact.get("ids", {})
+    run_id = ids.get("run_id")
+    action_id = ids.get("action_id")
+    node_a = ids.get("node_a_id")
+    node_b = ids.get("node_b_id")
+    instance_id = ids.get("target_instance_id")
+    work_order_id = ids.get("work_order_id")
+    expected_audience = (
+        f"splendor.daemon.approval_receipt.v2:instance:{instance_id}:run:{run_id}"
+    )
+
+    def action_binding(request: dict) -> dict:
+        return {
+            key: request.get(key)
+            for key in (
+                "action_id",
+                "run_id",
+                "tenant_id",
+                "agent_id",
+                "action",
+                "adapter",
+                "quota_usage",
+                "satisfied_preconditions",
+                "requested_at",
+                "safety_context",
+                "operator_intervention_evidence",
+            )
+        }
+
+    submit_rows = [
+        (index, row)
+        for index, row in operation_rows(api_rows, "submitWorkOrder")
+        if row.get("request", {}).get("work_order", {}).get("work_order_id")
+        == work_order_id
+    ]
+    dispatch_rows = [
+        (index, row)
+        for index, row in operation_rows(api_rows, "dispatchWorkOrder")
+        if row_path(row) == f"/work-orders/{work_order_id}/dispatch"
+    ]
+    if len(submit_rows) != 1 or len(dispatch_rows) != 1:
+        failures.append("s6_physical_manager_dispatch_api_cardinality_invalid")
+    else:
+        submit_index, submit_row = submit_rows[0]
+        dispatch_index, dispatch_row = dispatch_rows[0]
+        target = artifact.get("manager_target_binding", {})
+        if (
+            submit_index >= dispatch_index
+            or submit_row.get("response") != target.get("work_order_submit")
+            or dispatch_row.get("response") != target.get("dispatch")
+            or dispatch_row.get("response", {}).get("selected_node_id") != node_a
+            or dispatch_row.get("response", {}).get("selected_instance_id")
+            != instance_id
+            or dispatch_row.get("response", {}).get("run_id") != run_id
+        ):
+            failures.append("s6_physical_manager_dispatch_not_exact")
+
+    physical_rows = [
+        (index, row)
+        for index, row in enumerate(api_rows)
+        if row.get("method") == "POST"
+        and row_path(row).startswith("/devices/")
+        and row_path(row).endswith("/actions")
+        and row.get("request", {}).get("action_id") == action_id
+    ]
+    coordinate_rows = [
+        item
+        for item in physical_rows
+        if "physical_action_resource_coordinate" in item[1].get("request", {})
+    ]
+    unknown_rows = [
+        item
+        for item in physical_rows
+        if "authority_override" in item[1].get("request", {})
+    ]
+    challenge_rows = [
+        item
+        for item in physical_rows
+        if not item[1].get("request", {}).get("authority_obligation_receipts")
+        and "physical_action_resource_coordinate" not in item[1].get("request", {})
+        and "authority_override" not in item[1].get("request", {})
+        and item[1].get("response", {}).get("status") == "NeedsApproval"
+    ]
+    receipt_rows = [
+        item
+        for item in physical_rows
+        if item[1].get("request", {}).get("authority_obligation_receipts")
+    ]
+    wrong_rows = [
+        item
+        for item in receipt_rows
+        if row_path(item[1]) == f"/devices/{node_b}/actions"
+    ]
+    exact_rows = [
+        item
+        for item in receipt_rows
+        if row_path(item[1]) == f"/devices/{node_a}/actions"
+        and item[1].get("response", {}).get("status") == "Executed"
+    ]
+    replay_rows = [
+        item
+        for item in receipt_rows
+        if row_path(item[1]) == f"/devices/{node_a}/actions"
+        and item[1].get("response", {}).get("status") == "Denied"
+    ]
+    classified = [
+        coordinate_rows,
+        unknown_rows,
+        challenge_rows,
+        wrong_rows,
+        exact_rows,
+        replay_rows,
+    ]
+    if any(len(rows) != 1 for rows in classified):
+        failures.append("s6_physical_approval_api_cardinality_invalid")
+    else:
+        indexes = [rows[0][0] for rows in classified]
+        coordinate_row, unknown_row, challenge_row, wrong_row, exact_row, replay_row = [
+            rows[0][1] for rows in classified
+        ]
+        if indexes != sorted(indexes):
+            failures.append("s6_physical_approval_api_order_invalid")
+        closed = artifact.get("closed_schema", {})
+        reserved_node = closed.get("reserved_node_action_param", {})
+        if (
+            coordinate_row.get("status") != 422
+            or unknown_row.get("status") != 422
+            or coordinate_row.get("response")
+            != closed.get("physical_action_resource_coordinate", {}).get("body")
+            or unknown_row.get("response")
+            != closed.get("unknown_authority_field", {}).get("body")
+            or reserved_node.get("status") != 200
+            or reserved_node.get("body", {}).get("status") != "Failed"
+            or reserved_node.get("body", {}).get("error") != "adapter failed"
+            or "acceptance_operation_reserved_field" in str(reserved_node.get("body", {}))
+            or closed.get("simulator_unchanged") is not True
+        ):
+            failures.append("s6_physical_action_transport_schema_not_closed")
+        challenge = artifact.get("challenge", {})
+        challenge_body = challenge_row.get("response", {})
+        exact_challenge = challenge_body.get("approval_challenge", {})
+        challenge_request = challenge_row.get("request", {})
+        if (
+            challenge_row.get("status") != 200
+            or challenge_body.get("status") != "NeedsApproval"
+            or challenge.get("status") != "NeedsApproval"
+            or challenge.get("physical_action_resource_coordinate")
+            != {"resource_kind": "physical_node", "node_id": node_a}
+            or exact_challenge.get("physical_action_resource_coordinate")
+            != challenge.get("physical_action_resource_coordinate")
+            or exact_challenge.get("canonical_request_digest")
+            != challenge.get("canonical_request_digest")
+            or exact_challenge.get("gateway_action_request_digest")
+            != challenge.get("gateway_action_request_digest")
+            or exact_challenge.get("authority_decision_digest")
+            != challenge.get("authority_decision_digest")
+            or exact_challenge.get("receipt_audience") != expected_audience
+            or challenge.get("caller_action_param_node_id") is not None
+            or challenge.get("caller_param_did_not_override_server_coordinate")
+            is not True
+            or action_binding(challenge_request)
+            != action_binding(challenge.get("request", {}))
+            or challenge_request.get("action", {}).get("name") != "capture_image"
+            or challenge_request.get("action", {}).get("params")
+            != {"physical_action": True}
+            or challenge.get("simulator_counter_before")
+            != challenge.get("simulator_counter_after")
+        ):
+            failures.append("s6_physical_v2_challenge_not_server_bound")
+        receipt = artifact.get("manager_approval", {}).get("receipt", {})
+        grant_receipt = artifact.get("manager_approval", {}).get("grant", {}).get(
+            "authority_obligation_receipt", {}
+        )
+        wrong_receipts = wrong_row.get("request", {}).get(
+            "authority_obligation_receipts", []
+        )
+        exact_receipts = exact_row.get("request", {}).get(
+            "authority_obligation_receipts", []
+        )
+        if (
+            authority_receipt_projection(receipt)
+            != authority_receipt_projection(grant_receipt)
+            or receipt.get("audience") != expected_audience
+            or len(wrong_receipts) != 1
+            or len(exact_receipts) != 1
+            or authority_receipt_projection(wrong_receipts[0])
+            != authority_receipt_projection(receipt)
+            or authority_receipt_projection(exact_receipts[0])
+            != authority_receipt_projection(receipt)
+        ):
+            failures.append("s6_physical_receipt_not_exact")
+        wrong = artifact.get("wrong_node_preclaim", {})
+        if (
+            wrong_row.get("status") != 409
+            or wrong_row.get("response", {}).get("code")
+            != "approval_challenge_retry_mismatch"
+            or wrong.get("response") != {
+                "status": wrong_row.get("status"),
+                "body": wrong_row.get("response"),
+            }
+            or lifecycle_projection(wrong.get("run_before"))
+            != lifecycle_projection(wrong.get("run_after"))
+            or wrong.get("simulator_counter_before")
+            != wrong.get("simulator_counter_after")
+            or wrong.get("action_trace_ids_before")
+            != wrong.get("action_trace_ids_after")
+            or wrong.get("receipt_unclaimed") is not True
+        ):
+            failures.append("s6_wrong_node_retry_not_preclaim_rejected")
+        execution = artifact.get("exact_node_execution", {})
+        execution_response = exact_row.get("response", {})
+        execution_output = execution_response.get("output", {})
+        execution_result = execution_output.get("result", {})
+        execution_request = exact_row.get("request", {})
+        if (
+            exact_row.get("status") != 200
+            or execution_response != execution.get("response")
+            or action_binding(execution_request)
+            != action_binding(execution.get("request", {}))
+            or action_binding(execution_request) != action_binding(challenge_request)
+            or execution_request.get("action", {}).get("params")
+            != {"physical_action": True}
+            or execution_response.get("status") != "Executed"
+            or execution_output.get("operation_id") != "device-sim/capture_image"
+            or execution_output.get("proof_type") != "physical_image"
+            or execution_result.get("coordinate")
+            != {"resource_kind": "physical_node", "node_id": node_a}
+            or type(execution_result.get("images_captured")) is not int
+            or execution_result.get("images_captured", 0) <= 0
+            or not isinstance(execution_output.get("provider_receipt"), dict)
+            or execution_response.get("verification", {})
+            .get("artifacts", {})
+            .get("safety", {})
+            .get("source")
+            != "safety_verifier"
+            or execution_response.get("post_verification", {})
+            .get("artifacts", {})
+            .get("safety", {})
+            .get("source")
+            != "safety_verifier"
+            or execution.get("simulator_counter_after", {}).get("total")
+            - execution.get("simulator_counter_before", {}).get("total")
+            != 1
+            or execution.get("run_after", {}).get("adapter_executions") != 1
+            or execution.get("executed_exactly_once") is not True
+        ):
+            failures.append("s6_exact_node_did_not_execute_once_with_safety")
+        replay = artifact.get("receipt_replay", {})
+        if (
+            replay_row.get("status") != 200
+            or replay_row.get("response") != replay.get("response")
+            or replay_row.get("response", {}).get("status") != "Denied"
+            or replay_row.get("response", {}).get("error")
+            != "authority_obligation_receipt_replayed"
+            or replay.get("simulator_counter_before")
+            != replay.get("simulator_counter_after")
+            or replay.get("run_after", {}).get("adapter_executions") != 1
+            or replay.get("denied_without_effect") is not True
+        ):
+            failures.append("s6_physical_receipt_replay_not_denied")
+
+    failures.extend(
+        validate_manager_approval_auth_evidence(
+            manager_auth,
+            api_rows,
+            {"requestApproval", "grantApproval"},
+            "s6",
+        )
+    )
+    approval_order = [
+        challenge_rows,
+        operation_rows(api_rows, "requestApproval"),
+        operation_rows(api_rows, "grantApproval"),
+        wrong_rows,
+        exact_rows,
+        replay_rows,
+    ]
+    if any(len(rows) != 1 for rows in approval_order) or [
+        rows[0][0] for rows in approval_order
+    ] != sorted(rows[0][0] for rows in approval_order):
+        failures.append("s6_physical_approval_manager_order_invalid")
+    inspect_replay = artifact.get("inspect_only_replay", {})
+    if (
+        inspect_replay.get("response", {}).get("mode") != "inspect_only"
+        or inspect_replay.get("simulator_counter_before")
+        != inspect_replay.get("simulator_counter_after")
+        or inspect_replay.get("unchanged") is not True
+    ):
+        failures.append("s6_physical_inspect_replay_changed_effects")
+    if contains_bearer_bytes(manager_auth) or contains_bearer_bytes(api_rows):
+        failures.append("s6_retained_evidence_contains_bearer")
+    if contains_unredacted_authority_receipt_signature(artifact) or contains_unredacted_authority_receipt_signature(api_rows):
+        failures.append("s6_retained_evidence_contains_receipt_signature")
+    return failures
+
+
+def load_s6_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S6"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S6"),
+            trusted_public_key_path,
+            "s6",
+        )
+    )
     required = [
         "scenario-report.json",
         "api-traffic.ndjson",
@@ -2120,6 +3119,9 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "operator-intervention.json",
         "trace-sync-report.json",
         "device-sim-counters.json",
+        "physical-approval-node-binding.json",
+        "physical-approval-trace.jsonl",
+        "manager-approval-auth.json",
         "security-negatives.json",
         "state-export.json",
         "replay-report.json",
@@ -2152,6 +3154,43 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     for case in (S6_REQUIRED_NEGATIVES | S6_REQUIRED_SECURITY_NEGATIVES) & set(negatives):
         if negatives.get(case, {}).get("passed") is not True:
             failures.append(f"s6_negative_case_not_asserted:{case}")
+    api_rows = read_jsonl(artifact_dir / "api-traffic.ndjson")
+    physical_approval = read_json(
+        artifact_dir / "physical-approval-node-binding.json"
+    )
+    safety_evidence = read_json(artifact_dir / "device-safety-evidence.json")
+    operator_intervention = read_json(artifact_dir / "operator-intervention.json")
+    safe_actions = safety_evidence.get("safe_actions", {})
+    exact_outputs = {
+        "approved_capture": physical_approval.get("exact_node_execution", {}).get(
+            "response", {}
+        ),
+        "read_battery": safe_actions.get("read_battery", {}),
+        "inspect_zone": safe_actions.get("inspect_zone", {}),
+        "move_to_waypoint": safe_actions.get("move_to_waypoint", {}),
+        "capture_image": safe_actions.get("capture_image", {}),
+        "read_sensor_summary": safe_actions.get("offline_sensor", {}),
+        "return_to_base": safe_actions.get("return_to_base", {}),
+        "upload_trace_summary": safe_actions.get("upload_trace_summary", {}),
+        "operator_capture": operator_intervention.get("granted_capture", {}),
+    }
+    for expectation_id, value in exact_outputs.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S6", expectation_id),
+                trusted_public_key_path,
+                f"s6_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
+    failures.extend(
+        validate_s6_physical_approval_binding(
+            physical_approval,
+            read_json(artifact_dir / "manager-approval-auth.json"),
+            api_rows,
+        )
+    )
     event_ids = scenario.get("required_trace_event_ids", {})
     missing_events = sorted(event for event in S6_REQUIRED_EVENTS if not event_ids.get(event))
     if missing_events:
@@ -2295,13 +3334,105 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
-def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def validate_s7_manager_approval_auth(
+    manager_auth: dict, api_rows: list[dict]
+) -> list[str]:
+    failures: list[str] = []
+    events = manager_auth.get("events", [])
+    if not isinstance(events, list) or len(events) != 2:
+        return ["s7_manager_approval_auth_event_count_invalid"]
+    relevant_rows = [row for row in api_rows if row.get("manager_approval_call_id")]
+    events_by_id = {event.get("call_id"): event for event in events}
+    rows_by_id = {row.get("manager_approval_call_id"): row for row in relevant_rows}
+    if set(events_by_id) != set(rows_by_id) or len(events_by_id) != len(events):
+        failures.append("s7_manager_approval_auth_api_cardinality_mismatch")
+    if {event.get("operation_id") for event in events} != {
+        "requestApproval",
+        "grantApproval",
+    }:
+        failures.append("s7_manager_approval_auth_operations_invalid")
+    credential_ids: list[str] = []
+    for call_id, event in events_by_id.items():
+        row = rows_by_id.get(call_id, {})
+        request = row.get("request", {}) if isinstance(row.get("request"), dict) else {}
+        credential = (
+            request.get("credential", {})
+            if isinstance(request.get("credential"), dict)
+            else {}
+        )
+        audit = (
+            request.get("audit_attribution", {})
+            if isinstance(request.get("audit_attribution"), dict)
+            else {}
+        )
+        response = (
+            row.get("response", {}) if isinstance(row.get("response"), dict) else {}
+        )
+        credential_id = str(event.get("credential_id") or "")
+        credential_ids.append(credential_id)
+        response_trace_id = response.get("trace_event_id")
+        if (
+            event.get("operation_id") not in {"requestApproval", "grantApproval"}
+            or event.get("method") != "POST"
+            or event.get("scope") != "approvals_manage"
+            or not credential_id.startswith("sha256:")
+            or event.get("fleet_id") != "00000000-0000-4000-8000-000000000104"
+            or event.get("target_manager_id") != "central-manager"
+            or event.get("audience_manager_id") != "central-manager"
+            or event.get("header_presence", {}).get("authorization") is not True
+            or event.get("body_mirror_status") != "matched"
+            or event.get("result_status") != 200
+            or event.get("raw_bearer_recorded") is not False
+            or row.get("status") != 200
+            or row.get("operation_id") != event.get("operation_id")
+            or row.get("transport") != "local_acceptance_http"
+            or credential.get("credential_id") != credential_id
+            or credential.get("scopes") != ["approvals_manage"]
+            or credential.get("binding")
+            != {"fleet": {"fleet_id": "00000000-0000-4000-8000-000000000104"}}
+            or credential.get("audience")
+            != {"central_manager": {"manager_id": "central-manager"}}
+            or audit.get("credential_id") != credential_id
+            or audit.get("principal") != credential.get("principal")
+            or contains_bearer_bytes(row)
+            or not response_trace_id
+            or response_trace_id not in event.get("trace_event_ids", [])
+        ):
+            failures.append(f"s7_manager_approval_auth_event_invalid:{call_id}")
+    if len(credential_ids) != len(set(credential_ids)):
+        failures.append("s7_manager_approval_auth_jti_reused")
+    if (
+        manager_auth.get("status") != "passed"
+        or manager_auth.get("mode") != "local_acceptance"
+        or manager_auth.get("exact_scope") != "approvals_manage"
+        or manager_auth.get("raw_bearers_recorded") is not False
+        or manager_auth.get("production_manager_auth_claimed") is not False
+        or manager_auth.get("other_manager_endpoints_authenticated_by_this_profile")
+        is not False
+        or manager_auth.get("fresh_mutating_credential_ids")
+        != (len(credential_ids) == len(set(credential_ids)))
+    ):
+        failures.append("s7_manager_approval_auth_summary_invalid")
+    return failures
+
+
+def load_s7_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S7"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S7"),
+            trusted_public_key_path,
+            "s7",
+        )
+    )
     required = [
         "scenario-report.json",
         "api-traffic.ndjson",
@@ -2311,6 +3442,7 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "message-flow.json",
         "artifact-report.json",
         "data-scope-report.json",
+        "manager-approval-auth.json",
         "state-export.json",
         "replay-report.json",
         "audit-report.json",
@@ -2329,6 +3461,7 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     for failure in scenario.get("scenario_failures", []):
         failures.append(f"s7_scenario_failure:{failure}")
     operations = set(scenario.get("api_operations", []))
+    api_rows = read_jsonl(artifact_dir / "api-traffic.ndjson")
     missing_ops = sorted(S7_REQUIRED_OPERATIONS - operations)
     if missing_ops:
         failures.append("s7_missing_required_api_operations:" + ",".join(missing_ops))
@@ -2356,6 +3489,21 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if raw in trace_text:
             failures.append("s7_trace_export_contains_raw_protected_fixture")
     artifact = read_json(artifact_dir / "artifact-report.json")
+    data_scope_artifact = read_json(artifact_dir / "data-scope-report.json")
+    for expectation_id, value in {
+        "specialist_data_read": data_scope_artifact.get("allowed_data_read", {}),
+        "internal_artifact": artifact.get("internal_artifact", {}),
+        "approved_publish": artifact.get("approved_exact_action_response", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S7", expectation_id),
+                trusted_public_key_path,
+                f"s7_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     internal = artifact.get("internal_artifact_evidence", {})
     if artifact.get("internal_artifact", {}).get("status") != "Executed":
         failures.append("s7_internal_artifact_not_executed")
@@ -2373,15 +3521,23 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     else:
         payload = trace_record_kind_payload(trace_by_id[internal_trace_id])
         action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
-        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
         if trace_record_kind(trace_by_id[internal_trace_id]) != "action.executed" or action.get("name") != "artifact.create_internal":
             failures.append("s7_internal_artifact_trace_not_create_execution")
-        if output.get("artifact_path") != internal.get("artifact_path"):
-            failures.append("s7_internal_artifact_trace_path_mismatch")
-        if output.get("tenant_id") != internal.get("tenant_id"):
-            failures.append("s7_internal_artifact_trace_tenant_mismatch")
-        if output.get("integrity") != internal.get("integrity"):
-            failures.append("s7_internal_artifact_trace_integrity_mismatch")
+        try:
+            trace_projection = verify_retained_private_v3_projection(
+                internal.get("trace_private_v3_projection", {}),
+                trusted_public_key_path=trusted_public_key_path,
+                expectation=expectation_for("UC-E2E-S7", "internal_artifact"),
+            )
+        except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+            failures.append("s7_internal_artifact_trace_projection_invalid")
+        else:
+            if trace_projection.get("resource_id") != internal.get("artifact_path"):
+                failures.append("s7_internal_artifact_trace_path_mismatch")
+            if trace_projection.get("tenant_id") != internal.get("tenant_id"):
+                failures.append("s7_internal_artifact_trace_tenant_mismatch")
+            if trace_projection.get("state_digest") != internal.get("integrity"):
+                failures.append("s7_internal_artifact_trace_integrity_mismatch")
     if internal.get("outcome_action_id") and internal.get("outcome_action_id") != internal.get("action_id"):
         failures.append("s7_internal_artifact_outcome_action_mismatch")
     if internal.get("outcome_artifact_path") and internal.get("outcome_artifact_path") != internal.get("artifact_path"):
@@ -2394,6 +3550,160 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s7_approved_publish_not_executed")
     if artifact.get("approved_publish", {}).get("action_id") != artifact.get("publish_without_approval", {}).get("action_id"):
         failures.append("s7_approval_action_id_mismatch")
+    challenge = artifact.get("approval_challenge", {})
+    manager_request_payload = artifact.get("manager_approval_request_payload", {})
+    manager_request = artifact.get("manager_approval_request", {})
+    manager_grant = artifact.get("manager_approval_grant", {})
+    receipt = manager_grant.get("authority_obligation_receipt", {})
+    admitted_action = artifact.get("admitted_publish_action", {})
+    approved_request = artifact.get("approved_exact_action_request", {})
+    request_receipts = approved_request.get("authority_obligation_receipts", [])
+    if not challenge or manager_request_payload.get("challenge") != challenge:
+        failures.append("s7_manager_request_missing_full_exact_challenge")
+    if manager_request.get("challenge") != challenge:
+        failures.append("s7_manager_did_not_record_full_exact_challenge")
+    for field, challenge_field in [
+        ("approval_id", "approval_id"),
+        ("tenant_id", "tenant_id"),
+        ("agent_id", "agent_id"),
+        ("run_id", "run_id"),
+        ("action_id", "action_id"),
+        ("action_name", "action_name"),
+        ("adapter", "adapter"),
+        ("policy_id", "policy_id"),
+        ("risk_level", "risk_level"),
+        ("audience", "receipt_audience"),
+        ("expires_at", "expires_at"),
+    ]:
+        if manager_request_payload.get(field) != challenge.get(challenge_field):
+            failures.append(f"s7_manager_request_challenge_coordinate_mismatch:{field}")
+    approval_request_rows = [
+        row for row in api_rows if row.get("operation_id") == "requestApproval"
+    ]
+    approval_grant_rows = [
+        row for row in api_rows if row.get("operation_id") == "grantApproval"
+    ]
+    if (
+        len(approval_request_rows) != 1
+        or approval_request_rows[0].get("request", {}).get("challenge") != challenge
+    ):
+        failures.append("s7_manager_api_request_missing_full_exact_challenge")
+    if (
+        len(approval_grant_rows) != 1
+        or approval_grant_rows[0]
+        .get("response", {})
+        .get("authority_obligation_receipt")
+        != receipt
+        or approval_grant_rows[0].get("response", {}).get("trace_event_id")
+        != manager_grant.get("trace_event_id")
+    ):
+        failures.append("s7_manager_api_grant_receipt_not_correlated")
+    if (
+        manager_grant.get("status") != "granted"
+        or not isinstance(receipt, dict)
+        or not receipt.get("receipt_id")
+        or not receipt.get("issuer")
+        or receipt.get("approval_id") != challenge.get("approval_id")
+        or receipt.get("audience") != challenge.get("receipt_audience")
+        or receipt.get("subject") != challenge.get("subject")
+        or receipt.get("authority_decision_id")
+        != challenge.get("authority_decision_id")
+        or receipt.get("obligation_id") != challenge.get("obligation_id")
+        or receipt.get("canonical_request_digest")
+        != challenge.get("canonical_request_digest")
+        or receipt.get("approval_trace_event_id") != manager_grant.get("trace_event_id")
+        or receipt.get("evidence_ref")
+        != f"approval-trace:{manager_grant.get('trace_event_id')}"
+        or artifact.get("receipt_matches_challenge") is not True
+    ):
+        failures.append("s7_manager_receipt_not_exact_or_trace_linked")
+    if (
+        approved_request.get("action_id") != challenge.get("action_id")
+        or approved_request.get("action") != admitted_action.get("action")
+        or approved_request.get("action", {}).get("name")
+        != challenge.get("action_name")
+        or approved_request.get("action", {}).get("params")
+        != admitted_action.get("action", {}).get("params")
+        or approved_request.get("adapter") != admitted_action.get("adapter")
+        or approved_request.get("adapter") != challenge.get("adapter")
+        or approved_request.get("requested_at") != challenge.get("requested_at")
+        or approved_request.get("quota_usage") != admitted_action.get("quota_usage")
+        or approved_request.get("satisfied_preconditions")
+        != admitted_action.get("satisfied_preconditions")
+        or request_receipts != [receipt]
+        or "approval_evidence" in approved_request
+    ):
+        failures.append("s7_approved_action_did_not_preserve_exact_pending_request")
+    approved_action_rows = [
+        row for row in api_rows if row.get("operation_id") == "submitApprovedExactAction"
+    ]
+    if len(approved_action_rows) != 1:
+        failures.append("s7_approved_exact_action_api_call_count_invalid")
+    else:
+        actual_request = approved_action_rows[0].get("request", {})
+        for field in [
+            "action_id",
+            "run_id",
+            "tenant_id",
+            "agent_id",
+            "causal_trace_id",
+            "action",
+            "adapter",
+            "quota_usage",
+            "satisfied_preconditions",
+            "requested_at",
+            "authority_obligation_receipts",
+        ]:
+            if actual_request.get(field) != approved_request.get(field):
+                failures.append(f"s7_approved_action_api_request_mismatch:{field}")
+        if "approval_evidence" in actual_request:
+            failures.append("s7_approved_action_used_raw_grant_evidence")
+    waiting = artifact.get("publish_run_waiting", {})
+    after_exact_action = artifact.get("publish_run_after_exact_action", {})
+    state_before = artifact.get("publish_state_head_before_exact_action", {})
+    state_after = artifact.get("publish_state_head_after_exact_action", {})
+    if (
+        waiting.get("status") != "waiting_for_approval"
+        or waiting.get("adapter_executions") != 0
+    ):
+        failures.append("s7_publish_not_waiting_with_zero_executions")
+    if (
+        after_exact_action.get("status") != "running"
+        or after_exact_action.get("adapter_executions") != 1
+    ):
+        failures.append("s7_publish_not_running_after_exactly_one_execution")
+    if waiting.get("ticks") != after_exact_action.get("ticks"):
+        failures.append("s7_approved_action_started_second_tick")
+    if (
+        state_before.get("state_node_id") != state_after.get("state_node_id")
+        or state_before.get("data_hash") != state_after.get("data_hash")
+        or artifact.get("state_head_unchanged") is not True
+    ):
+        failures.append("s7_approved_action_advanced_state_head")
+    publish_execution_records = [
+        record
+        for record in trace_records
+        if trace_record_run_id(record) == challenge.get("run_id")
+        and trace_record_kind(record) == "action.executed"
+        and trace_record_action_name(record) == challenge.get("action_name")
+    ]
+    if (
+        len(publish_execution_records) != 1
+        or artifact.get("publish_execution_trace_count") != 1
+    ):
+        failures.append("s7_approved_publish_execution_count_not_one")
+    resumed_records = [
+        record
+        for record in trace_records
+        if trace_record_run_id(record) == challenge.get("run_id")
+        and trace_record_kind(record) == "run.resumed"
+    ]
+    if not resumed_records or not set(event_ids.get("run.resumed", [])) & {
+        trace_record_id(record) for record in resumed_records
+    }:
+        failures.append("s7_approved_publish_missing_run_resumed_evidence")
+    if "publish_run_resume" in artifact or "grant" in artifact:
+        failures.append("s7_stale_approval_artifact_key_present")
     publish_evidence = artifact.get("approved_publish_evidence", {})
     if not publish_evidence.get("integrity"):
         failures.append("s7_approved_publish_missing_integrity")
@@ -2407,25 +3717,28 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     else:
         payload = trace_record_kind_payload(trace_by_id[publish_trace_id])
         action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
-        params = action.get("params", {}) if isinstance(action.get("params"), dict) else {}
-        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
         if trace_record_kind(trace_by_id[publish_trace_id]) != "action.executed" or action.get("name") != "artifact.publish_external":
             failures.append("s7_approved_publish_trace_not_publish_execution")
-        trace_publish_path = output.get("publish_ref") or output.get("artifact_path") or params.get("publish_ref")
-        if trace_publish_path != publish_evidence.get("artifact_path"):
-            failures.append("s7_approved_publish_trace_path_mismatch")
-        trace_tenant_id = output.get("tenant_id")
-        if not trace_tenant_id and isinstance(trace_publish_path, str) and trace_publish_path.startswith("artifact://"):
-            trace_tenant_id = trace_publish_path.removeprefix("artifact://").split("/", 1)[0]
-        if trace_tenant_id != publish_evidence.get("tenant_id"):
-            failures.append("s7_approved_publish_trace_tenant_mismatch")
-        if output.get("integrity") != publish_evidence.get("integrity"):
-            failures.append("s7_approved_publish_trace_integrity_mismatch")
+        try:
+            trace_projection = verify_retained_private_v3_projection(
+                publish_evidence.get("trace_private_v3_projection", {}),
+                trusted_public_key_path=trusted_public_key_path,
+                expectation=expectation_for("UC-E2E-S7", "approved_publish"),
+            )
+        except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+            failures.append("s7_approved_publish_trace_projection_invalid")
+        else:
+            if trace_projection.get("resource_id") != publish_evidence.get("artifact_path"):
+                failures.append("s7_approved_publish_trace_path_mismatch")
+            if trace_projection.get("tenant_id") != publish_evidence.get("tenant_id"):
+                failures.append("s7_approved_publish_trace_tenant_mismatch")
+            if trace_projection.get("state_digest") != publish_evidence.get("integrity"):
+                failures.append("s7_approved_publish_trace_integrity_mismatch")
     if artifact.get("collision", {}).get("status") != "Denied":
         failures.append("s7_artifact_collision_not_denied")
     if artifact.get("specialist_publish_denial", {}).get("status") != "Denied":
         failures.append("s7_specialist_publish_not_denied")
-    data_scope = read_json(artifact_dir / "data-scope-report.json")
+    data_scope = data_scope_artifact
     if data_scope.get("tenant_b_denial", {}).get("status") != "Denied":
         failures.append("s7_tenant_b_data_ref_not_denied")
     if data_scope.get("manager_permission_denial", {}).get("status") != 403:
@@ -2446,9 +3759,63 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if message.get("smuggling_denial", {}).get("status") != 403:
         failures.append("s7_smuggling_message_not_rejected")
     work_orders = read_json(artifact_dir / "work-order-validation.json")
-    specialist = work_orders.get("specialist", {})
+    specialist = work_orders.get("specialist_data", work_orders.get("specialist", {}))
     if "artifact.publish_external" in specialist.get("allowed_actions", []) or "artifact.publish_external" in specialist.get("allowed_permissions", []):
         failures.append("s7_specialist_work_order_overbroad")
+    exact_profiles = work_orders.get("exact_profiles", {})
+    expected_profiles = {
+        "specialist_data": (
+            "data.read_fixture",
+            "fixture-data-store",
+            "data.read_fixture",
+            "sql.read_fixture",
+        ),
+        "internal_artifact": (
+            "artifact.create_internal",
+            "artifact-store",
+            "artifact.create_internal",
+            "artifact.create_internal",
+        ),
+        "publish": (
+            "artifact.publish_external",
+            "artifact-store",
+            "artifact.publish_external",
+            "artifact.publish_external",
+        ),
+        "request_message": (
+            "message.remote.proposal",
+            "remote-message",
+            f"message.remote.proposal:{specialist.get('agent_id')}",
+            "message.remote.proposal",
+        ),
+        "response_message": (
+            "message.remote.proposal",
+            "remote-message",
+            f"message.remote.proposal:{work_orders.get('internal_artifact', {}).get('agent_id')}",
+            "message.remote.proposal",
+        ),
+    }
+    for profile_name, (action_name, adapter, permission, capability) in expected_profiles.items():
+        profile = exact_profiles.get(profile_name, {})
+        if profile.get("allowed_actions") != [action_name]:
+            failures.append(f"s7_exact_profile_action_mismatch:{profile_name}")
+        if profile.get("allowed_adapters") != [adapter]:
+            failures.append(f"s7_exact_profile_adapter_mismatch:{profile_name}")
+        if profile.get("allowed_permissions") != [permission]:
+            failures.append(f"s7_exact_profile_permission_mismatch:{profile_name}")
+        if profile.get("required_capabilities") != [capability]:
+            failures.append(f"s7_exact_profile_capability_mismatch:{profile_name}")
+        if profile.get("signature_key_id") != "work-order-acceptance-vpc":
+            failures.append(f"s7_work_order_not_signed_for_vpc_instance:{profile_name}")
+    message_authority = message.get("authority_binding", {})
+    if (
+        message_authority.get("response_work_order_run_id")
+        != message_authority.get("child_run_id")
+        or message_authority.get("message_run_id")
+        != message_authority.get("parent_run_id")
+        or message_authority.get("message_payload_is_authority") is not False
+    ):
+        failures.append("s7_specialist_response_authority_binding_mismatch")
     replay = read_json(artifact_dir / "replay-report.json")
     if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("external_publish_replayed") is not False or replay.get("raw_payloads_absent") is not True:
         failures.append("s7_replay_suppression_or_redaction_missing")
@@ -2483,8 +3850,60 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s7_missing_message_trace_evidence")
     elif set(event_ids.get("message.sent", [])) & set(event_ids.get("message.received", [])):
         failures.append("s7_message_receive_trace_reuses_send_trace")
+    resident_security = read_json(artifact_dir / "resident-security.json")
+    security_events = resident_security.get("events", [])
+    credential_ids = [
+        event.get("credential_id")
+        for event in security_events
+        if event.get("credential_id")
+    ]
+    if (
+        resident_security.get("status") != "passed"
+        or resident_security.get("transport") != "verified_tls"
+        or not str(resident_security.get("resident_url", "")).startswith("https://")
+        or resident_security.get("raw_bearer_recorded") is not False
+        or resident_security.get("fresh_jti_per_request") is not True
+        or not security_events
+    ):
+        failures.append("s7_resident_security_evidence_missing_or_invalid")
+    if len(credential_ids) != len(set(credential_ids)):
+        failures.append("s7_resident_mutating_jti_reused")
+    for event in security_events:
+        if event.get("bearer_present") is not True or event.get("tls_verified_with_acceptance_ca") is not True:
+            failures.append(
+                f"s7_resident_security_boundary_not_enforced:{event.get('operation_id')}"
+            )
+        if event.get("mutating") is True and event.get("credential_and_audit_mirrored_in_body") is not True:
+            failures.append(
+                f"s7_resident_mutation_missing_credential_audit_mirror:{event.get('operation_id')}"
+            )
+        if event.get("raw_bearer_recorded") is not False:
+            failures.append(
+                f"s7_resident_security_evidence_contains_bearer:{event.get('operation_id')}"
+            )
+    if sum(
+        1
+        for event in security_events
+        if event.get("intentional_projection_mismatch_negative") is True
+    ) != 1:
+        failures.append("s7_manager_projection_negative_not_isolated")
+    manager_approval_auth = read_json(artifact_dir / "manager-approval-auth.json")
+    failures.extend(
+        validate_s7_manager_approval_auth(manager_approval_auth, api_rows)
+    )
     anti = read_json(artifact_dir / "anti-drift-results.json")
-    for key in ["private_helper_only_e2e", "gateway_bypass", "specialist_broad_permission_inheritance", "manager_credential_authorizes_action", "trace_export_without_redaction_allowed", "replay_side_effects_allowed_default"]:
+    for key in [
+        "private_helper_only_e2e",
+        "gateway_bypass",
+        "specialist_broad_permission_inheritance",
+        "manager_credential_authorizes_action",
+        "trace_export_without_redaction_allowed",
+        "replay_side_effects_allowed_default",
+        "raw_approval_evidence_used_for_execution",
+        "approval_lifecycle_resume_used",
+        "approval_retry_started_second_tick",
+        "approval_retry_advanced_state_head",
+    ]:
         if anti.get(key) is not False:
             failures.append(f"s7_anti_drift_expected_false:{key}")
     if not scenario.get("run_ids") or not scenario.get("state_node_ids") or not scenario.get("state_hashes") or not scenario.get("work_order_ids") or not scenario.get("message_ids") or not scenario.get("approval_ids"):
@@ -2509,6 +3928,7 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "schema-migration-report.json",
         "audit-package.json",
         "audit-report.json",
+        "resident-security.json",
         "public-boundary-evidence.json",
         "anti-drift-results.json",
         "tampered-trace-export.jsonl",
@@ -2602,12 +4022,60 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if not public_replays:
         failures.append("s8_public_replay_api_runs_missing")
     for item in public_replays:
+        if not str(item.get("base_url", "")).startswith("https://"):
+            failures.append(f"s8_public_replay_api_not_tls:{item.get('label')}:{item.get('run_id')}")
         if item.get("before_status") != 200 or item.get("replay_status") != 200 or item.get("after_status") != 200:
             failures.append(f"s8_public_replay_api_status_failed:{item.get('label')}:{item.get('run_id')}")
         if item.get("adapter_executions_before") is None or item.get("adapter_executions_after") is None:
             failures.append(f"s8_public_replay_counter_missing:{item.get('label')}:{item.get('run_id')}")
         if item.get("adapter_executions_before") != item.get("adapter_executions_after"):
             failures.append(f"s8_public_replay_counter_changed:{item.get('label')}:{item.get('run_id')}")
+    resident_security = read_json(artifact_dir / "resident-security.json")
+    security_events = resident_security.get("events", [])
+    credential_ids = [
+        event.get("credential_id") for event in security_events if event.get("credential_id")
+    ]
+    mutating_credential_ids = [
+        event.get("credential_id")
+        for event in security_events
+        if event.get("mutating") is True and event.get("credential_id")
+    ]
+    if (
+        resident_security.get("status") != "passed"
+        or resident_security.get("transport") != "verified_tls"
+        or resident_security.get("request_local_bearer") is not True
+        or resident_security.get("exact_endpoint_scopes") is not True
+        or resident_security.get("fresh_jti_per_request") is not True
+        or resident_security.get("fresh_mutating_jti_per_request") is not True
+        or resident_security.get("body_credential_and_audit_mirrors_aligned") is not True
+        or resident_security.get("raw_bearer_recorded") is not False
+        or not security_events
+    ):
+        failures.append("s8_resident_security_evidence_missing_or_invalid")
+    if len(credential_ids) != len(set(credential_ids)):
+        failures.append("s8_resident_request_credential_reused")
+    if len(mutating_credential_ids) != len(set(mutating_credential_ids)):
+        failures.append("s8_resident_mutating_jti_reused")
+    for event in security_events:
+        operation = event.get("operation_id")
+        method = event.get("method")
+        expected_scope = "runs_read" if method == "GET" else "replay_create"
+        if (
+            event.get("bearer_present") is not True
+            or event.get("caller_credential_header_present") is not True
+            or event.get("tls_verified_with_acceptance_ca") is not True
+            or event.get("scope") != expected_scope
+            or event.get("target_instance_id") != event.get("audience_instance_id")
+        ):
+            failures.append(f"s8_resident_security_boundary_not_enforced:{operation}")
+        if method == "POST" and (
+            event.get("credential_and_audit_mirrored_in_body") is not True
+            or event.get("body_credential_matches_verified_projection") is not True
+            or event.get("body_audit_matches_verified_projection") is not True
+        ):
+            failures.append(f"s8_resident_mutation_mirror_mismatch:{operation}")
+        if event.get("raw_bearer_recorded") is not False:
+            failures.append(f"s8_resident_security_evidence_contains_bearer:{operation}")
     modes = replay.get("modes", {})
     for mode in ["inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"]:
         evidence = modes.get(mode, {})
@@ -2816,8 +4284,10 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     retry_policy = quota.get("retry_policy", {})
     if retry_policy.get("mode") != "explicit_public_retry_policy" or retry_policy.get("enforced_by") != "gateway_quota" or retry_policy.get("max_attempts") != 2:
         failures.append("s9_retry_policy_shape_invalid")
-    if quota.get("unsafe_retry", {}).get("status") not in {"Denied", "NeedsIntervention"}:
-        failures.append("s9_unsafe_non_idempotent_retry_not_rejected")
+    if quota.get("unsafe_retry", {}).get("status") != "Failed":
+        failures.append("s9_non_idempotent_adapter_failure_missing")
+    if retry_policy.get("non_idempotent_action") != "s9.unsafe_retry" or retry_policy.get("non_idempotent_submissions") != 1 or retry_policy.get("non_idempotent_failure_events") != 1 or retry_policy.get("automatic_retry_observed") is not False:
+        failures.append("s9_non_idempotent_automatic_retry_not_disproven")
     if quota.get("quota_first", {}).get("status") != "Executed" or quota.get("quota_second", {}).get("status") not in {"Denied", "NeedsIntervention"}:
         failures.append("s9_quota_outcomes_invalid")
     idempotency = read_json(artifact_dir / "idempotency-report.json")
@@ -2849,6 +4319,10 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s9_trace_sync_tamper_not_rejected")
     if trace_sync.get("recovered", {}).get("accepted_records", 0) <= 0:
         failures.append("s9_trace_sync_recovery_missing")
+    if trace_sync.get("source_scenario") != "UC-E2E-S4" or trace_sync.get("source_artifact") != "UC-E2E-S4/trace-sync-report.json" or trace_sync.get("raw_sync_accepted_by_s4") is not True or trace_sync.get("tamper_rejected_by_s4") is not True:
+        failures.append("s9_trace_sync_not_derived_from_s4_raw_sync")
+    if trace_sync.get("redacted_records_resynced_by_s9") is not False or trace_sync.get("trace_hashes_rewritten") is not False:
+        failures.append("s9_trace_sync_redacted_or_hash_rewritten")
     telemetry = read_json(artifact_dir / "fleet-telemetry.json")
     if telemetry.get("authority") != "observational_only" or telemetry.get("stale_placement", {}).get("status") != "rejected":
         failures.append("s9_telemetry_or_stale_placement_authoritative")
@@ -2865,6 +4339,8 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     for key in ["private_helper_only_e2e", "gateway_bypass", "static_s9_evidence", "unbounded_retry", "fake_success_after_adapter_failure", "verifier_or_policy_fail_open", "telemetry_authorizes_action_or_placement", "replay_side_effects_allowed_default"]:
         if anti.get(key) is not False:
             failures.append(f"s9_anti_drift_expected_false:{key}")
+    if anti.get("immutable_s4_identities_reused") is not True or anti.get("redacted_trace_records_resynced") is not False or anti.get("trace_hashes_rewritten") is not False:
+        failures.append("s9_anti_drift_identity_or_trace_integrity_claim_missing")
     if sorted(anti.get("derived_from_required_event_evidence", [])) != sorted(S9_REQUIRED_EVENTS):
         failures.append("s9_anti_drift_not_derived_from_event_evidence")
     if set(anti.get("public_api_operations", [])) < S9_REQUIRED_OPERATIONS:
@@ -2876,13 +4352,1176 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
-def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def s10_resident_required_scope(method: str, url: str) -> str | None:
+    path = urlsplit(url).path.rstrip("/") or "/"
+    parts = [part for part in path.split("/") if part]
+    if method == "GET" and path == "/health":
+        return "health_read"
+    if method == "POST" and path == "/runs":
+        return "runs_create"
+    if method == "POST" and path == "/actions":
+        return "actions_submit"
+    if method == "POST" and path == "/state-snapshots/export":
+        return "state_handoff"
+    if method == "POST" and path == "/state-snapshots/import":
+        return "state_handoff"
+    if method == "POST" and path == "/devices/profiles":
+        return "device_register"
+    if parts[:1] == ["operator"] and len(parts) >= 2 and parts[1] == "interventions" and method == "POST":
+        return "operator_intervene"
+    if len(parts) >= 3 and parts[0] == "devices":
+        if method == "GET" and parts[2] in {"status", "policy-cache"}:
+            return "device_read"
+        if method == "POST" and parts[2] == "actions":
+            return "actions_submit"
+        if method == "POST" and parts[2:] == ["trace-buffer", "sync"]:
+            return "device_trace_sync"
+    if len(parts) >= 2 and parts[0] == "runs":
+        if method == "GET" and len(parts) == 2:
+            return "runs_read"
+        if method == "POST" and parts[2:] == ["start"]:
+            return "runs_start"
+        if method == "POST" and parts[2:] == ["pause"]:
+            return "runs_pause"
+        if method == "POST" and parts[2:] == ["resume"]:
+            return "runs_resume"
+        if method == "GET" and parts[2:] == ["state-head"]:
+            return "state_read"
+        if method == "GET" and parts[2:] == ["traces"]:
+            return "traces_read"
+        if method == "POST" and parts[2:] == ["replay"]:
+            return "replay_create"
+        if method == "POST" and parts[2:] == ["traces", "export"]:
+            return "traces_read"
+        if method == "POST" and parts[2:] == ["governance", "circuit-breakers", "sync"]:
+            return "policies_sync"
+    return None
+
+
+def contains_bearer_bytes(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(
+            re.search(r"(?i)\bbearer\s+\S+", value)
+            or re.search(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b", value)
+        )
+    if isinstance(value, dict):
+        return any(contains_bearer_bytes(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_bearer_bytes(item) for item in value)
+    return False
+
+
+def s10_resident_event_structurally_valid(event: dict) -> bool:
+    status = event.get("result_status")
+    expected_statuses = event.get("expected_statuses")
+    expected_result = event.get("expected_result")
+    mutating = event.get("mutating") is True
+    correlation = event.get("correlation", {})
+    if (
+        not event.get("call_id")
+        or not event.get("operation_id")
+        or event.get("method") not in {"GET", "POST", "PUT", "PATCH", "DELETE"}
+        or event.get("url_scheme") != "https"
+        or event.get("tls_verification") != "acceptance_ca"
+        or event.get("redirect_policy") != "disabled"
+        or event.get("target_instance_id") != event.get("audience_instance_id")
+        or event.get("target_audience") != f"urn:splendor:instance:{event.get('target_instance_id')}"
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(event.get("credential_id", "")))
+        or event.get("header_presence", {}).get("authorization") is not True
+        or event.get("header_presence", {}).get("caller_credential_mirror") is not True
+        or event.get("raw_bearer_recorded") is not False
+        or contains_bearer_bytes(event)
+        or not isinstance(expected_statuses, list)
+        or not expected_statuses
+        or status not in expected_statuses
+    ):
+        return False
+    if expected_result == "success" and not (isinstance(status, int) and 200 <= status < 300):
+        return False
+    if expected_result == "error" and not (isinstance(status, int) and 300 <= status < 600):
+        return False
+    if mutating and event.get("body_mirror_status") != "matched":
+        return False
+    if not mutating and event.get("body_mirror_status") not in {"matched", "not_applicable"}:
+        return False
+    if event.get("scope_expectation") == "exact":
+        if event.get("scope") != event.get("required_scope"):
+            return False
+    elif event.get("scope_expectation") == "intentional_mismatch":
+        if event.get("scope") == event.get("required_scope") or expected_result != "error":
+            return False
+    else:
+        return False
+    if mutating:
+        if correlation.get("status") == "available":
+            if not correlation.get("trace_event_ids") and not correlation.get("daemon_audit_trace_event_ids"):
+                return False
+        elif correlation.get("status") == "unavailable":
+            if not correlation.get("unavailable_reason"):
+                return False
+        else:
+            return False
+    elif correlation.get("status") != "not_required_read_only":
+        return False
+    return True
+
+
+def derive_s10_resident_security_summary(
+    events: list[dict], invalid_call_ids: set[str] | None = None
+) -> dict:
+    invalid_call_ids = invalid_call_ids or {
+        str(event.get("call_id"))
+        for event in events
+        if not s10_resident_event_structurally_valid(event)
+    }
+    mutating = [event for event in events if event.get("mutating") is True]
+    mutating_ids = [event.get("credential_id") for event in mutating]
+    unique_mutating_ids = len(set(mutating_ids))
+    return {
+        "total_calls": len(events),
+        "mutating_calls": len(mutating),
+        "read_only_calls": len(events) - len(mutating),
+        "successful_response_calls": sum(isinstance(event.get("result_status"), int) and 200 <= event["result_status"] < 300 for event in events),
+        "expected_error_calls": sum(event.get("expected_result") == "error" for event in events),
+        "expected_result_matches": sum(event.get("result_status") in event.get("expected_statuses", []) for event in events),
+        "unique_mutating_credential_ids": unique_mutating_ids,
+        "response_trace_correlated_mutating_calls": sum(bool(event.get("correlation", {}).get("trace_event_ids")) for event in mutating),
+        "daemon_audit_correlated_mutating_calls": sum(bool(event.get("correlation", {}).get("daemon_audit_trace_event_ids")) for event in mutating),
+        "unavailable_mutating_correlations": sum(event.get("correlation", {}).get("status") == "unavailable" for event in mutating),
+        "invalid_calls": len(invalid_call_ids),
+        "status": "passed" if events and not invalid_call_ids and len(mutating_ids) == unique_mutating_ids else "failed",
+    }
+
+
+def validate_s10_resident_security(
+    resident_security: dict,
+    authority_profiles: dict,
+    api_rows: list[dict] | None = None,
+    trace_records: list[dict] | None = None,
+) -> list[str]:
+    failures: list[str] = []
+    api_rows = api_rows or []
+    trace_records = trace_records or []
+    resident_calls = resident_security.get("events", [])
+    if not isinstance(resident_calls, list) or not resident_calls:
+        resident_calls = []
+        failures.append("s10_resident_mutating_jti_reuse_or_missing_calls")
+    if resident_security.get("transport") != "verified_tls" or resident_security.get("local_development_work_order_key_used") is not False:
+        failures.append("s10_resident_security_transport_or_secret_redaction_failed")
+
+    relevant_api_rows = [
+        row
+        for row in api_rows
+        if row.get("resident_call_id")
+        or urlsplit(str(row.get("url", ""))).hostname in {
+            "resident-vpc-node",
+            "resident-cloud-node",
+            "resident-edge-node",
+        }
+    ]
+    if contains_unredacted_authority_receipt_signature(relevant_api_rows):
+        failures.append("s10_resident_security_contains_receipt_signature")
+    event_ids = [event.get("call_id") for event in resident_calls]
+    traffic_ids = [row.get("resident_call_id") for row in relevant_api_rows]
+    if len(event_ids) != len(set(event_ids)) or len(traffic_ids) != len(set(traffic_ids)) or set(event_ids) != set(traffic_ids):
+        failures.append("s10_resident_event_api_traffic_cardinality_mismatch")
+    traffic_by_id = {row.get("resident_call_id"): row for row in relevant_api_rows if row.get("resident_call_id")}
+
+    daemon_audit_ids: dict[str, set[str]] = {}
+    for record in trace_records:
+        payload = record.get("payload", {}) if isinstance(record, dict) else {}
+        kind = payload.get("kind", {}) if isinstance(payload, dict) else {}
+        audit_event = kind.get("DaemonAudit", {}) if isinstance(kind, dict) else {}
+        audit = audit_event.get("audit", {}) if isinstance(audit_event, dict) else {}
+        credential_id = audit.get("credential_id") if isinstance(audit, dict) else None
+        event_id = payload.get("trace_event_id") if isinstance(payload, dict) else None
+        if credential_id and event_id:
+            daemon_audit_ids.setdefault(str(credential_id), set()).add(str(event_id))
+
+    invalid_call_ids: set[str] = set()
+    mutating_ids: list[str | None] = []
+    for event in resident_calls:
+        call_id = str(event.get("call_id") or "missing")
+        row = traffic_by_id.get(event.get("call_id"))
+        event_invalid = not s10_resident_event_structurally_valid(event)
+        if row is None:
+            event_invalid = True
+        else:
+            actual_scheme = urlsplit(str(row.get("url", ""))).scheme.lower()
+            required_scope = s10_resident_required_scope(str(row.get("method", "")), str(row.get("url", "")))
+            if (
+                actual_scheme != "https"
+                or event.get("url_scheme") != actual_scheme
+                or event.get("operation_id") != row.get("operation_id")
+                or event.get("method") != row.get("method")
+                or event.get("result_status") != row.get("status")
+                or required_scope is None
+                or event.get("required_scope") != required_scope
+                or row.get("transport") != "verified_tls"
+                or contains_bearer_bytes(row)
+            ):
+                event_invalid = True
+            intentional_mismatch = event.get("scope_expectation") == "intentional_mismatch"
+            if intentional_mismatch:
+                if event.get("scope") == required_scope or row.get("status") != 403:
+                    event_invalid = True
+            elif event.get("scope") != required_scope:
+                event_invalid = True
+            request = row.get("request") if isinstance(row.get("request"), dict) else None
+            if event.get("mutating") is True:
+                mutating_ids.append(event.get("credential_id"))
+                credential = request.get("credential", {}) if request else {}
+                audit = request.get("audit_attribution", {}) if request else {}
+                if (
+                    not request
+                    or credential.get("credential_id") != event.get("credential_id")
+                    or credential.get("scopes") != [event.get("scope")]
+                    or credential.get("audience") != {"instance": {"instance_id": event.get("target_instance_id")}}
+                    or audit.get("credential_id") != event.get("credential_id")
+                    or event.get("body_mirror_status") != "matched"
+                ):
+                    event_invalid = True
+            elif request is not None and event.get("body_mirror_status") == "not_applicable":
+                event_invalid = True
+
+            response = row.get("response") if isinstance(row.get("response"), dict) else {}
+            exposed_ids = {
+                str(response[key])
+                for key in ["trace_event_id", "audit_trace_event_id"]
+                if response.get(key)
+            }
+            correlation = event.get("correlation", {})
+            reported_response_ids = set(correlation.get("trace_event_ids", []))
+            reported_audit_ids = set(correlation.get("daemon_audit_trace_event_ids", []))
+            expected_audit_ids = daemon_audit_ids.get(str(event.get("credential_id")), set())
+            if not exposed_ids.issubset(reported_response_ids) or not expected_audit_ids.issubset(reported_audit_ids):
+                event_invalid = True
+            if event.get("mutating") is True:
+                expected_correlation = "available" if exposed_ids or expected_audit_ids else "unavailable"
+                if correlation.get("status") != expected_correlation:
+                    event_invalid = True
+        if event_invalid:
+            invalid_call_ids.add(call_id)
+
+    if not resident_calls or len(mutating_ids) != len(set(mutating_ids)) or any(not value for value in mutating_ids):
+        failures.append("s10_resident_mutating_jti_reuse_or_missing_calls")
+    if invalid_call_ids:
+        failures.append("s10_resident_per_call_evidence_invalid:" + ",".join(sorted(invalid_call_ids)))
+    if {row.get("target_instance_id") for row in resident_calls} < S10_INSTANCE_IDS:
+        failures.append("s10_resident_security_missing_instance_coverage")
+    if {row.get("required_scope") for row in resident_calls} < {"runs_create", "runs_start", "runs_pause", "runs_resume", "actions_submit", "state_handoff", "replay_create", "policies_sync"}:
+        failures.append("s10_resident_security_missing_exact_scope_coverage")
+
+    derived_summary = derive_s10_resident_security_summary(resident_calls, invalid_call_ids)
+    if resident_security.get("summary") != derived_summary or resident_security.get("status") != derived_summary["status"]:
+        failures.append("s10_resident_security_summary_event_mismatch")
+    derived_aliases = {
+        "all_calls_tls_verified": bool(resident_calls) and all(event.get("url_scheme") == "https" and event.get("tls_verification") == "acceptance_ca" for event in resident_calls),
+        "all_calls_exact_one_scope": bool(resident_calls) and all(bool(event.get("scope")) for event in resident_calls),
+        "all_calls_target_bound": bool(resident_calls) and all(event.get("target_instance_id") == event.get("audience_instance_id") for event in resident_calls),
+        "all_body_mirrors_match_verified_projection": bool(resident_calls) and all(event.get("body_mirror_status") in {"matched", "not_applicable"} for event in resident_calls),
+        "all_redirects_disabled": bool(resident_calls) and all(event.get("redirect_policy") == "disabled" for event in resident_calls),
+        "mutating_credential_ids_unique": bool(mutating_ids) and len(mutating_ids) == len(set(mutating_ids)),
+        "raw_bearers_recorded": any(event.get("raw_bearer_recorded") is not False or contains_bearer_bytes(event) for event in resident_calls),
+    }
+    if any(resident_security.get(key) != value for key, value in derived_aliases.items()):
+        failures.append("s10_resident_security_summary_alias_mismatch")
+
+    signing_profiles = resident_security.get("signing_profiles", {})
+    expected_signing_keys = {
+        "00000000-0000-4000-8000-000000000302": "work-order-acceptance-vpc",
+        "00000000-0000-4000-8000-000000000304": "work-order-acceptance-cloud",
+        "00000000-0000-4000-8000-000000000306": "work-order-acceptance-edge",
+    }
+    signed_for_targets = bool(signing_profiles) and all(
+        profile.get("key_id") == expected_signing_keys.get(profile.get("instance_id"))
+        for profile in signing_profiles.values()
+    )
+    if resident_security.get("all_work_orders_signed_for_target_instance") != signed_for_targets:
+        failures.append("s10_resident_work_order_signing_summary_mismatch")
+
+    profiles = authority_profiles.get("profiles", {})
+    internal_profile = profiles.get("internal_artifact", {})
+    publish_profile = profiles.get("external_publish", {})
+    physical_profile = profiles.get("physical_edge", {})
+    cloud_receiver_profile = profiles.get("cloud_receiver", {})
+    if authority_profiles.get("artifact_profiles_split") is not True or internal_profile.get("run_id") == publish_profile.get("run_id"):
+        failures.append("s10_artifact_authority_profiles_not_split")
+    if internal_profile.get("allowed_actions") != ["artifact.create_internal"] or internal_profile.get("allowed_adapters") != ["artifact-store"] or internal_profile.get("allowed_permissions") != ["artifact.create_internal"]:
+        failures.append("s10_internal_artifact_profile_not_exact")
+    if publish_profile.get("allowed_actions") != ["artifact.publish_external"] or publish_profile.get("allowed_adapters") != ["artifact-store"] or publish_profile.get("allowed_permissions") != ["artifact.publish_external"]:
+        failures.append("s10_publish_artifact_profile_not_exact")
+    if physical_profile.get("allowed_actions") != authority_profiles.get("physical_action_allowlist") or physical_profile.get("allowed_adapters") != ["device-sim"] or physical_profile.get("allowed_permissions") != ["physical.high_level"]:
+        failures.append("s10_physical_profile_not_high_level_exact")
+    if cloud_receiver_profile.get("signature_key_id") != "work-order-acceptance-cloud" or authority_profiles.get("secrets_redacted") is not True:
+        failures.append("s10_cloud_receiver_signing_or_secret_redaction_failed")
+    return failures
+
+
+def validate_s10_manager_approval_auth(
+    manager_auth: dict, api_rows: list[dict] | None = None
+) -> list[str]:
+    api_rows = api_rows or []
+    required_operations = {
+        "requestApproval",
+        "grantApproval",
+        "revokeApprovalClaimFirst",
+        "requestRevocableApproval",
+        "grantRevocableApproval",
+        "revokeApproval",
+    }
+    failures = validate_manager_approval_auth_evidence(
+        manager_auth, api_rows, required_operations, "s10"
+    )
+    events = manager_auth.get("events", [])
+    credential_ids = [event.get("credential_id") for event in events]
+    if (
+        manager_auth.get("status") != "passed"
+        or manager_auth.get("mode") != "local_acceptance"
+        or manager_auth.get("exact_scope") != "approvals_manage"
+        or manager_auth.get("raw_bearers_recorded") is not False
+        or manager_auth.get("production_manager_auth_claimed") is not False
+        or manager_auth.get("other_manager_endpoints_authenticated_by_this_profile")
+        is not False
+        or manager_auth.get("raw_jtis_recorded") is not False
+        or manager_auth.get("receipt_signatures_recorded") is not False
+        or manager_auth.get("fresh_mutating_credential_ids")
+        != (len(credential_ids) == len(set(credential_ids)))
+    ):
+        failures.append("s10_manager_approval_auth_summary_invalid")
+    return failures
+
+
+def validate_s10_approval_exact_retry(
+    artifact: dict,
+    api_rows: list[dict],
+    trace_records: list[dict],
+    trusted_public_key_path: Path,
+) -> list[str]:
+    failures: list[str] = []
+    needs_approval = artifact.get("publish_needs_approval", {})
+    challenge = needs_approval.get("approval_challenge", {})
+    publish_start = artifact.get("publish_start", {})
+    approval_request = artifact.get("approval_request", {})
+    approval_grant = artifact.get("approval_grant", {})
+    challenge_fields = {
+        "approval_id",
+        "tenant_id",
+        "agent_id",
+        "run_id",
+        "action_id",
+        "action_name",
+        "adapter",
+        "policy_id",
+        "subject",
+        "receipt_audience",
+        "authority_decision_id",
+        "authority_decision_digest",
+        "obligation_id",
+        "canonical_request_digest",
+        "gateway_action_request_digest",
+        "requested_at",
+        "expires_at",
+    }
+    if (
+        not isinstance(challenge, dict)
+        or not challenge
+        or any(not challenge.get(field) for field in challenge_fields)
+        or approval_request.get("challenge") != challenge
+        or approval_grant.get("challenge") != challenge
+        or publish_start.get("status") != "running"
+        or publish_start.get("action_outcomes") != []
+    ):
+        failures.append("s10_approval_challenge_not_exact_across_artifacts")
+
+    run_id = challenge.get("run_id")
+    action_id = challenge.get("action_id")
+    action_name = challenge.get("action_name")
+    try:
+        approved_projection = verify_retained_private_v3_projection(
+            artifact.get("approved_publish_evidence", {}).get(
+                "private_v3_projection", {}
+            ),
+            trusted_public_key_path=trusted_public_key_path,
+            expectation=expectation_for("UC-E2E-S10", "approved_publish"),
+        )
+    except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+        approved_projection = {}
+        failures.append("s10_approved_publish_projection_invalid")
+    work_order_id = artifact.get("publish_work_order_id")
+    target_instance_id = artifact.get("publish_manager_dispatch", {}).get(
+        "selected_instance_id"
+    )
+    expected_audience = (
+        f"splendor.daemon.approval_receipt.v2:instance:{target_instance_id}:run:{run_id}"
+    )
+    if challenge.get("receipt_audience") != expected_audience:
+        failures.append("s10_approval_challenge_audience_not_instance_run_bound")
+
+    submit_rows = [
+        item
+        for item in operation_rows(api_rows, "submitWorkOrder")
+        if item[1].get("request", {}).get("work_order", {}).get("work_order_id")
+        == work_order_id
+    ]
+    dispatch_rows = [
+        item
+        for item in operation_rows(api_rows, "dispatchWorkOrder")
+        if row_path(item[1]) == f"/work-orders/{work_order_id}/dispatch"
+    ]
+    proposal_rows = operation_rows(api_rows, "submitPublishForApproval")
+    if len(submit_rows) != 1 or len(dispatch_rows) != 1:
+        failures.append("s10_publish_manager_dispatch_api_cardinality_invalid")
+    else:
+        submit_row = submit_rows[0][1]
+        dispatch_row = dispatch_rows[0][1]
+        if (
+            submit_row.get("response") != artifact.get("publish_manager_submission")
+            or dispatch_row.get("response") != artifact.get("publish_manager_dispatch")
+            or dispatch_row.get("response", {}).get("run_id") != run_id
+            or dispatch_row.get("response", {}).get("selected_instance_id")
+            != target_instance_id
+            or dispatch_row.get("response", {}).get("create_run_status") != 200
+            or dispatch_row.get("response", {}).get("start_run_status") != 200
+        ):
+            failures.append("s10_publish_manager_dispatch_not_exact")
+
+    proposal_row = proposal_rows[0][1] if len(proposal_rows) == 1 else {}
+    proposal_request = proposal_row.get("request", {})
+    if (
+        len(proposal_rows) != 1
+        or proposal_row.get("method") != "POST"
+        or row_path(proposal_row) != "/actions"
+        or proposal_row.get("status") != 200
+        or proposal_row.get("response") != needs_approval
+        or proposal_request.get("action_id") != action_id
+        or proposal_request.get("run_id") != run_id
+        or proposal_request.get("tenant_id") != challenge.get("tenant_id")
+        or proposal_request.get("agent_id") != challenge.get("agent_id")
+        or proposal_request.get("action", {}).get("name") != action_name
+        or proposal_request.get("adapter") != challenge.get("adapter")
+        or proposal_request.get("requested_at") != challenge.get("requested_at")
+        or proposal_request.get("authority_obligation_receipts")
+        or "approval_evidence" in proposal_request
+        or needs_approval.get("status") != "NeedsApproval"
+    ):
+        failures.append("s10_publish_proposal_not_exact_public_action")
+
+    request_approval_rows = [
+        item
+        for item in operation_rows(api_rows, "requestApproval")
+        if item[1].get("request", {}).get("challenge", {}).get("approval_id")
+        == challenge.get("approval_id")
+    ]
+    if (
+        len(request_approval_rows) != 1
+        or request_approval_rows[0][1].get("request", {}).get("challenge")
+        != challenge
+        or request_approval_rows[0][1].get("response", {}).get("challenge")
+        != challenge
+        or request_approval_rows[0][1].get("response") != approval_request
+    ):
+        failures.append("s10_manager_approval_request_not_exact")
+
+    grant_rows = [
+        item
+        for item in operation_rows(api_rows, "grantApproval")
+        if item[1].get("response", {}).get("approval_id")
+        == challenge.get("approval_id")
+    ]
+    manager_grant: dict = {}
+    receipt: dict = {}
+    if len(grant_rows) != 1:
+        failures.append("s10_manager_approval_grant_count_invalid")
+    else:
+        manager_grant = grant_rows[0][1].get("response", {})
+        manager_receipt = manager_grant.get("authority_obligation_receipt")
+        if isinstance(manager_receipt, dict):
+            receipt = manager_receipt
+        if (
+            grant_rows[0][1].get("method") != "POST"
+            or grant_rows[0][1].get("status") != 200
+            or authority_receipt_projection(manager_receipt)
+            != authority_receipt_projection(
+                approval_grant.get("authority_obligation_receipt", {})
+            )
+            or manager_grant.get("challenge") != approval_grant.get("challenge")
+            or approval_grant.get("status") != "granted"
+        ):
+            failures.append("s10_manager_approval_grant_not_correlated")
+
+    retry_indexes = [
+        index
+        for index, row in enumerate(api_rows)
+        if row.get("operation_id") == "submitApprovedExactAction"
+    ]
+    retry_row = api_rows[retry_indexes[0]] if len(retry_indexes) == 1 else {}
+    if len(retry_indexes) != 1:
+        failures.append("s10_approved_exact_action_api_call_count_invalid")
+    if (
+        retry_row.get("method") != "POST"
+        or row_path(retry_row) != "/actions"
+        or retry_row.get("status") != 200
+    ):
+        failures.append("s10_approved_exact_action_not_public_post_actions")
+
+    retry_request = retry_row.get("request", {})
+    expected_coordinates = {
+        "action_id": challenge.get("action_id"),
+        "run_id": challenge.get("run_id"),
+        "tenant_id": challenge.get("tenant_id"),
+        "agent_id": challenge.get("agent_id"),
+    }
+    if any(retry_request.get(field) != value for field, value in expected_coordinates.items()):
+        failures.append("s10_approved_exact_action_coordinate_mismatch")
+    if retry_request.get("action", {}).get("name") != action_name:
+        failures.append("s10_approved_exact_action_name_mismatch")
+    for field in [
+        "action_id",
+        "run_id",
+        "tenant_id",
+        "agent_id",
+        "causal_trace_id",
+        "action",
+        "adapter",
+        "quota_usage",
+        "satisfied_preconditions",
+        "requested_at",
+    ]:
+        if retry_request.get(field) != proposal_request.get(field):
+            failures.append(f"s10_approved_exact_action_proposal_mismatch:{field}")
+        if retry_request.get(field) != artifact.get(
+            "publish_exact_action_request", {}
+        ).get(field):
+            failures.append(f"s10_approved_exact_action_artifact_mismatch:{field}")
+    if retry_request.get("adapter") != challenge.get("adapter"):
+        failures.append("s10_approved_exact_action_effective_adapter_mismatch")
+    if retry_request.get("requested_at") != challenge.get("requested_at"):
+        failures.append("s10_approved_exact_action_requested_at_mismatch")
+    challenge_approval = (
+        needs_approval.get("verification", {})
+        .get("artifacts", {})
+        .get("approval", {})
+    )
+    if challenge_approval.get("adapter") != challenge.get("adapter"):
+        failures.append("s10_approval_challenge_effective_adapter_mismatch")
+
+    retry_receipts = retry_request.get("authority_obligation_receipts", [])
+    if not isinstance(retry_receipts, list) or len(retry_receipts) != 1:
+        failures.append("s10_approved_exact_action_receipt_count_invalid")
+    elif authority_receipt_projection(retry_receipts[0]) != authority_receipt_projection(receipt):
+        failures.append("s10_approved_exact_action_receipt_not_manager_issued")
+    if "approval_evidence" in retry_request:
+        failures.append("s10_approved_exact_action_used_raw_approval_evidence")
+
+    manager_trace_id = manager_grant.get("trace_event_id")
+    receipt_validation = receipt.get("validation", {}) if receipt else {}
+    if (
+        not receipt
+        or not receipt.get("receipt_id")
+        or not receipt.get("issuer")
+        or receipt.get("schema_version")
+        != "splendor.authority.obligation_receipt.v1"
+        or receipt.get("kind") != "approval_required"
+        or receipt.get("revocation") != "active"
+        or receipt.get("approval_id") != challenge.get("approval_id")
+        or receipt.get("subject") != challenge.get("subject")
+        or receipt.get("audience") != challenge.get("receipt_audience")
+        or receipt.get("authority_decision_id")
+        != challenge.get("authority_decision_id")
+        or receipt.get("obligation_id") != challenge.get("obligation_id")
+        or receipt.get("canonical_request_digest")
+        != challenge.get("canonical_request_digest")
+        or not str(receipt.get("evidence_digest", "")).startswith("blake3:")
+        or receipt.get("expires_at") != challenge.get("expires_at")
+        or receipt.get("approval_trace_event_id") != manager_trace_id
+        or receipt.get("evidence_ref") != f"approval-trace:{manager_trace_id}"
+        or not is_canonical_uuid(manager_trace_id)
+        or not str(receipt_validation.get("digest", "")).startswith("blake3:")
+    ):
+        failures.append("s10_authority_receipt_not_exact_or_trace_linked")
+
+    retry_response = retry_row.get("response", {})
+    verification = retry_response.get("verification", {})
+    verification_artifacts = verification.get("artifacts", {})
+    obligation = verification_artifacts.get("authority_obligation", {})
+    approval_result = verification_artifacts.get("approval", {}).get("approval", {})
+    authority_decisions = verification_artifacts.get("authority", {}).get(
+        "decisions", []
+    )
+    action_decisions = [
+        decision
+        for decision in authority_decisions
+        if isinstance(decision, dict)
+        and decision.get("decision_id") == challenge.get("authority_decision_id")
+    ]
+    receipt_id = receipt.get("receipt_id")
+    obligation_id = challenge.get("obligation_id")
+    response_valid = (
+        retry_response.get("status") == "Executed"
+        and retry_response.get("action_id") == action_id
+        and retry_response.get("error") is None
+        and verification.get("allowed") is True
+        and retry_response.get("post_verification", {}).get("allowed") is True
+        and approved_projection.get("operation_id")
+        == "artifact-store/artifact.publish_external"
+        and approved_projection.get("action_id") == action_id
+        and approved_projection.get("resource_id")
+        == proposal_request.get("action", {}).get("params", {}).get("publish_ref")
+        and obligation.get("authority_obligation_status") == "satisfied"
+        and obligation.get("decision_id") == challenge.get("authority_decision_id")
+        and obligation.get("authority_decision_digest")
+        == challenge.get("authority_decision_digest")
+        and obligation.get("gateway_action_request_digest")
+        == challenge.get("gateway_action_request_digest")
+        and obligation.get("obligation_ids") == [obligation_id]
+        and obligation.get("satisfied_obligation_ids") == [obligation_id]
+        and obligation.get("receipt_ids") == [receipt_id]
+        and obligation.get("pre_effect_recorded") is True
+        and len(action_decisions) == 1
+        and obligation.get("authority_decision_evidence_digest")
+        == action_decisions[0].get("decision_digest")
+        and approval_result.get("decision") == "Granted"
+        and approval_result.get("action_id") == action_id
+        and approval_result.get("adapter") == challenge.get("adapter")
+    )
+    if not response_valid:
+        failures.append("s10_approved_exact_action_response_not_executed_and_satisfied")
+    if (
+        artifact.get("approved_publish") != retry_response
+        or artifact.get("publish_exact_action_retry") != retry_response
+    ):
+        failures.append("s10_approved_exact_action_response_artifact_mismatch")
+
+    before_inspections = operation_rows(api_rows, "inspectPublishBeforeExactRetry")
+    after_inspections = operation_rows(api_rows, "inspectPublishAfterExactRetry")
+    before_states = operation_rows(api_rows, "getPublishStateBeforeExactRetry")
+    after_states = operation_rows(api_rows, "getPublishStateAfterExactRetry")
+    if any(
+        len(rows) != 1
+        for rows in [before_inspections, after_inspections, before_states, after_states]
+    ):
+        failures.append("s10_approved_exact_action_public_run_inspections_missing")
+    else:
+        before = before_inspections[0][1].get("response", {})
+        after = after_inspections[0][1].get("response", {})
+        state_before = before_states[0][1].get("response", {})
+        state_after = after_states[0][1].get("response", {})
+        if (
+            before.get("ticks") != after.get("ticks")
+            or before.get("ticks") != publish_start.get("tick_id")
+        ):
+            failures.append("s10_approved_exact_action_advanced_tick")
+        if (
+            before.get("state_head") != after.get("state_head")
+            or before.get("state_head") != publish_start.get("state_node_id")
+        ):
+            failures.append("s10_approved_exact_action_advanced_state_head")
+        if state_projection(state_before) != state_projection(state_after):
+            failures.append("s10_approved_exact_action_advanced_state_head")
+        if (
+            before.get("adapter_executions") != 0
+            or after.get("adapter_executions") != 1
+        ):
+            failures.append("s10_approved_publish_public_execution_count_not_one")
+
+    if artifact.get("publish_execution_count_for_positive_run") != 1:
+        failures.append("s10_approved_publish_artifact_execution_count_not_one")
+
+    pending_records = [
+        record
+        for record in trace_records
+        if trace_record_run_id(record) == run_id
+        and trace_record_action_id(record) == action_id
+        and trace_record_kind(record) == "action.needs_approval"
+        and trace_record_action_name(record) == action_name
+    ]
+    if (
+        len(pending_records) != 1
+        or trace_record_kind_payload(pending_records[0]).get("action")
+        != proposal_request.get("action")
+    ):
+        failures.append("s10_approved_publish_pending_trace_not_exact")
+
+    execution_records = [
+        record
+        for record in trace_records
+        if trace_record_run_id(record) == run_id
+        and trace_record_action_id(record) == action_id
+        and trace_record_kind(record) == "action.executed"
+        and trace_record_action_name(record) == action_name
+    ]
+    trace_projection = {}
+    try:
+        trace_projection = verify_retained_private_v3_projection(
+            artifact.get("approved_publish_evidence", {}).get(
+                "trace_private_v3_projection", {}
+            ),
+            trusted_public_key_path=trusted_public_key_path,
+            expectation=expectation_for("UC-E2E-S10", "approved_publish"),
+        )
+    except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+        failures.append("s10_approved_publish_trace_projection_invalid")
+    if (
+        len(execution_records) != 1
+        or trace_record_kind_payload(execution_records[0]).get("action")
+        != proposal_request.get("action")
+        or trace_projection.get("operation_id")
+        != "artifact-store/artifact.publish_external"
+        or trace_projection.get("action_id") != action_id
+        or trace_projection.get("resource_id")
+        != proposal_request.get("action", {}).get("params", {}).get("publish_ref")
+    ):
+        failures.append("s10_approved_publish_execution_trace_count_not_one")
+
+    resumed_records = [
+        record
+        for record in trace_records
+        if trace_record_run_id(record) == run_id
+        and trace_record_kind(record) == "run.resumed"
+    ]
+    if (
+        len(execution_records) != 1
+        or len(resumed_records) != 1
+        or trace_record_sequence(resumed_records[0])
+        <= trace_record_sequence(execution_records[0])
+        or trace_record_kind_payload(resumed_records[0]).get("reason")
+        != "exact approved action executed"
+    ):
+        failures.append("s10_approved_publish_post_effect_resume_missing")
+
+    lifecycle_resume_rows = [
+        row
+        for row in api_rows
+        if row.get("method") == "POST"
+        and row_path(row) == f"/runs/{run_id}/resume"
+    ]
+    if lifecycle_resume_rows:
+        failures.append("s10_approved_publish_used_lifecycle_resume")
+    order_groups = [
+        submit_rows,
+        dispatch_rows,
+        proposal_rows,
+        request_approval_rows,
+        grant_rows,
+        before_inspections,
+        before_states,
+        [(retry_indexes[0], retry_row)] if len(retry_indexes) == 1 else [],
+        after_inspections,
+        after_states,
+    ]
+    if all(len(group) == 1 for group in order_groups):
+        indexes = [group[0][0] for group in order_groups]
+        if indexes != sorted(indexes):
+            failures.append("s10_approved_publish_api_order_invalid")
+    if contains_unredacted_authority_receipt_signature(artifact) or contains_unredacted_authority_receipt_signature(
+        [row for _, row in proposal_rows + request_approval_rows + grant_rows]
+        + [retry_row]
+    ):
+        failures.append("s10_retained_approval_evidence_contains_receipt_signature")
+    return failures
+
+
+def trace_record_sequence(record: dict) -> int:
+    sequence = record.get("sequence")
+    if not isinstance(sequence, int):
+        sequence = record.get("payload", {}).get("sequence")
+    return sequence if isinstance(sequence, int) else -1
+
+
+def validate_s10_active_raw_rejection(
+    artifact: dict, api_rows: list[dict]
+) -> list[str]:
+    failures: list[str] = []
+    required = [
+        "inspectPublishBeforeExpiredRaw",
+        "getPublishStateBeforeExpiredRaw",
+        "getPublishTracesBeforeExpiredRaw",
+        "submitExpiredRawApprovalOnActiveRun",
+        "inspectPublishAfterExpiredRaw",
+        "getPublishStateAfterExpiredRaw",
+        "getPublishTracesAfterExpiredRaw",
+    ]
+    groups = [operation_rows(api_rows, operation) for operation in required]
+    if any(len(group) != 1 for group in groups):
+        return ["s10_active_raw_api_cardinality_invalid"]
+    indexes = [group[0][0] for group in groups]
+    rows = [group[0][1] for group in groups]
+    if indexes != sorted(indexes):
+        failures.append("s10_active_raw_api_order_invalid")
+    before_run, before_state, before_traces, raw_row, after_run, after_state, after_traces = rows
+    if (
+        raw_row.get("method") != "POST"
+        or row_path(raw_row) != "/actions"
+        or raw_row.get("status") != 409
+        or raw_row.get("response") != artifact.get("expired_approval", {}).get("body")
+        or raw_row.get("response", {}).get("code")
+        != "legacy_approval_evidence_non_authorizing"
+        or not isinstance(raw_row.get("request", {}).get("approval_evidence"), dict)
+        or raw_row.get("request", {}).get("authority_obligation_receipts")
+    ):
+        failures.append("s10_active_raw_not_pre_gateway_rejected")
+    evidence = artifact.get("expired_raw_active_run", {})
+    if (
+        lifecycle_projection(before_run.get("response"))
+        != lifecycle_projection(after_run.get("response"))
+        or lifecycle_projection(before_run.get("response"))
+        != lifecycle_projection(evidence.get("run_before"))
+        or state_projection(before_state.get("response"))
+        != state_projection(after_state.get("response"))
+        or state_projection(before_state.get("response"))
+        != state_projection(evidence.get("state_before"))
+        or evidence.get("lifecycle_unchanged") is not True
+        or evidence.get("state_unchanged") is not True
+        or evidence.get("pre_gateway_rejected_unchanged") is not True
+        or evidence.get("no_new_approval_action_outcome_trace") is not True
+    ):
+        failures.append("s10_active_raw_changed_lifecycle_tick_state_or_effect")
+
+    def decision_trace_ids(row: dict) -> list[str]:
+        records = row.get("response", {}).get("records", [])
+        return sorted(
+            trace_record_id(record)
+            for record in records
+            if trace_record_id(record)
+            and (
+                trace_record_kind(record).startswith("action.")
+                or trace_record_kind(record).startswith("approval.")
+                or trace_record_kind(record).startswith("Approval")
+                or trace_record_kind(record)
+                in {"verification.started", "verification.completed", "outcome.recorded"}
+            )
+        )
+
+    before_ids = decision_trace_ids(before_traces)
+    after_ids = decision_trace_ids(after_traces)
+    if (
+        before_ids != after_ids
+        or before_ids != evidence.get("decision_trace_ids_before")
+        or after_ids != evidence.get("decision_trace_ids_after")
+    ):
+        failures.append("s10_active_raw_appended_decision_trace")
+    return failures
+
+
+def validate_s10_approval_revocation(
+    report: dict,
+    resident_security: dict,
+    manager_auth: dict,
+    api_rows: list[dict],
+    trace_records: list[dict],
+) -> list[str]:
+    failures: list[str] = []
+    revoke = report.get("revoke_before_claim", {})
+    run_id = revoke.get("run_id")
+    work_order_id = revoke.get("work_order_id")
+    challenge = revoke.get("challenge", {})
+    receipt = revoke.get("retained_receipt", {})
+    target_instance_id = revoke.get("target_instance_id")
+    expected_audience = (
+        f"splendor.daemon.approval_receipt.v2:instance:{target_instance_id}:run:{run_id}"
+    )
+    if (
+        report.get("status") != "passed"
+        or report.get("schema_version")
+        != "splendor.uc_e2e_s10.approval_receipt_revocation.v1"
+        or report.get("uncertainty_mocked") is not False
+        or report.get("exact_resident_scope")
+        != "splendor.approval_receipts.revoke"
+        or report.get("fresh_manager_jtis") is not True
+        or report.get("fresh_resident_revocation_jtis") is not True
+        or report.get("raw_bearers_recorded") is not False
+        or report.get("raw_jtis_recorded") is not False
+        or report.get("receipt_signatures_recorded_in_per_call_evidence") is not False
+    ):
+        failures.append("s10_revocation_report_summary_invalid")
+
+    submit_rows = [
+        item
+        for item in operation_rows(api_rows, "submitWorkOrder")
+        if item[1].get("request", {}).get("work_order", {}).get("work_order_id")
+        == work_order_id
+    ]
+    dispatch_rows = [
+        item
+        for item in operation_rows(api_rows, "dispatchWorkOrder")
+        if row_path(item[1]) == f"/work-orders/{work_order_id}/dispatch"
+    ]
+    operation_names = [
+        "submitRevocablePublishForApproval",
+        "requestRevocableApproval",
+        "grantRevocableApproval",
+        "inspectRevocablePublishBeforeManagerRevoke",
+        "getRevocablePublishStateBeforeManagerRevoke",
+        "revokeApproval",
+        "inspectRevocablePublishAfterManagerRevoke",
+        "submitRevokedOriginalReceipt",
+        "inspectRevocablePublishAfterDeniedRetry",
+        "getRevocablePublishStateAfterDeniedRetry",
+    ]
+    groups = [submit_rows, dispatch_rows] + [
+        operation_rows(api_rows, operation) for operation in operation_names
+    ]
+    if any(len(group) != 1 for group in groups):
+        failures.append("s10_revocation_api_cardinality_invalid")
+        rows: list[dict] = []
+    else:
+        indexes = [group[0][0] for group in groups]
+        rows = [group[0][1] for group in groups]
+        if indexes != sorted(indexes):
+            failures.append("s10_revocation_api_order_invalid")
+
+    if rows:
+        (
+            submit_row,
+            dispatch_row,
+            proposal_row,
+            request_row,
+            grant_row,
+            before_row,
+            state_before_row,
+            manager_revoke_row,
+            after_revoke_row,
+            retry_row,
+            after_retry_row,
+            state_after_row,
+        ) = rows
+        if (
+            submit_row.get("status") != revoke.get("manager_submission", {}).get("status")
+            or submit_row.get("response")
+            != revoke.get("manager_submission", {}).get("body")
+            or dispatch_row.get("status")
+            != revoke.get("manager_dispatch", {}).get("status")
+            or dispatch_row.get("response")
+            != revoke.get("manager_dispatch", {}).get("body")
+            or dispatch_row.get("response", {}).get("selected_instance_id")
+            != target_instance_id
+            or dispatch_row.get("response", {}).get("run_id") != run_id
+        ):
+            failures.append("s10_revocation_manager_dispatch_not_exact")
+        proposal = proposal_row.get("response", {})
+        if (
+            proposal_row.get("status") != 200
+            or proposal.get("status") != "NeedsApproval"
+            or proposal.get("approval_challenge") != challenge
+            or proposal_row.get("request", {}).get("authority_obligation_receipts")
+            or "approval_evidence" in proposal_row.get("request", {})
+        ):
+            failures.append("s10_revocation_proposal_not_exact")
+        grant_receipt = grant_row.get("response", {}).get(
+            "authority_obligation_receipt", {}
+        )
+        if (
+            request_row.get("request", {}).get("challenge") != challenge
+            or grant_row.get("response", {}).get("challenge") != challenge
+            or grant_row.get("response", {}).get("status") != "granted"
+            or grant_row.get("response", {}).get("trace_event_id")
+            != revoke.get("grant", {}).get("trace_event_id")
+            or grant_receipt.get("receipt_id") != receipt.get("receipt_id")
+            or grant_receipt.get("approval_id") != receipt.get("approval_id")
+            or grant_receipt.get("audience") != expected_audience
+            or receipt.get("audience") != expected_audience
+            or receipt.get("revocation") != "active"
+        ):
+            failures.append("s10_revocation_receipt_or_challenge_mismatch")
+        acknowledgement = revoke.get("resident_ack", {})
+        if (
+            manager_revoke_row.get("status") != 200
+            or manager_revoke_row.get("response", {}).get(
+                "resident_receipt_revocation_ack"
+            )
+            != acknowledgement
+            or manager_revoke_row.get("response", {}).get("status") != "revoked"
+            or manager_revoke_row.get("response", {}).get("evidence", {}).get(
+                "revoked"
+            )
+            is not True
+            or acknowledgement.get("schema_version")
+            != "splendor.resident.approval_receipt_revocation_ack.v1"
+            or acknowledgement.get("status") not in {"revoked", "already_revoked"}
+            or acknowledgement.get("effect_certainty") != "known"
+            or acknowledgement.get("receipt_id") != receipt.get("receipt_id")
+            or acknowledgement.get("approval_id") != receipt.get("approval_id")
+            or acknowledgement.get("run_id") != run_id
+            or acknowledgement.get("target_instance_id") != target_instance_id
+            or acknowledgement.get("receipt_audience") != expected_audience
+        ):
+            failures.append("s10_revocation_resident_ack_not_exact")
+        retry_receipts = retry_row.get("request", {}).get(
+            "authority_obligation_receipts", []
+        )
+        retry_outcome = retry_row.get("response", {})
+        if (
+            len(retry_receipts) != 1
+            or any(
+                retry_receipts[0].get(key) != receipt.get(key)
+                for key in [
+                    "schema_version",
+                    "receipt_id",
+                    "approval_id",
+                    "audience",
+                    "revocation",
+                ]
+            )
+            or retry_row.get("status") != 200
+            or retry_outcome != revoke.get("retry_outcome")
+            or retry_outcome.get("status") != "Denied"
+            or retry_outcome.get("error")
+            != "authority_obligation_receipt_revoked"
+            or retry_outcome.get("output") is not None
+        ):
+            failures.append("s10_revoked_original_receipt_not_denied")
+        before = lifecycle_projection(before_row.get("response"))
+        after_revoke = lifecycle_projection(after_revoke_row.get("response"))
+        after_retry = lifecycle_projection(after_retry_row.get("response"))
+        if (
+            before != lifecycle_projection(revoke.get("run_before_revoke"))
+            or after_revoke != lifecycle_projection(revoke.get("run_after_revoke"))
+            or after_retry != lifecycle_projection(revoke.get("run_after_retry"))
+            or before != after_revoke
+            or before != after_retry
+            or before.get("adapter_executions") != 0
+            or state_projection(state_before_row.get("response"))
+            != state_projection(state_after_row.get("response"))
+            or state_projection(state_before_row.get("response"))
+            != state_projection(revoke.get("state_before_revoke"))
+            or revoke.get("zero_effect") is not True
+        ):
+            failures.append("s10_revocation_changed_tick_state_or_effect")
+
+    manager_events = manager_auth.get("events", [])
+    manager_calls = report.get("manager_calls", [])
+    expected_manager_calls = [
+        event
+        for event in manager_events
+        if event.get("operation_id") in {"revokeApprovalClaimFirst", "revokeApproval"}
+    ]
+    if manager_calls != expected_manager_calls:
+        failures.append("s10_revocation_manager_call_projection_mismatch")
+    resident_calls = report.get("resident_calls", [])
+    resident_security_calls = resident_security.get(
+        "manager_dispatched_approval_receipt_revocations", []
+    )
+    manager_auth_calls = manager_auth.get("resident_approval_receipt_revocations", [])
+    if (
+        len(resident_calls) != 1
+        or resident_calls != resident_security_calls
+        or resident_calls != manager_auth_calls
+    ):
+        failures.append("s10_revocation_resident_call_projection_mismatch")
+    else:
+        resident_call = resident_calls[0]
+        manager_revoke_call_ids = {
+            event.get("call_id")
+            for event in manager_events
+            if event.get("operation_id") == "revokeApproval"
+        }
+        if (
+            resident_call.get("operation_id") != "revokeApprovalReceipt"
+            or resident_call.get("method") != "POST"
+            or resident_call.get("manager_approval_call_id")
+            not in manager_revoke_call_ids
+            or resident_call.get("scope")
+            != "splendor.approval_receipts.revoke"
+            or resident_call.get("required_scope")
+            != "splendor.approval_receipts.revoke"
+            or resident_call.get("scope_expectation") != "exact"
+            or resident_call.get("url_scheme") != "https"
+            or resident_call.get("tls_verification") != "acceptance_ca"
+            or resident_call.get("redirect_policy") != "disabled"
+            or resident_call.get("target_instance_id") != target_instance_id
+            or resident_call.get("audience_instance_id") != target_instance_id
+            or resident_call.get("target_audience")
+            != f"urn:splendor:instance:{target_instance_id}"
+            or resident_call.get("run_id") != run_id
+            or resident_call.get("receipt_id") != receipt.get("receipt_id")
+            or resident_call.get("approval_id") != receipt.get("approval_id")
+            or resident_call.get("receipt_audience") != expected_audience
+            or resident_call.get("result_status") != 200
+            or resident_call.get("ack_status") not in {"revoked", "already_revoked"}
+            or resident_call.get("effect_certainty") != "known"
+            or resident_call.get("fresh_one_use_jti") is not True
+            or resident_call.get("credential_id")
+            != resident_call.get("credential_correlation_id")
+            or resident_call.get("raw_bearer_recorded") is not False
+            or resident_call.get("raw_jti_recorded") is not False
+            or resident_call.get("receipt_signature_recorded") is not False
+        ):
+            failures.append("s10_revocation_resident_security_invalid")
+
+    claim = report.get("claim_before_revoke", {})
+    claim_rows = operation_rows(api_rows, "revokeApprovalClaimFirst")
+    if (
+        len(claim_rows) != 1
+        or claim_rows[0][1].get("status") != 409
+        or claim_rows[0][1].get("response")
+        != claim.get("manager_response", {}).get("body")
+        or claim.get("manager_response", {}).get("status") != 409
+        or claim.get("outcome") != "too_late"
+        or claim.get("effect_certainty") != "known"
+        or claim.get("too_late_observed") is not True
+        or claim.get("successful_revocation_claimed") is not False
+        or claim.get("effect_unknown_observed") is not False
+        or claim_rows[0][1].get("response", {}).get("details", {}).get(
+            "revocation_applied"
+        )
+        is not False
+    ):
+        failures.append("s10_claim_before_revoke_false_success_or_status")
+
+    execution_records = [
+        record
+        for record in trace_records
+        if trace_record_run_id(record) == run_id
+        and trace_record_kind(record) == "action.executed"
+        and trace_record_action_name(record) == challenge.get("action_name")
+    ]
+    if execution_records:
+        failures.append("s10_revoked_receipt_reached_adapter")
+    if contains_unredacted_authority_receipt_signature(report) or contains_unredacted_authority_receipt_signature(
+        api_rows
+    ):
+        failures.append("s10_revocation_evidence_contains_receipt_signature")
+    return failures
+
+
+def validate_s10_trace_sync_evidence(trace_sync: dict) -> list[str]:
+    failures: list[str] = []
+    for key in ["vpc", "edge", "cloud"]:
+        if trace_sync.get(key, {}).get("accepted_records", 0) <= 0:
+            failures.append(f"s10_trace_sync_missing_records:{key}")
+    redacted_rejection = trace_sync.get(
+        "edge_central_redacted_export_rejection", {}
+    )
+    if (
+        redacted_rejection.get("status") != 403
+        or redacted_rejection.get("body", {}).get("code") != "trace_sync_rejected"
+        or trace_sync.get("redacted_edge_export_resynced") is not False
+        or trace_sync.get("trace_hashes_rewritten") is not False
+    ):
+        failures.append("s10_edge_redacted_trace_integrity_boundary_missing")
+    if trace_sync.get("tampered", {}).get("status") != 403:
+        failures.append("s10_tampered_trace_sync_not_rejected")
+    return failures
+
+
+def load_s10_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S10"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S10"),
+            trusted_public_key_path,
+            "s10",
+        )
+    )
     required = [
         "scenario-report.json",
         "human-summary.md",
@@ -2893,6 +5532,7 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "message-flow.json",
         "message-api-report.json",
         "artifact-publication-report.json",
+        "approval-receipt-revocation-report.json",
         "cloud-helper-report.json",
         "edge-inspection-report.json",
         "state-handoff-report.json",
@@ -2908,6 +5548,9 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "manager-audit-export.json",
         "fr-primitive-coverage-matrix.json",
         "anti-drift-results.json",
+        "resident-security.json",
+        "manager-approval-auth.json",
+        "authority-profiles-report.json",
         "api-traffic.ndjson",
         "commands.log",
         "stdout.log",
@@ -3032,7 +5675,39 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         for item in registry.get(group, []):
             if item.get("status") != 200:
                 failures.append(f"s10_registry_status_not_accepted:{group}:{item.get('status')}")
+    if registry.get("canonical_s4_registration_reused") is not True:
+        failures.append("s10_canonical_s4_registration_not_reused")
+    resident_security = read_json(artifact_dir / "resident-security.json")
+    manager_approval_auth = read_json(artifact_dir / "manager-approval-auth.json")
+    authority_profiles = read_json(artifact_dir / "authority-profiles-report.json")
+    api_rows = read_jsonl(artifact_dir / "api-traffic.ndjson")
+    failures.extend(
+        validate_s10_resident_security(
+            resident_security,
+            authority_profiles,
+            api_rows,
+            trace_records,
+        )
+    )
+    failures.extend(
+        validate_s10_manager_approval_auth(
+            manager_approval_auth, api_rows
+        )
+    )
     journey = read_json(artifact_dir / "journey-report.json")
+    for expectation_id, value in {
+        "orchestrator_data_read": journey.get("data_analysis", {}),
+        "specialist_data_read": journey.get("specialist_data", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S10", expectation_id),
+                trusted_public_key_path,
+                f"s10_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     if journey.get("data_analysis", {}).get("status") != "Executed":
         failures.append("s10_journey_data_analysis_not_executed")
     message_api = read_json(artifact_dir / "message-api-report.json")
@@ -3058,10 +5733,40 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if message_api.get("causal_graph", {}).get("node_count", 0) < 2:
         failures.append("s10_message_causal_graph_missing_nodes")
     artifact = read_json(artifact_dir / "artifact-publication-report.json")
+    for expectation_id, value in {
+        "internal_artifact": artifact.get("internal_artifact", {}),
+        "approved_publish": artifact.get("approved_publish", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S10", expectation_id),
+                trusted_public_key_path,
+                f"s10_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     if artifact.get("publish_needs_approval", {}).get("status") != "NeedsApproval":
         failures.append("s10_publish_did_not_pause_for_approval")
     if artifact.get("approved_publish", {}).get("status") != "Executed" or artifact.get("publish_execution_count_for_positive_run") != 1:
         failures.append("s10_publish_not_executed_once_after_approval")
+    if artifact.get("internal_run_id") == artifact.get("publish_run_id"):
+        failures.append("s10_publish_artifact_runs_not_split")
+    failures.extend(
+        validate_s10_approval_exact_retry(
+            artifact, api_rows, trace_records, trusted_public_key_path
+        )
+    )
+    failures.extend(validate_s10_active_raw_rejection(artifact, api_rows))
+    failures.extend(
+        validate_s10_approval_revocation(
+            read_json(artifact_dir / "approval-receipt-revocation-report.json"),
+            resident_security,
+            manager_approval_auth,
+            api_rows,
+            trace_records,
+        )
+    )
     internal = artifact.get("internal_artifact_evidence", {})
     approved = artifact.get("approved_publish_evidence", {})
     for label, evidence in {"internal": internal, "approved_publish": approved}.items():
@@ -3075,6 +5780,24 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if cloud.get("publish_denial", {}).get("status") != "Denied" or cloud.get("device_direct_denial", {}).get("status") != "Denied":
         failures.append("s10_cloud_helper_direct_authority_not_denied")
     edge = read_json(artifact_dir / "edge-inspection-report.json")
+    for expectation_id, value in {
+        "inspect_zone": edge.get("inspect_zone", {}),
+        "move_to_waypoint": edge.get("move_to_waypoint", {}),
+        "read_sensor_summary": edge.get("offline_sensor", {}),
+        "upload_trace_summary": edge.get("upload_summary", {}),
+        "operator_capture": edge.get("operator_intervention", {}).get(
+            "capture", {}
+        ),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S10", expectation_id),
+                trusted_public_key_path,
+                f"s10_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     simulator_evidence = edge.get("simulator_evidence", [])
     for item in simulator_evidence:
         if item.get("total_delta") != item.get("expected_sim_delta"):
@@ -3082,16 +5805,19 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if edge.get("inspect_zone", {}).get("status") != "Executed" or edge.get("device_trace_sync", {}).get("accepted") is not True:
         failures.append("s10_edge_inspection_or_trace_sync_missing")
     state = read_json(artifact_dir / "state-handoff-report.json")
-    if state.get("imported", {}).get("accepted") is not True or state.get("cloud_resume", {}).get("status") not in {"running", "waiting_for_approval", "completed"}:
-        failures.append("s10_state_handoff_resume_missing")
-    if state.get("tampered_state_import", {}).get("status") != 403:
+    import_denied = state.get("resident_import_denied", {})
+    if import_denied.get("status") != 503 or import_denied.get("body", {}).get("code") != "state_handoff_proof_unavailable":
+        failures.append("s10_resident_state_handoff_not_denied_without_source_proof")
+    if state.get("receiver_unchanged_on_import_denial") is not True:
+        failures.append("s10_resident_handoff_denial_mutated_receiver_state")
+    if state.get("receiver_create_import_resume_used_exact_admitted_envelope") is not True or state.get("receiver_envelope_key_id") != "work-order-acceptance-cloud":
+        failures.append("s10_resident_handoff_receiver_envelope_not_exact")
+    if state.get("cloud_resume", {}).get("status") not in {"running", "waiting_for_approval", "completed"}:
+        failures.append("s10_receiver_own_state_resume_missing")
+    if state.get("tampered_state_import", {}).get("status") != 503:
         failures.append("s10_tampered_state_import_not_rejected")
     trace_sync = read_json(artifact_dir / "trace-sync-report.json")
-    for key in ["vpc", "edge", "cloud"]:
-        if trace_sync.get(key, {}).get("accepted_records", 0) <= 0:
-            failures.append(f"s10_trace_sync_missing_records:{key}")
-    if trace_sync.get("tampered", {}).get("status") != 403:
-        failures.append("s10_tampered_trace_sync_not_rejected")
+    failures.extend(validate_s10_trace_sync_evidence(trace_sync))
     governance = read_json(artifact_dir / "governance-branches.json")
     if governance.get("circuit_breaker", {}).get("blocked_action", {}).get("status") != "Denied":
         failures.append("s10_circuit_breaker_branch_not_denied")
@@ -3132,10 +5858,12 @@ def main() -> int:
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--mode", required=True)
     parser.add_argument("--compose-file", required=True)
+    parser.add_argument("--trusted-provider-public-key", required=True)
     args = parser.parse_args()
 
     root = Path(args.root)
     report_dir = Path(args.report_dir)
+    trusted_public_key_path = Path(args.trusted_provider_public_key)
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S0"
     contract = read_json(report_dir / "contract-status.json")
     anti = read_json(report_dir / "anti-drift-results.json")
@@ -3171,6 +5899,7 @@ def main() -> int:
     blocking.extend(validate_required_s0_artifacts(artifact_dir))
 
     topology_hash = digest_file(Path(args.compose_file))
+    source_tree = source_tree_identity(root)
     s0_scenario = {
         "id": "UC-E2E-S0",
         "status": "passed" if not blocking else "failed",
@@ -3206,12 +5935,20 @@ def main() -> int:
     s2_scenario, s2_failures = load_s2_scenario(report_dir)
     s3_scenario, s3_failures = load_s3_scenario(report_dir)
     s4_scenario, s4_failures = load_s4_scenario(report_dir)
-    s5_scenario, s5_failures = load_s5_scenario(report_dir)
-    s6_scenario, s6_failures = load_s6_scenario(report_dir)
-    s7_scenario, s7_failures = load_s7_scenario(report_dir)
+    s5_scenario, s5_failures = load_s5_scenario(
+        report_dir, trusted_public_key_path
+    )
+    s6_scenario, s6_failures = load_s6_scenario(
+        report_dir, trusted_public_key_path
+    )
+    s7_scenario, s7_failures = load_s7_scenario(
+        report_dir, trusted_public_key_path
+    )
     s8_scenario, s8_failures = load_s8_scenario(report_dir)
     s9_scenario, s9_failures = load_s9_scenario(report_dir)
-    s10_scenario, s10_failures = load_s10_scenario(report_dir)
+    s10_scenario, s10_failures = load_s10_scenario(
+        report_dir, trusted_public_key_path
+    )
     active_ids: set[str] = set()
     if args.scenario in {"UC-E2E-S1", "UC-E2E-S8", "UC-E2E-S9", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -3289,6 +6026,7 @@ def main() -> int:
         "suite_id": "splendor-use-case-e2e-through-0.1",
         "suite_version": "0.1-s10-final-journey",
         "source_revision": git_revision(root),
+        "source_tree": source_tree,
         "started_at": utc_now(),
         "completed_at": utc_now(),
         "container_topology_hash": topology_hash,

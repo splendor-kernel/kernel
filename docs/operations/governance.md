@@ -16,8 +16,8 @@ around the Action Gateway.
 Run the test-backed governance checks:
 
 ```bash
-cargo test -p splendor-daemon approval_required_run_pauses_and_valid_grant_resumes_execution
-cargo test -p splendor-daemon approval_denial_expiry_and_wrong_scope_do_not_execute_adapter
+cargo test -p splendor-daemon --test runtime_daemon_api_tests approval_required_run_pauses_and_exact_receipt_retry_executes_once
+cargo test -p splendor-daemon --test runtime_daemon_api_tests legacy_approval_variants_cannot_resume_tick_or_execute_adapter
 cargo test -p splendor-kernel quota_pressure_escalates_without_consuming_denied_usage
 cargo run -p splendorctl -- run --config examples/circuit-breaker-basic/config.yaml --cycles 1
 ```
@@ -34,9 +34,16 @@ Use the examples:
 1. Configure an `ApprovalPolicy` for a scoped action, adapter, permission, side-effect class, tenant, agent, or risk level.
 2. The policy proposes an action.
 3. The Action Gateway runs the approval verifier before adapter execution.
-4. Missing evidence returns `NeedsApproval`, records `ActionNeedsApproval` and `ApprovalRequested`, and pauses the run as `waiting_for_approval`.
-5. Resume requires a signed resume work order and scoped `ApprovalEvidence`.
-6. A valid grant re-enters the gateway verifier chain. It still must pass tenant, permission, adapter, quota, precondition, and postcondition checks before execution.
+4. Missing trusted receipt evidence returns `NeedsApproval` with an exact
+   `ApprovalChallenge`, records `ActionNeedsApproval` and `ApprovalRequested`, and
+   pauses the run as `waiting_for_approval`.
+5. Submit the complete challenge to the trusted approval manager. A raw granted
+   `ApprovalEvidence` remains non-authorizing compatibility/replay data.
+6. Copy the manager-issued `AuthorityObligationReceipt` into an exact `/actions`
+   retry. Do not use lifecycle resume for successful approval.
+7. The gateway regenerates the live conditional decision, validates/matches and
+   claims the receipt, then still requires tenant, permission, adapter, quota,
+   precondition, safety, and postcondition checks before one execution.
 
 ## Denial Flow
 
@@ -101,7 +108,12 @@ Replay is inspect-only. It explains approval, denial, escalation, and circuit-br
 ## Failure Handling
 
 - Approval verifier uncertainty returns `NeedsIntervention`.
-- Missing evidence on resume from `waiting_for_approval` returns `approval_required` before a tick runs.
+- Lifecycle resume from `waiting_for_approval` returns a stable `409` migration
+  code (`legacy_approval_evidence_non_authorizing`,
+  `approval_receipt_resume_not_supported`, or
+  `approval_exact_action_retry_required`) before a tick runs.
+- Changed exact-action bindings and reused or semantically reissued receipts fail
+  closed without another adapter call.
 - Expired or unsupported approval policy requires intervention.
 - Unknown circuit-breaker runtime scope fails closed when identity is missing.
 - Escalation policy validation rejects unsupported schema versions and zero thresholds.

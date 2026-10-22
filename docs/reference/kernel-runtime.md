@@ -18,6 +18,11 @@ records. It owns a `RunId`, a monotonic sequence counter, and a trace sink.
 **Responsibilities**
 - Assign a `RunId` to the runtime instance.
 - Track event sequence numbers.
+- Serialize every emitter for one run through one shared trace cursor. A process
+  composition must reuse the same `Arc<KernelRuntime>` for all loop, gateway,
+  and agent emitters that resolve to the same `RunId`; independently initialized
+  runtimes for one run are invalid because their persisted cursors can race or
+  become stale.
 - Emit `TraceEvent` payloads via the configured sink.
 - Expose the next trace sequence so new persisted runs can emit `RunStarted`
   exactly once before the first tick.
@@ -25,8 +30,14 @@ records. It owns a `RunId`, a monotonic sequence counter, and a trace sink.
 
 **Methods**
 - `new(config)` creates a runtime without emitting events.
+- `with_trace_store(store, run_id)` initializes the cursor from the latest
+  durable sequence/hash. Call it once per resolved run in a composition, then
+  share the returned runtime.
 - `boot(config)` creates a runtime and emits `LoopTickStarted`.
 - `record_event(kind)` serializes and emits a `TraceEvent`.
+- `record_event_with_identity(identity, kind)` uses the same cursor while
+  retaining the emitting tenant/agent/tick/action identity and rejects a
+  different run identity.
 
 ## TraceSink
 
@@ -144,6 +155,17 @@ state commits.
 - Record `WorkOrderAccepted` after `RunStarted` when constructed with a validated
   work order via `with_trace_store_and_work_order` or
   `resume_from_trace_store_with_work_order`.
+- Accept an existing shared runtime via
+  `with_shared_trace_runtime_and_work_order` or
+  `resume_from_shared_trace_runtime_and_work_order`. These constructors are
+  required when a gateway pre-effect evidence recorder or another local agent
+  emits into the same run stream. Resume rejects a runtime whose `RunId` differs
+  from the requested run before restoring state.
+
+`with_trace_store_and_work_order` and `resume_from_trace_store_with_work_order`
+create their own runtime and remain suitable only when that loop is the sole
+emitter for the run. Composition roots must own runtime reuse; stores persist
+records but do not arbitrate multiple stale in-process cursors.
 
 **Key Types**
 - `ActionCandidate`: action proposal plus adapter, quota usage, and satisfied preconditions.

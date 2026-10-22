@@ -47,6 +47,10 @@ class SplendorDaemonClient:
         return self._request("GET", "/capabilities", header_credential=credential or self.default_credential)
 
     def create_run(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(request.get("request_id"), str) or not request["request_id"].strip():
+            raise ValueError("create_run requires a non-blank request_id")
+        if not isinstance(request.get("idempotency_key"), str) or not request["idempotency_key"].strip():
+            raise ValueError("create_run requires a non-blank idempotency_key")
         self._require_mutating_body(request)
         if not request.get("work_order"):
             raise ValueError("create_run requires a signed scoped work_order")

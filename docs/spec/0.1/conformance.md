@@ -23,6 +23,11 @@ for these primitive categories:
 - work orders
 - governance
 - adapters
+- compatibility fixture matrix v0
+- FND-011 security invariant mapping fixture v0
+- FND-011 G80 prompt/data-injection denial fixture v0
+- FND-011 G86 driver schema-confusion denial fixture v0
+- performance budget fixture contract v0
 
 The suite must be runnable without production secrets, external services,
 production networks, SaaS systems, hardware, or vendor-specific runners.
@@ -58,6 +63,50 @@ The suite validates:
   and no secret-shaped fixture fields.
 - S1 stable primitive examples with required fields and non-authorizing
   extensions.
+- Partial FND-006 compatibility fixture matrix v0 evidence: current stable
+  examples are accepted, additive non-authorizing extensions are accepted where
+  allowed, authorizing/security-critical extension fields are rejected
+  fail-closed, and the documented `trace_id` input alias canonicalizes to stable
+  `trace_event_id` output.
+- Partial FND-011 security invariant mapping fixture v0 evidence: every G80-G89
+  security/adversarial case maps to assets, trust boundary, principal, attacker
+  capability, fail-closed decision, enforcing component, required event,
+  evidence link, containment action, incident class, and change-risk class. The
+  runner rejects prompt-only boundaries, skipped mandatory conformant cases,
+  prompt-only enforcement wording even when `prompt_only` is false, unsafe
+  crypto-agility labels, `exercised` status without executable gold evidence,
+  missing G80-G89 mappings, and missing event/evidence/containment links.
+- Partial FND-011 G80 prompt/data-injection denial fixture v0 evidence: a
+  malicious perceptor payload smuggles authorizing fields and bypass hints, a
+  naive policy proposes the unauthorized side-effect action requested by that
+  payload, tenant/gateway verification denies before execution, adapter
+  invocation count remains zero, required denial events and exact identity
+  linkage are present, and side-effect counters remain zero. Negative fixtures
+  reject contradictory adapter execution, side-effect event namespaces, missing
+  side-effect counters, malformed non-claim guards, and fixtures that do not
+  prove the malicious payload tried to grant the requested action authority. This
+  is bounded denial evidence only, not a G80 gold pass.
+- Partial FND-011 G86 driver schema-confusion denial fixture v0 evidence: a
+  driver schema/version mismatch carries a stable mismatch reason, fails
+  verification, records schema rejection/denial/outcome events, keeps
+  adapter/driver invocation counts at zero, and records no side effects. A
+  negative fixture family proves the runner rejects a mismatched-schema case that
+  still reports execution, unknown execution/receipt fields, side-effect events,
+  missing side-effect counters, duplicate trace IDs, out-of-order events,
+  mismatched verifier evidence, and malformed non-claim guards. This is bounded
+  denial evidence only, not a G86 gold pass.
+- V2-FND-0 foundation readiness checkpoint evidence: every `FND-001` through
+  `FND-012` entry has foundation-level evidence paths, explicit remaining
+  validation gaps, `not_exercised` gold status, and non-claims. The C01 readiness
+  section allows starting Identity Registry contract/RFC work only; it does not
+  claim C01 implementation. A negative fixture rejects an overclaiming foundation
+  status.
+- Partial FND-012 performance budget fixture contract v0 evidence: mandatory
+  latency/throughput budgets, environment-capture shape, regression thresholds,
+  retention/backpressure actions, provider/model-time separation, and
+  G29/G66/G68/G74 SLO/resource mappings are present while gold status remains
+  `not_exercised`; negative fixtures reject missing environment capture,
+  provider/model-time mixing, and skipped safety checks.
 
 ## Report Format
 
@@ -79,7 +128,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 24,
+  "case_count": 55,
   "failed_count": 0,
   "results": [
     {
@@ -100,8 +149,49 @@ Every failure identifies the exact `primitive`, `requirement`, and `case_id`.
 
 The suite does not change stable primitive schemas. It adds conformance fixture
 IDs and report schema `splendor.conformance_report.v1` for compatibility testing.
-Implementers may use the report shape for CI checks, but passing this fixture
-suite alone must not be represented as complete use-case E2E acceptance.
+The FND-006 compatibility matrix v0 cases are partial fixture evidence only; they
+do not implement version negotiation, storage migrations, rolling upgrades,
+training-worker compatibility, or agent migration, and they must not be reported
+as `G00`, `G72`, or full FND-006 completion. Implementers may use the report
+shape for CI checks, but passing this fixture suite alone must not be represented
+as complete use-case E2E acceptance.
+
+The FND-011 security invariant mapping v0 case is also partial evidence only. It
+does not implement a secret broker, data-use controller, attestation system,
+rollout controller, protected eval isolation, red-team harness, or physical
+safety certification. It must not be reported as full FND-011 completion or as
+passing G80-G89 gold evidence.
+
+The fixture runner also rejects `case_status: exercised` unless explicit
+executable gold evidence metadata is present. The checked G80-G89 fixture remains
+`mapped_not_exercised`; this is not pass status.
+
+The G86 driver schema-confusion denial fixture is partial evidence only. It does
+not implement a driver registry, driver certification process, runtime ABI
+negotiation service, or live adapter execution path. It must not be reported as a
+full G86 gold pass, full FND-011 completion, issue #230 completion, or full
+G80-G89 pass status.
+
+The G80 prompt/data-injection denial fixture and Python runtime test are partial
+evidence only. They prove that payload-smuggled authority fields are non-
+authorizing in the bounded local denial path; they do not implement a route taint
+engine, full capability separation grammar, protected eval/data-use controls,
+secret brokering, a production adapter registry, or a full adversarial gold
+harness. They must not be reported as a G80 gold pass, full FND-011 completion,
+issue #230 completion, issue #180 completion, or full G80-G89 pass status.
+
+The V2-FND-0 foundation readiness checkpoint is a foundation gate only. It marks
+all FND tasks as ready for C01 contract/RFC work by evidence path, but it does
+not mark FND-001 through FND-012 complete, does not close #180/#220-#231 by
+itself, does not pass any gold case, and does not implement C01 or a Principal
+Registry service.
+
+The FND-012 performance budget cases are also partial fixture evidence only.
+They validate a budget/report contract plus negative environment-capture,
+provider/model-time-mixing, and skipped-safety-check cases; they do not execute
+24/7 soak tests, 1,000-node simulation, GPU/training,
+robotics, live fleet, or physical hardware benchmarks, and they must not be
+reported as `G29`, `G66`, `G68`, `G74`, issue #231, or issue #180 completion.
 
 ## Non-Goals
 

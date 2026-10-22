@@ -172,7 +172,7 @@ let runtime = KernelRuntime::new(splendor_kernel::KernelRuntimeConfig {
 });
 let router = LocalMessageRouter::new();
 router.register_agent_with_policy(source.clone(), splendor_kernel::AgentIsolationPolicy {
-    allowed_message_schemas: vec!["splendor.message.task_request.v1".to_string()],
+    allowed_message_schemas: vec!["splendor.message.task_request.v2".to_string()],
     allowed_message_recipients: vec![target.clone()],
     ..Default::default()
 })?;
@@ -183,7 +183,7 @@ let message = Message::new(
     source,
     target.clone(),
     run_id.clone(),
-    "splendor.message.task_request.v1",
+    "splendor.message.task_request.v2",
     serde_json::json!({"task": "summarize"}),
     None,
     true,

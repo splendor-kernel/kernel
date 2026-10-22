@@ -106,3 +106,11 @@ The S1 validator checks concrete stable examples and Rust/TypeScript/Python
 schema-facing parity where this repository exposes those surfaces. It does not
 claim adapter certification, daemon compatibility, generated schemas, or the full
 cross-implementation conformance matrix planned for 0.1-S2.
+
+0.1-S2 now includes a bounded compatibility fixture matrix v0 in
+`conformance/0.1/run-conformance.py`. The matrix is partial FND-006 evidence for
+current stable examples, additive non-authorizing extensions, fail-closed
+rejection of authorizing/security-critical extension fields, and the implemented
+`trace_id` input alias with stable `trace_event_id` output. It is not a `G00` or
+`G72` pass, and it does not implement version negotiation, storage migration,
+rolling upgrades, or agent migration.

@@ -89,6 +89,23 @@ splendorctl run --config <path> [--cycles <n> | --forever]
 
 See `docs/reference/run-config.md` for the config format.
 
+Signed runs preserve the validated work order as live run authority. The CLI's
+per-run gateway checks exact action, adapter, permission, tenant, agent, and run
+bindings; rechecks expiry/revocation immediately before the effect; and writes
+durable pre-effect authority evidence through the same trace cursor used by the
+loop. A denied, expired, revoked, mismatched, or unrecordable decision does not
+reach the filesystem or HTTP adapter. Replay remains inspect-only and does not
+re-evaluate authority or call adapters.
+
+Unsigned local execution is available only when the config omits `work_order`
+and explicitly sets `allow_unsigned_local_run: true`. The CLI warns when this
+development-only compatibility mode is active and never uses it as fallback for
+a configured work order.
+
+When multiple configured agents resolve to the same `run_id`, the CLI reuses one
+shared runtime cursor for all of them. Their events retain separate agent
+identities but form one contiguous sequence and integrity chain.
+
 ## Example
 
 ```

@@ -4,7 +4,7 @@
 
 Implement the minimal approval verifier path for Splendor0.04-dev: actions that
 match an approval policy pause before adapter execution, runs enter a trace-linked
-waiting state, valid scoped approval grants permit re-evaluation, and denial,
+waiting state, trusted receipts for the exact challenged action permit re-evaluation, and denial,
 expiry, revocation, wrong scope, unsupported schema versions, or verifier
 uncertainty fails closed.
 
@@ -15,7 +15,8 @@ uncertainty fails closed.
 - Add `NeedsApproval` and `NeedsIntervention` action statuses.
 - Add daemon `waiting_for_approval`, `denied`, and `expired` run statuses for the
   approval path.
-- Add approval evidence fields to daemon lifecycle and action submission requests.
+- Retain approval evidence fields as non-authorizing compatibility data and add
+  exact challenges plus authority-obligation receipts to action contracts.
 - Add trace events for approval request, grant, denial, expiry, and revocation.
 - Add inspect-only replay reporting for approval lifecycle events.
 - Add Rust and TypeScript/OpenAPI schema coverage for approval contracts.
@@ -36,15 +37,18 @@ uncertainty fails closed.
 - `splendor_types::ApprovalId`
 - `splendor_types::ApprovalPolicy`
 - `splendor_types::ApprovalEvidence`
+- `splendor_types::ApprovalChallenge`
 - `splendor_types::ApprovalDecision`
 - `splendor_types::ApprovalTraceContext`
 - `splendor_gateway::ApprovalVerifier`
 - `splendor_gateway::PolicyApprovalVerifier`
+- `splendor_gateway::LocalAuthorityObligationVerifier`
 - `splendor_gateway::ActionStatus::{NeedsApproval, NeedsIntervention}`
 - `splendor_gateway::ActionRequest.approval_evidence`
 - `splendor_daemon::CreateRunRequest.approval_policies`
 - `splendor_daemon::LifecycleRequest.approval_evidence`
 - `splendor_daemon::SubmitActionRequest.approval_evidence`
+- `splendor_daemon::SubmitActionRequest.authority_obligation_receipts`
 - `splendor_daemon::ReplayResponse.approval_events`
 - OpenAPI and TypeScript contracts for the same fields/statuses.
 
@@ -70,31 +74,34 @@ Added approval/action lifecycle trace variants:
 - `ApprovalExpired`
 - `ApprovalRevoked`
 
-The daemon also records `RunPaused { reason: "waiting_for_approval" }` when a
-tick pauses for approval and `RunResumed { reason }` when a signed resume request
-is accepted.
+The daemon records `RunPaused { reason: "waiting_for_approval" }` when a tick
+pauses. It records `RunResumed` only after the exact receipt-bearing `/actions`
+retry executes successfully; approval does not run a lifecycle resume tick.
 
 ## 7. State behavior added or changed
 
 Approval does not introduce hidden mutable agent state. The loop still commits a
-state node for ticks according to the existing state graph path. Daemon run-slot
-approval evidence is consumed as the next tick's verifier input and is not a
-replacement for committed state or trace records. Terminal denial/expiry does not
-execute adapters and does not silently retry.
+state node for ticks according to the existing state graph path. The daemon stores
+only the exact pending challenge needed to bind a later action retry. A successful
+retry does not create another scheduler tick or state commit. The challenge and
+receipt are not replacements for committed state or trace records.
 
 ## 8. Verifier/gateway behavior added or changed
 
 The gateway now calls `ApprovalVerifier` before adapter execution:
 
 - missing required approval returns `NeedsApproval`;
-- valid scoped grant allows normal verifier checks to continue;
+- a raw scoped grant remains non-authorizing and requires a trusted receipt;
+- a trusted receipt must match the live conditional authority decision and exact
+  challenged action, then be atomically claimed before effect;
 - explicit denial, wrong scope, unsupported evidence schema, expired evidence, or
   revoked evidence returns `Denied`;
 - unsupported policy schema or verifier uncertainty returns `NeedsIntervention`;
 - all non-grant outcomes stop before adapter execution.
 
-Approval evidence scopes tenant, agent, run, optional action ID, optional action
-name, optional adapter, expiry, revocation state, and supported schema version.
+`ApprovalChallenge` binds tenant, agent, run, action ID/name/payload, effective
+adapter, authority subject/decision/obligation, policy, request/action/decision
+digests, receipt audience, original request time, and expiry.
 
 ## 9. Replay behavior
 
@@ -105,9 +112,13 @@ approval services, verifiers, gateways, or adapters.
 
 ## 10. Failure behavior
 
-- Missing approval evidence on a required action pauses with `NeedsApproval`.
-- Missing approval evidence on resume from `waiting_for_approval` returns
-  `403 approval_required`.
+- Missing trusted receipt evidence on a required action pauses with
+  `NeedsApproval` and an exact challenge.
+- Lifecycle resume from `waiting_for_approval` rejects raw evidence, receipts, or
+  missing approval material with stable `409` migration errors and no tick.
+- Changed action coordinates, replayed receipt IDs, semantically reissued
+  receipts, missing trusted ledger/configuration, or pre-effect trace failure do
+  not execute adapters.
 - Wrong tenant, agent, run, action, or adapter evidence denies.
 - Unsupported approval evidence schema denies; unsupported approval policy schema
   fails closed as intervention.
@@ -127,8 +138,9 @@ Targeted tests added/updated:
   execution.
 - Daemon approval-required run enters `waiting_for_approval` and records trace
   linkage.
-- Daemon valid scoped grant resumes and executes one adapter call.
-- Daemon denial, expiry, wrong scope, unsupported schema, and revocation do not
+- Daemon exact trusted receipt retry executes one adapter call, records resume,
+  and cannot be reused.
+- Daemon raw grant, denial, expiry, wrong scope, unsupported schema, and revocation do not
   execute adapters.
 - Replay reports `requested`, `granted`, `denied`, `expired`, and `revoked`
   approval events.
@@ -148,7 +160,7 @@ npm test
 
 ## 13. Future extension notes
 
-Future 0.04 governance work should reuse the approval verifier's scoped evidence,
+Future governance work should reuse the exact challenge, trusted receipt,
 trace context, and replay representation. Escalations, circuit breakers,
 kill-switches, and external approval control-plane adapters must remain
 trace-linked and must not authorize side effects outside the gateway.

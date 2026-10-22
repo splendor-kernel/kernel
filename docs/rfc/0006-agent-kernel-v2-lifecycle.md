@@ -2,8 +2,8 @@
 
 ## Motivation
 
-The imported `splendor_agent_kernel_v2` documentation pack describes a broader
-post-0.1 direction for Splendor as a user-space kernel for persistent agents. It
+The imported `splendor_agent_kernel_v2` documentation pack describes the broader
+0.2/v2 direction for Splendor as a user-space kernel for persistent agents. It
 adds planning detail around identity and authority, artifact lineage,
 event/state/evidence, execution fabric, driver boundaries, agent runtime and
 routing, feedback/evaluation/learning control, and change governance.
@@ -30,15 +30,20 @@ Future RFCs may affect:
 
 No stable schema or API is changed by this import.
 
-The imported material is stored under:
+The original import provenance is stored under:
 
 ```text
 docs/planning/agent-kernel-v2/
 ```
 
-It is explicitly marked as proposed vNext planning. Stable 0.1 schemas remain in
-`docs/spec/0.1/*`. Runtime rules and sprint acceptance criteria remain in
-`docs/rules/*`.
+The active execution rules derived from that import now live under:
+
+```text
+docs/rules/v2/
+```
+
+0.1 schemas remain the implemented/stable baseline in `docs/spec/0.1/*`. Runtime
+safety rules and sprint acceptance criteria remain in `docs/rules/*`.
 
 ## Migration plan
 
@@ -46,7 +51,7 @@ There is no runtime migration in this PR. Follow-up planning issues should:
 
 1. map each vNext object to current stable primitives;
 2. classify changes as additive extension, compatible migration, breaking
-   replacement, or post-0.1 RFC requirement;
+   replacement, or 0.2/v2 RFC requirement;
 3. define fixtures and compatibility tests before implementation;
 4. preserve Action Gateway mediation, trace/state/replay guarantees, fail-closed
    behavior, and identity separation throughout any migration.
@@ -55,10 +60,10 @@ There is no runtime migration in this PR. Follow-up planning issues should:
 
 This is a documentation import with no public runtime compatibility impact.
 
-The highest compatibility risk is interpretive: maintainers might treat vNext
-planning docs as implemented behavior. To prevent that, the planning directory,
-README, RFC, and known-limitations docs all state that the pack is non-normative
-until accepted and implemented.
+The highest compatibility risk is interpretive: maintainers might treat v2 rule
+docs as implemented behavior. To prevent that, the v2 rule pack, README, RFC,
+and known-limitations docs all state that active decomposition rules are not
+implementation evidence.
 
 ## Security impact
 
@@ -100,6 +105,7 @@ This RFC is accompanied by:
 
 - `docs/planning/README.md`;
 - `docs/planning/agent-kernel-v2/README.md`;
-- imported planning source docs under `docs/planning/agent-kernel-v2/imported/`;
-- `docs/releases/known-limitations.md` note clarifying non-implementation
-  status.
+- active 0.2/v2 rules under `docs/rules/v2/`;
+- `docs/planning/agent-kernel-v2/README.md` provenance redirect;
+- `docs/releases/known-limitations.md` note clarifying active-rule and
+  non-implementation status.

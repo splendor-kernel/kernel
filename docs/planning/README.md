@@ -19,5 +19,8 @@ implementation.
 
 ## Current planning packs
 
-- [`agent-kernel-v2/`](agent-kernel-v2/) — imported vNext architecture and task
-  planning pack for a post-0.1 agent-kernel direction.
+- [`agent-kernel-v2/`](agent-kernel-v2/) — provenance and archival import notes
+  for the original v2 source pack.
+- Active 0.2/v2 execution rules now live under [`../rules/v2/`](../rules/v2/).
+  Use [`../rules/v2/0.2-execution-sprints.md`](../rules/v2/0.2-execution-sprints.md)
+  as the grouped sprint map over the v2 catalog.

@@ -34,7 +34,9 @@ work-order, retry, and idempotency metadata but does not change the canonical
 explicitly allowed to send the message schema to the target recipient.
 
 0.02-S4 adds schema-specific validation for the local delegation schemas
-`splendor.message.task_request.v1` and `splendor.message.task_response.v1`.
+`splendor.message.task_request.v2` and `splendor.message.task_response.v1`.
+Legacy task-request v1 data is non-authorizing and not accepted for live
+delegation creation.
 Those payloads are documented in
 [`local-delegation.md`](local-delegation.md); invalid task payloads fail closed
 before routing.
@@ -47,7 +49,7 @@ before routing.
 | `source_agent_id` | `AgentId` | yes | Agent that authored the message. The nil UUID is rejected. |
 | `target_agent_id` | `AgentId` | yes | Agent intended to consume the message. The nil UUID is rejected. |
 | `run_id` | `RunId` | yes | Run that scopes the message and trace causality. The nil UUID is rejected. |
-| `schema` | `String` | yes | Versioned payload schema, such as `splendor.message.task_request.v1`. |
+| `schema` | `String` | yes | Versioned payload schema, such as `splendor.message.task_request.v2`. |
 | `payload` | `serde_json::Value` | yes | Typed JSON payload. JSON `null` is rejected at the envelope layer. |
 | `causal_parent` | `Option<TraceEventId>` | yes | Required-but-nullable trace event that causally produced the message. The JSON field must be present; use `null` when no causal parent exists. |
 | `requires_response` | `bool` | yes | Whether the sender expects a response message. |
@@ -61,12 +63,13 @@ Example:
   "source_agent_id": "00000000-0000-0000-0000-000000000002",
   "target_agent_id": "00000000-0000-0000-0000-000000000003",
   "run_id": "00000000-0000-0000-0000-000000000004",
-  "schema": "splendor.message.task_request.v1",
+  "schema": "splendor.message.task_request.v2",
   "payload": {
     "parent_run_id": "00000000-0000-0000-0000-000000000004",
     "child_run_id": "00000000-0000-0000-0000-000000000006",
     "target_agent_id": "00000000-0000-0000-0000-000000000003",
     "objective": "forecast revenue for Q3",
+    "capability_grant_id": "00000000-0000-0000-0000-000000000007",
     "delegated_authority": {
       "allowed_actions": ["sql.query"],
       "allowed_adapters": ["sql"],
@@ -92,7 +95,7 @@ transport-neutral.
 | Field | Rust type | Purpose |
 | --- | --- | --- |
 | `message` | `Message` | Validated message payload and identities. |
-| `schema_version` | `MessageSchemaVersion` | Parsed version from `message.schema`; currently only `V1`. |
+| `schema_version` | `MessageSchemaVersion` | Parsed version from `message.schema`; `V1` and `V2` are recognized. |
 | `delivery_status` | `MessageDeliveryStatus` | Local lifecycle status. |
 | `trace_links` | `MessageTraceLinks` | Optional trace IDs for queued, delivered, rejected, expired, and consumed events. |
 
@@ -102,11 +105,12 @@ delivered, expired, and consumed envelopes while preserving trace links.
 
 ## Schema versioning
 
-Message payload schemas must end with a `.vN` suffix. The 0.02-S1 contract
-accepts only `v1`:
+Message payload schemas must end with a `.vN` suffix. The current contract
+recognizes `v1` and `v2`:
 
 ```text
 splendor.message.<schema-name>.v1
+splendor.message.<schema-name>.v2
 ```
 
 Validation failures are structured as `MessageValidationError` and fail closed
@@ -121,7 +125,7 @@ before routing:
 - envelope/message schema-version mismatch.
 
 The envelope validates payload presence for all schemas. For
-`task_request.v1` and `task_response.v1`, the message contract also validates
+`task_request.v2` and `task_response.v1`, the message contract also validates
 the typed payload shape before routing. When a schema-specific payload validator
 rejects a message, routing code records a `message.rejected` trace event with
 the message trace context and reason.
@@ -157,3 +161,7 @@ Messages do not grant permissions. A receiving agent must operate under its own
 agent identity, permissions, quotas, work-order scope, and gateway/verifier
 checks. Shared or specialist agents must not use messages as a permission
 laundering channel.
+
+Live task-request v2 requires a child `capability_grant_id`, but that ID and the
+optional evidence object are references only. The local delegation manager must
+match them to opaque, live authority-owned state before routing or execution.

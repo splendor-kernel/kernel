@@ -92,7 +92,7 @@ S8 validates four replay modes without side effects:
 - policy comparison;
 - verifier explanation.
 
-Inspect-only replay additionally calls the documented daemon replay API and compares adapter execution counters before and after the replay request. Read-only re-evaluation, policy comparison, and verifier explanation are validated by `splendorctl acceptance replay-mode` against exported artifacts instead of hardcoded scenario claims.
+Inspect-only replay additionally calls the documented resident daemon replay API over acceptance-CA-verified TLS and compares adapter execution counters before and after the replay request. Every resident request carries an `Authorization: Bearer` proof minted for that request and target instance. Inspect GETs use only `runs_read`; replay POSTs use only `replay_create`; body credential/audit fields remain exact non-authoritative mirrors. Each mutating replay request, including the unsafe negative, receives a fresh one-use JTI. Read-only re-evaluation, policy comparison, and verifier explanation are validated by `splendorctl acceptance replay-mode` against exported artifacts instead of hardcoded scenario claims.
 
 Side-effectful replay requests are rejected unless separately gated and explicitly marked. S8 records the negative case `side_effectful_replay_mode_rejected_without_gate` and verifies `side_effects_allowed_default: false`.
 
@@ -131,6 +131,7 @@ Expected S8 artifacts include:
 - `artifacts/UC-E2E-S8/replay-mode-public-evidence.json`
 - `artifacts/UC-E2E-S8/schema-migration-report.json`
 - `artifacts/UC-E2E-S8/audit-package.json`
+- `artifacts/UC-E2E-S8/resident-security.json`
 - `artifacts/UC-E2E-S8/public-boundary-evidence.json`
 - `artifacts/UC-E2E-S8/trace-export.jsonl`
 

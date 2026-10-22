@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    RevocationStatus, WorkOrder, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    WORK_ORDER_SCHEMA_VERSION,
+    CapabilityGrantId, LocalDelegationAuthorityEvidence, RevocationStatus, WorkOrder, WorkOrderId,
+    WorkOrderPlacement, WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
 };
 use uuid::Uuid;
 
@@ -279,6 +279,80 @@ fn task_request_payload_must_match_message_run_and_target() {
 }
 
 #[test]
+fn task_request_authority_evidence_is_optional_behavior_free_and_validated() {
+    let parent_run_id = RunId::new();
+    let child_run_id = RunId::new();
+    let target_agent_id = AgentId::new();
+    let evidence = LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::new(),
+        CapabilityGrantId::new(),
+    );
+    let request = TaskRequest::new(
+        parent_run_id,
+        child_run_id,
+        target_agent_id,
+        "summarize ledger",
+        DelegatedAuthority::empty(),
+    )
+    .expect("valid task request")
+    .with_authority_evidence(evidence.clone())
+    .expect("evidence refs are valid");
+    assert_eq!(request.authority_evidence, Some(evidence.clone()));
+
+    let payload = serde_json::to_value(&request).expect("request json");
+    let decoded = TaskRequest::from_payload(&payload).expect("decode with authority evidence");
+    assert_eq!(decoded.authority_evidence, Some(evidence));
+
+    let missing_evidence = TaskRequest::new(
+        RunId::new(),
+        RunId::new(),
+        AgentId::new(),
+        "summarize ledger",
+        DelegatedAuthority::empty(),
+    )
+    .expect("legacy payloads remain valid");
+    assert!(missing_evidence.authority_evidence.is_none());
+
+    let mut invalid_schema = LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::new(),
+        CapabilityGrantId::new(),
+    );
+    invalid_schema.schema_version =
+        "splendor.message.local_delegation_authority_evidence.v2".to_string();
+    assert!(TaskRequest::new(
+        RunId::new(),
+        RunId::new(),
+        AgentId::new(),
+        "summarize ledger",
+        DelegatedAuthority::empty(),
+    )
+    .expect("valid task request")
+    .with_authority_evidence(invalid_schema)
+    .expect_err("invalid evidence schema is rejected")
+    .to_string()
+    .contains("invalid local delegation authority evidence schema_version"));
+
+    let nil_parent = LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::from(Uuid::nil()),
+        CapabilityGrantId::new(),
+    );
+    assert!(nil_parent
+        .validate()
+        .expect_err("nil parent grant rejected")
+        .to_string()
+        .contains("parent_capability_grant_id is required"));
+
+    let same_grant = CapabilityGrantId::new();
+    let same_parent_child =
+        LocalDelegationAuthorityEvidence::issued(same_grant.clone(), same_grant);
+    assert!(same_parent_child
+        .validate()
+        .expect_err("parent and child grant IDs must be distinct")
+        .to_string()
+        .contains("child_capability_grant_id must differ"));
+}
+
+#[test]
 fn task_response_schema_requires_structured_failure() {
     let parent_run_id = RunId::new();
     let child_run_id = RunId::new();
@@ -372,7 +446,7 @@ fn delegated_authority_denies_missing_action_adapter_and_permission() {
 
 #[test]
 fn invalid_schema_versions_are_rejected_before_routing() {
-    assert_eq!(MessageSchemaVersion::LATEST.suffix(), "v1");
+    assert_eq!(MessageSchemaVersion::LATEST.suffix(), "v2");
     assert_eq!(
         MessageSchemaVersion::from_schema("v1"),
         Err(MessageValidationError::MissingSchemaVersion)
@@ -396,11 +470,13 @@ fn invalid_schema_versions_are_rejected_before_routing() {
         })
     );
     assert_eq!(
-        MessageSchemaVersion::from_schema("splendor.message.task_request.v2"),
-        Err(MessageValidationError::UnsupportedSchemaVersion {
-            version: "v2".to_string()
-        })
+        MessageSchemaVersion::from_schema("splendor.message.task_request.v2").expect("v2 schema"),
+        MessageSchemaVersion::V2
     );
+    assert!(matches!(
+        MessageSchemaVersion::from_schema("splendor.message.task_request.v3"),
+        Err(MessageValidationError::UnsupportedSchemaVersion { .. })
+    ));
 }
 
 #[test]
@@ -521,17 +597,15 @@ fn message_envelope_validates_schema_version_and_status() {
     let envelope = MessageEnvelope::new(message.clone()).expect("valid envelope");
 
     assert_eq!(envelope.message, message);
-    assert_eq!(envelope.schema_version, MessageSchemaVersion::V1);
+    assert_eq!(envelope.schema_version, MessageSchemaVersion::V2);
     assert_eq!(envelope.delivery_status, MessageDeliveryStatus::Pending);
     envelope.validate().expect("envelope remains valid");
 
     let mut mismatched = envelope;
-    mismatched.message.schema = "splendor.message.task_request.v2".to_string();
+    mismatched.message.schema = "splendor.message.task_request.v1".to_string();
     assert_eq!(
         mismatched.validate(),
-        Err(MessageValidationError::UnsupportedSchemaVersion {
-            version: "v2".to_string()
-        })
+        Err(MessageValidationError::SchemaVersionMismatch)
     );
 }
 
@@ -544,7 +618,7 @@ fn causal_parent_and_trace_links_round_trip_for_replay() {
         .expect("valid fixture has causal parent");
     let envelope = MessageEnvelope {
         message,
-        schema_version: MessageSchemaVersion::V1,
+        schema_version: MessageSchemaVersion::V2,
         delivery_status: MessageDeliveryStatus::Queued,
         trace_links: MessageTraceLinks {
             queued_trace_id: Some(TraceEventId::new()),
@@ -568,7 +642,7 @@ fn payload_validation_failure_is_structured_for_rejection_trace() {
     assert_eq!(
         error,
         MessageValidationError::PayloadValidationFailed {
-            schema: "splendor.message.task_request.v1".to_string(),
+            schema: "splendor.message.task_request.v2".to_string(),
             reason: "missing task".to_string()
         }
     );

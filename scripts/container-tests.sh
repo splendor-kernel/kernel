@@ -55,7 +55,7 @@ if [[ -z "${image_version}" ]]; then
   exit 1
 fi
 
-daemon_container="$(docker run -d "${IMAGE}" splendor-daemon)"
+daemon_container="$(docker run -d -e SPLENDOR_DAEMON_MODE=local_dev "${IMAGE}" splendor-daemon)"
 sleep 2
 daemon_logs="$(docker logs "${daemon_container}" 2>&1)"
 docker rm -f "${daemon_container}" >/dev/null

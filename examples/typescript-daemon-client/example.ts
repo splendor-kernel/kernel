@@ -66,6 +66,8 @@ const workOrder: WorkOrderEnvelope = {
 };
 
 const createRunRequest: CreateRunRequest = {
+  request_id: "req_typescript_example_create_run",
+  idempotency_key: "idem_typescript_example_create_run",
   tenant_id: tenantId,
   agent_id: agentId,
   work_order: workOrder,
@@ -79,6 +81,7 @@ const createRunRequest: CreateRunRequest = {
   policy_bundle: null,
   registered_actions: [],
   approval_policies: [],
+  circuit_breakers: [],
   allowed_percept_schemas: ["splendor.percept.example.v1"],
   allowed_percept_sources: ["typescript-example"],
   initial_state: { example: true },

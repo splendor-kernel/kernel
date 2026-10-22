@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/splendor-types",
+    "crates/splendor-authority",
     "crates/splendor-kernel",
     "crates/splendor-gateway",
     "crates/splendor-store",
@@ -9,6 +10,7 @@ members = [
     "adapters/filesystem",
     "adapters/http",
     "adapters/robotics",
+    "tests/e2e/use-cases/acceptance-host",
     "python/bindings",
 ]
 resolver = "2"

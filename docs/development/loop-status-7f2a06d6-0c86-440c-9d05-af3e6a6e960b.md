@@ -6,7 +6,7 @@
 - Master loop branch: `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`
 - Master loop worktree: `/Users/db/dev/Splendor Kernel-loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`
 - Base branch: latest `origin/dev` at loop creation (`fc37cdc`, merge of prior 0.05 implementation loop PR #105)
-- Final integration PR: [#109](https://github.com/splendor-os/kernel/pull/109), source `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`, base `dev`
+- Final integration PR: [#109](https://github.com/splendor-kernel/kernel/pull/109), source `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`, base `dev`
 
 ## Sprint scope
 
@@ -71,8 +71,8 @@
 
 | Task | Issue scope | Sprint scope | Branch | Worktree | Status | PR | Validation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Release docs alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-docs` | `/Users/db/dev/Splendor Kernel-106-0.05-docs` | merged | [#107](https://github.com/splendor-os/kernel/pull/107) merged into loop | Sub-agent `git diff --check`; PR CI rust/python/typescript/docker passed; code-review conditional pass resolved by merging label PR | Added 0.05 release notes and aligned README/known limitations/Docker docs/changelog without overclaiming robotics readiness. |
-| Release/package label alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-labels` | `/Users/db/dev/Splendor Kernel-106-0.05-labels` | merged | [#108](https://github.com/splendor-os/kernel/pull/108) merged into loop | `cargo test -p splendorctl run_with_args_version_succeeds`; `pytest python/tests/test_runtime.py -q`; `bash -n scripts/container-tests.sh`; full container smoke by reviewer; PR CI rust/python/typescript/docker passed | Updated release labels, Dockerfile, container test default, and Docker workflow while preserving `splendor.audit_export.v0.04-dev`. |
+| Release docs alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-docs` | `/Users/db/dev/Splendor Kernel-106-0.05-docs` | merged | [#107](https://github.com/splendor-kernel/kernel/pull/107) merged into loop | Sub-agent `git diff --check`; PR CI rust/python/typescript/docker passed; code-review conditional pass resolved by merging label PR | Added 0.05 release notes and aligned README/known limitations/Docker docs/changelog without overclaiming robotics readiness. |
+| Release/package label alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-labels` | `/Users/db/dev/Splendor Kernel-106-0.05-labels` | merged | [#108](https://github.com/splendor-kernel/kernel/pull/108) merged into loop | `cargo test -p splendorctl run_with_args_version_succeeds`; `pytest python/tests/test_runtime.py -q`; `bash -n scripts/container-tests.sh`; full container smoke by reviewer; PR CI rust/python/typescript/docker passed | Updated release labels, Dockerfile, container test default, and Docker workflow while preserving `splendor.audit_export.v0.04-dev`. |
 | QA/release-readiness review | #106, #28-#34 | 0.05* | n/a | n/a | completed | n/a | Integrated loop validation completed | Sub-agent PR reviews completed; docs/package contradictions resolved; final PR can open after tracker update. |
 
 ## GitHub issue management
@@ -118,4 +118,4 @@
 
 ## Final PR readiness
 
-- Final integration PR [#109](https://github.com/splendor-os/kernel/pull/109) is open against `dev`; do not merge to `dev` without project policy/human authorization.
+- Final integration PR [#109](https://github.com/splendor-kernel/kernel/pull/109) is open against `dev`; do not merge to `dev` without project policy/human authorization.
