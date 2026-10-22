@@ -340,7 +340,7 @@ impl DriverCredentialDestinationDigest {
             return Err(DriverCredentialDestinationDigestError::InvalidFormat);
         }
         let mut digest = [0_u8; 32];
-        for (index, pair) in bytes[7..].chunks_exact(2).enumerate() {
+        for (index, pair) in bytes[7..].as_chunks::<2>().0.iter().enumerate() {
             let high = decode_lower_hex(pair[0])
                 .ok_or(DriverCredentialDestinationDigestError::InvalidFormat)?;
             let low = decode_lower_hex(pair[1])

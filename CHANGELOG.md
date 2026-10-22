@@ -2,6 +2,12 @@
 
 ## Unreleased — 0.2/v2 foundation partial evidence
 
+### Fixed
+
+- Restored compatibility with Rust 1.99 Clippy by decoding canonical digest
+  text through fixed-size byte pairs. Rust 1.88 container compatibility, digest
+  wire formats, validation errors, and runtime enforcement remain unchanged.
+
 ### Added
 
 - **status/incomplete:** added RFC 0018 Slice 1A's additive experimental,
