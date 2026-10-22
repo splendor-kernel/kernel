@@ -95,6 +95,17 @@ That step must run `scripts/verify-0.03-kernel-e2e.sh` and archive
 
 ## Release hygiene
 
+- CI follows the stable Rust toolchain with Clippy warnings treated as errors;
+  fixes must also preserve the Rust 1.88 container build. Digest decoding uses
+  fixed-size byte pairs supported by both toolchains, with canonical wire and
+  malformed-input tests retained.
+- After merging, verify both the `CI` and `Docker Image` workflows for the exact
+  merge commit. The image workflow must pass smoke tests, publish `linux/amd64`
+  and `linux/arm64` digest artifacts, and publish the combined GHCR manifest.
+  A successful smoke build alone does not prove publication. Inspect the
+  published branch or `sha-<short-commit>` tag and confirm its OCI revision label
+  identifies the merged source before reporting artifacts ready.
+
 - `CHANGELOG.md` lists implemented primitives and exclusions.
 - `docs/releases/0.01-dev.md` lists release scope and command surface.
 - `docs/releases/known-limitations.md` lists local-only and future milestone

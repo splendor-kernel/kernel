@@ -295,6 +295,16 @@ fn destination_digest_is_exact_and_golden_is_independent() {
 }
 
 #[test]
+fn destination_digest_decodes_every_byte_value() {
+    for byte in 0_u8..=255 {
+        let wire = format!("blake3:{}", format!("{byte:02x}").repeat(32));
+        let digest = DriverCredentialDestinationDigest::parse(&wire).expect("canonical digest");
+        assert_eq!(digest.as_bytes(), &[byte; 32]);
+        assert_eq!(digest.to_string(), wire);
+    }
+}
+
+#[test]
 fn contract_errors_are_exact_code_only_values() {
     let codes = [
         DriverCredentialSinkContractErrorCode::InvalidContractShape,

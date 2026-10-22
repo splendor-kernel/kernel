@@ -425,3 +425,15 @@ fn registry_declaration_digest_wire_is_strict() {
         );
     }
 }
+
+#[test]
+fn registry_declaration_digest_round_trips_every_byte_value() {
+    for byte in 0_u8..=255 {
+        let wire = format!("blake3:{}", format!("{byte:02x}").repeat(32));
+        let digest = RegistryDeclarationDigest::parse(&wire).expect("canonical digest");
+        assert_eq!(
+            serde_json::to_string(&digest).expect("digest JSON"),
+            format!("\"{wire}\"")
+        );
+    }
+}
